@@ -1,0 +1,569 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=430, initial-scale=1">
+<title>Gentle Movil · progreso del emparejamiento</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #060407;
+    --bg-sunken: #0a060c;
+    --surface: #100A0F;
+    --border: #563040;
+    --border-strong: #7a4558;
+    --text: #F6EFF3;
+    --accent: #F095C8;
+    --accent-hover: #FFB1DD;
+    --accent-ink: #28121E;
+    --accent-text: #FFB1DD;
+    --deep-pink: #C96AA2;
+    --warning: #F2B86D;
+    --ok: #4fc58c;
+    --danger: #FF718F;
+    --code-bg: #0f0c12;
+    --overlay: rgb(0 0 0 / 0.55);
+    --accent-soft: rgb(240 149 200 / 0.12);
+    --glow: 0 10px 30px #f095c84d;
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --radius-bento: 20px;
+    --radius-pill: 999px;
+    --shadow: 0 1px 0 rgb(255 255 255 / 0.03) inset, 0 18px 40px -18px rgb(0 0 0 / 0.6);
+    --mono: "IosevkaTerm NF", "Iosevka Term", "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+    --ink-2: color-mix(in srgb, var(--text) 72%, transparent);
+    --ink-3: color-mix(in srgb, var(--text) 56%, transparent);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+
+  html, body { margin: 0; padding: 0; }
+
+  body {
+    width: 430px;
+    height: 932px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 0.95rem;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1, h2, p, ol { margin: 0; }
+  ol { list-style: none; padding: 0; }
+
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+
+  ::selection { background: var(--accent-soft); }
+
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
+  .screen {
+    display: flex;
+    flex-direction: column;
+    width: 430px;
+    height: 932px;
+    overflow: hidden;
+    background:
+      radial-gradient(color-mix(in srgb, var(--accent) 7%, transparent) 1px, transparent 1px) 0 0 / 22px 22px,
+      var(--bg);
+  }
+
+  /* ---- Barra superior ---- */
+  .bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 20px 24px 12px;
+  }
+
+  .brand { display: flex; align-items: center; gap: 10px; }
+
+  .pi {
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    border: 1px solid var(--accent-soft);
+    border-radius: var(--radius-sm);
+    background: var(--accent-soft);
+    color: var(--accent);
+    font-size: 1.15rem;
+    font-weight: 700;
+    line-height: 1;
+  }
+
+  .word { font-size: 0.8rem; font-weight: 650; color: var(--text); }
+  .word span { color: var(--accent-text); }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 26px;
+    padding: 0 11px;
+    border: 1px solid var(--accent-soft);
+    border-radius: var(--radius-pill);
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+  }
+
+  .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: var(--radius-pill);
+    background: currentColor;
+    animation: pulse 1.8s var(--ease) infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+  }
+
+  /* ---- Contenido ---- */
+  .content {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 6px 24px 12px;
+  }
+
+  .eyebrow {
+    font-size: 0.7rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+
+  h1 {
+    margin-top: 8px;
+    font-size: 1.6rem;
+    font-weight: 700;
+    line-height: 1.2;
+    letter-spacing: -0.025em;
+  }
+
+  .target {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    margin-top: 6px;
+    font-size: 0.8rem;
+    color: var(--ink-2);
+  }
+  .target svg { color: var(--accent-text); flex: none; }
+
+  /* ---- Progreso total ---- */
+  .overall {
+    display: grid;
+    gap: 7px;
+    margin-top: 16px;
+    padding: 12px 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+  }
+
+  .overall-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 0.72rem;
+  }
+  .overall-row .k { color: var(--ink-2); letter-spacing: 0.06em; }
+  .overall-row .v { color: var(--text); font-weight: 650; }
+
+  .track {
+    position: relative;
+    height: 8px;
+    overflow: hidden;
+    border-radius: var(--radius-pill);
+    background: var(--bg-sunken);
+    box-shadow: 0 0 0 1px var(--border) inset;
+  }
+
+  .track > span {
+    display: block;
+    height: 100%;
+    border-radius: var(--radius-pill);
+    background: var(--accent);
+  }
+
+  /* ---- Lista de pasos ---- */
+  .steps {
+    margin-top: 14px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-bento);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+
+  .step {
+    display: grid;
+    grid-template-columns: 28px 1fr auto;
+    gap: 12px;
+    align-items: start;
+    padding: 11px 16px;
+    border-top: 1px solid var(--border);
+  }
+  .step:first-child { border-top: 0; }
+
+  .step.active { background: var(--accent-soft); }
+
+  .mark {
+    display: grid;
+    place-items: center;
+    width: 24px;
+    height: 24px;
+    margin-top: 1px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-pill);
+    color: var(--ink-3);
+  }
+
+  .step.done .mark {
+    border-color: var(--ok);
+    color: var(--ok);
+  }
+
+  .step.active .mark {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .spin {
+    width: 13px;
+    height: 13px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: var(--radius-pill);
+    animation: spin 900ms linear infinite;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .step .title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    line-height: 1.35;
+    color: var(--text);
+  }
+
+  .step.pending .title { color: var(--ink-2); font-weight: 550; }
+
+  .step .sub {
+    margin-top: 2px;
+    font-size: 0.7rem;
+    line-height: 1.5;
+    color: var(--ink-3);
+    overflow-wrap: anywhere;
+  }
+
+  .step .sub.mono { letter-spacing: 0.01em; }
+
+  .step .state {
+    padding-top: 2px;
+    font-size: 0.68rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    white-space: nowrap;
+    color: var(--ink-3);
+  }
+  .step.done .state { color: var(--ok); }
+  .step.active .state { color: var(--accent-text); }
+
+  .mini {
+    margin-top: 8px;
+    height: 6px;
+  }
+
+  .pct {
+    font-size: 0.7rem;
+    font-weight: 700;
+    color: var(--accent-text);
+  }
+
+  /* ---- Variante de error ---- */
+  .variant-note {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 14px;
+    font-size: 0.68rem;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  .variant-note::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  .failed {
+    display: grid;
+    gap: 7px;
+    margin-top: 10px;
+    padding: 12px 16px;
+    border: 1px solid var(--border-strong);
+    border-left: 3px solid var(--danger);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+  }
+
+  .failed-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    line-height: 1.45;
+    color: var(--text);
+  }
+  .failed-head svg { flex: none; margin-top: 2px; color: var(--danger); }
+
+  .failed p.body {
+    font-size: 0.72rem;
+    line-height: 1.55;
+    color: var(--ink-2);
+  }
+
+  .failed-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 2px;
+  }
+
+  .retry {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 40px;
+    padding: 0 16px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-pill);
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    font-weight: 650;
+    cursor: pointer;
+    transition: background-color 150ms var(--ease), color 150ms var(--ease);
+  }
+  .retry:hover { background: var(--accent); color: var(--accent-ink); }
+
+  .detail-link {
+    display: inline-flex;
+    align-items: center;
+    min-height: 40px;
+    padding: 0 8px;
+    border-radius: var(--radius-sm);
+    color: var(--ink-2);
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-decoration: underline;
+    text-decoration-color: var(--border-strong);
+    text-underline-offset: 3px;
+  }
+  .detail-link:hover { color: var(--accent-text); }
+
+  /* ---- Dock ---- */
+  .dock {
+    display: grid;
+    gap: 6px;
+    padding: 10px 24px 26px;
+    border-top: 1px solid var(--border);
+    background: linear-gradient(to top, var(--bg) 78%, transparent);
+  }
+
+  .ghost {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 46px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-pill);
+    background: transparent;
+    color: var(--ink-2);
+    font-family: var(--mono);
+    font-size: 0.8rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 150ms var(--ease), border-color 150ms var(--ease), background-color 150ms var(--ease);
+  }
+  .ghost:hover { color: var(--text); border-color: var(--border-strong); background: var(--surface); }
+
+  .fine {
+    text-align: center;
+    font-size: 0.68rem;
+    line-height: 1.5;
+    color: var(--ink-3);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .spin { border-top-color: var(--accent); border-right-color: var(--accent); }
+  }
+</style>
+</head>
+<body>
+<div class="screen">
+
+  <header class="bar">
+    <div class="brand">
+      <span class="pi" aria-hidden="true">π</span>
+      <p class="word">gentle <span>movil</span></p>
+    </div>
+    <span class="chip"><span class="dot" aria-hidden="true"></span>emparejando</span>
+  </header>
+
+  <main class="content">
+    <p class="eyebrow">conexión · paso 2 de 2</p>
+    <h1>Instalando el compañero</h1>
+    <p class="target">
+      <svg width="12" height="12" viewBox="0 0 14 14" aria-hidden="true">
+        <rect x="2" y="2.4" width="10" height="7" rx="1.3" fill="none" stroke="currentColor" stroke-width="1.4"/>
+        <path d="M7 9.4v2.2M4.6 11.6h4.8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+      </svg>
+      reaan@192.168.1.42 · puerto 22
+    </p>
+
+    <div class="overall">
+      <div class="overall-row">
+        <span class="k">Progreso total</span>
+        <span class="v">52% · 2 de 5 pasos</span>
+      </div>
+      <div
+        class="track"
+        role="progressbar"
+        aria-label="Progreso total del emparejamiento"
+        aria-valuenow="52"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuetext="52 por ciento, 2 de 5 pasos completados"
+      ><span style="width:52%"></span></div>
+    </div>
+
+    <ol class="steps" aria-label="Pasos del emparejamiento">
+      <li class="step done">
+        <span class="mark" aria-hidden="true">
+          <svg width="11" height="11" viewBox="0 0 12 12"><path d="M2 6.4 4.6 9 10 3.2" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+        </span>
+        <div>
+          <p class="title">Conectado por SSH</p>
+          <p class="sub">192.168.1.42:22 · ed25519</p>
+        </div>
+        <p class="state">hecho</p>
+      </li>
+
+      <li class="step done">
+        <span class="mark" aria-hidden="true">
+          <svg width="11" height="11" viewBox="0 0 12 12"><path d="M2 6.4 4.6 9 10 3.2" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+        </span>
+        <div>
+          <p class="title">Huella confirmada</p>
+          <p class="sub">SHA256:9fK2mr7Q…qE1s coincide</p>
+        </div>
+        <p class="state">hecho</p>
+      </li>
+
+      <li class="step active" aria-current="step">
+        <span class="mark" aria-hidden="true"><span class="spin"></span></span>
+        <div>
+          <p class="title">Instalando daemon <span class="pct">64%</span></p>
+          <p class="sub mono">daemon-v1.4.2-linux-x86_64</p>
+          <p class="sub mono">5.4 MB de 8.4 MB descargados</p>
+          <div
+            class="track mini"
+            role="progressbar"
+            aria-label="Descarga e instalación del daemon"
+            aria-valuenow="64"
+            aria-valuemin="0"
+            aria-valuemax="100"
+            aria-valuetext="64 por ciento descargado"
+          ><span style="width:64%"></span></div>
+        </div>
+        <p class="state">en curso</p>
+      </li>
+
+      <li class="step pending">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <p class="title">Registrar dispositivo</p>
+          <p class="sub">Tu clave ed25519 se guarda en el host</p>
+        </div>
+        <p class="state">pendiente</p>
+      </li>
+
+      <li class="step pending">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <p class="title">Túnel listo</p>
+          <p class="sub">Sesiones, automatizaciones y CLI</p>
+        </div>
+        <p class="state">pendiente</p>
+      </li>
+    </ol>
+
+    <p class="sr-only" aria-live="polite">Instalando daemon: 64 por ciento.</p>
+
+    <p class="variant-note">Variante · si el checksum no coincide</p>
+
+    <div class="failed" role="alert" aria-labelledby="failed-title">
+      <p class="failed-head" id="failed-title">
+        <svg width="13" height="13" viewBox="0 0 12 12" aria-hidden="true">
+          <circle cx="6" cy="6" r="4.8" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M4.2 4.2 7.8 7.8M7.8 4.2 4.2 7.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        </svg>
+        El checksum del daemon no coincide — instalación abortada
+      </p>
+      <p class="body">
+        El binario descargado no coincide con la firma ed25519. No se escribió nada en tu
+        computadora; el daemon anterior sigue intacto.
+      </p>
+      <div class="failed-actions">
+        <button class="retry" type="button">
+          <svg width="12" height="12" viewBox="0 0 14 14" aria-hidden="true">
+            <path d="M11.4 7a4.4 4.4 0 1 1-1.5-3.3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            <path d="M11.6 2v3.2H8.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          Reintentar
+        </button>
+        <a class="detail-link" href="02-manual-ssh.html">Revisar el host</a>
+      </div>
+    </div>
+  </main>
+
+  <footer class="dock">
+    <button class="ghost" type="button">Cancelar emparejamiento</button>
+    <p class="fine">Podés salir: seguimos si volvés a esta pantalla.</p>
+  </footer>
+
+</div>
+</body>
+</html>

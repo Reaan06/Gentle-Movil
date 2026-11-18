@@ -1,0 +1,35 @@
+{
+  "title": "Gentle Movil · onboarding de emparejamiento",
+  "brief": "Onboarding móvil de Gentle Movil (Expo + Rust): emparejar el teléfono con la computadora por QR o SSH, seguir el aprovisionamiento del daemon y elegir entre modo conectado, local o ambos. Estética terminal elegante, mono, tema oscuro y acento rosa restringido.",
+  "artboards": [
+    {
+      "file": "01-qr-scan.html",
+      "title": "Escaneo de QR",
+      "tradeoff": "El camino más rápido y sin teclado; depende del permiso de cámara y de que la PC muestre el código, por eso incluye el panel de permiso denegado con salida a SSH.",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "02-manual-ssh.html",
+      "title": "Conexión SSH manual",
+      "tradeoff": "Funciona sin cámara y con hosts ya configurados; pide tres datos, una credencial y la confirmación de huella, así que es más lento en el primer uso.",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "03-pairing-progress.html",
+      "title": "Progreso del emparejamiento",
+      "tradeoff": "Hace visible cada paso del aprovisionamiento y la recuperación ante un checksum inválido; suma una pantalla de espera al flujo y muestra dos estados a la vez.",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "04-mode-choice.html",
+      "title": "Elección de modo",
+      "tradeoff": "Hace explícito el doble modo desde el día 1; agrega una decisión antes de entrar a la app y necesita texto de apoyo para no confundir local con un entorno completo.",
+      "width": 430,
+      "height": 932
+    }
+  ],
+  "feature": "odd/tasks/mobile-app.md"
+}
