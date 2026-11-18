@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { request } from "node:http";
 import test from "node:test";
 
 import { httpGet } from "./helpers/http.ts";
@@ -66,6 +67,48 @@ test("unknown paths and unsupported methods answer JSON instead of crashing", as
   assert.match(String(health.headers["content-type"]), /^application\/json$/);
 
   assert.equal(harness.logged("bridge.started"), true);
+});
+
+test("the existing health and sessions surface keeps its bodies and now stamps the identity header", async (t) => {
+  const harness = await startTestBridge();
+  t.after(() => harness.stop());
+
+  const health = await httpGet(harness.apiPort, "/api/health");
+  // Preserved: same status, same body shape, same identity payload.
+  assert.equal(health.status, 200);
+  assert.deepEqual(health.json, {
+    app: "gentle-shell",
+    bridge: "gentle-movil",
+    proto: 1,
+    version: packageJson.version,
+  });
+  assert.equal(health.headers["x-gentle-bridge"], "gentle-movil/1");
+
+  const sessions = await httpGet(harness.apiPort, "/api/sessions");
+  assert.equal(sessions.status, 200);
+  assert.deepEqual(sessions.json, []);
+  assert.equal(sessions.headers["x-gentle-bridge"], "gentle-movil/1");
+
+  const missing = await httpGet(harness.apiPort, "/api/does-not-exist");
+  assert.equal(missing.status, 404);
+  assert.deepEqual(missing.json, { error: "not_found", path: "/api/does-not-exist" });
+  assert.equal(missing.headers["x-gentle-bridge"], "gentle-movil/1");
+
+  // Preserved: the pre-existing 405 body of /api/health is unchanged.
+  const wrongMethod = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+    const req = request(
+      { host: "127.0.0.1", port: harness.apiPort, path: "/api/health", method: "POST", agent: false },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+      },
+    );
+    req.on("error", reject);
+    req.end();
+  });
+  assert.equal(wrongMethod.status, 405);
+  assert.deepEqual(JSON.parse(wrongMethod.body), { error: "method_not_allowed" });
 });
 
 test("a foreign server on the same port cannot produce this identity payload", async () => {

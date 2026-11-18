@@ -6,14 +6,37 @@
  * `server.mjs` runs it standalone for `doctor`, `curl` and the offline tests.
  *
  * Two ports, two surfaces, both bound to 127.0.0.1:
- *   43721  HTTP API (identity + session list) for the CLI and the phone
+ *   43721  HTTP API (identity, sessions, git, automations, exec, fs) for the CLI and the phone
  *   43722  device channel (WebSocket at /ws/device)
+ *
+ * Every JSON answer carries the `x-gentle-bridge` identity header, so a client
+ * that reaches a stranger on one of these ports still knows it is not us.
  */
 
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 
+import { readAutomations, findAutomation, defaultAutomationsFile } from "./automations.ts";
 import { BIND_HOST, DEFAULT_MAX_INPUT_BYTES, DEFAULT_MAX_PAYLOAD_BYTES, readBridgeVersion } from "./config.ts";
+import {
+  EXEC_HISTORY_CAPACITY,
+  ALLOW_EXEC_ENV,
+  createExecRing,
+  isExecEnabled,
+  runCommand,
+  statusOfResult,
+  tokenizeCommand,
+} from "./exec.ts";
+import type { ExecRing } from "./exec.ts";
+import {
+  DEFAULT_MAX_READ_BYTES,
+  DEFAULT_MAX_TREE_ENTRIES,
+  isDirectory,
+  listWorkspaceTree,
+  readWorkspaceFile,
+  resolveInsideWorkspace,
+} from "./fs.ts";
+import type { FsErrorCode } from "./fs.ts";
 import {
   ERROR_CODES,
   PROTO,
@@ -27,6 +50,8 @@ import {
   pongFrame,
   sessionsFrame,
 } from "./frames.ts";
+import { readGitStatus } from "./git.ts";
+import { BRIDGE_IDENTITY, methodNotAllowed as methodNotAllowedJson, readJsonBody, requestUrl, writeError, writeJson } from "./http.ts";
 import { createLogger } from "./log.ts";
 import type { Logger } from "./log.ts";
 import type { AgentSession, SessionSource } from "./sessions.ts";
@@ -34,12 +59,7 @@ import { createStaticSessionSource } from "./sessions.ts";
 import { attachWebSocketServer } from "./ws.ts";
 import type { WsConnection, WsServerHandle } from "./ws.ts";
 
-/** Identity advertised by `GET /api/health`. Clients use it to prove what listens. */
-export const BRIDGE_IDENTITY = {
-  app: "gentle-shell",
-  bridge: "gentle-movil",
-  proto: PROTO,
-} as const;
+export { BRIDGE_IDENTITY };
 
 export interface InputRequest {
   sessionId: string;
@@ -69,6 +89,18 @@ export interface BridgeOptions {
   sink?: InputSink;
   maxPayloadBytes?: number;
   maxInputBytes?: number;
+  /** Root the workspace-scoped endpoints may read; defaults to `process.cwd()`. */
+  workspace?: string;
+  /** JSON file `GET /api/automations` reads; defaults to `~/.pi/gentle-movil/automations.json`. */
+  automationsFile?: string | null;
+  /** Enables `POST /api/exec`; defaults to `GENTLE_MOVIL_ALLOW_EXEC === "1"`. */
+  allowExec?: boolean;
+  /** Commands kept in the exec history ring (default 50). */
+  execHistoryCapacity?: number;
+  /** Largest file `/api/fs/read` returns (default 512 KiB). */
+  fsMaxReadBytes?: number;
+  /** Entries one `/api/fs/tree` listing returns (default 500). */
+  fsMaxTreeEntries?: number;
 }
 
 export interface ListenerAddress {
@@ -97,19 +129,23 @@ interface DeviceState {
   seq: number;
 }
 
-function writeJson(response: ServerResponse, status: number, payload: unknown): void {
-  const body = JSON.stringify(payload);
-  response.writeHead(status, {
-    "content-type": "application/json",
-    "content-length": Buffer.byteLength(body),
-    "cache-control": "no-store",
-  });
-  response.end(body);
-}
-
-function methodNotAllowed(response: ServerResponse): void {
+function legacyMethodNotAllowed(response: ServerResponse): void {
   writeJson(response, 405, { error: "method_not_allowed" });
 }
+
+/** `GET` and `HEAD` are the same thing for the read-only endpoints. */
+function isRead(request: IncomingMessage): boolean {
+  return request.method === "GET" || request.method === "HEAD";
+}
+
+const FS_STATUS: Record<FsErrorCode, number> = {
+  path_outside_workspace: 400,
+  not_found: 404,
+  not_a_file: 400,
+  not_a_directory: 400,
+  file_too_large: 413,
+  binary_file: 415,
+};
 
 function addressOf(server: Server, configuredPort: number): ListenerAddress {
   const address = server.address();
@@ -141,23 +177,36 @@ export function createBridge(options: BridgeOptions = {}): Bridge {
   const configuredApiPort = options.apiPort ?? 43721;
   const configuredDevicePort = options.devicePort ?? 43722;
 
+  // Workspace-scoped endpoints never leave this root: the extension's cwd
+  // unless the host says otherwise (tests and hosts with a fixed project).
+  const workspace = options.workspace ?? process.cwd();
+  const automationsFile = options.automationsFile === undefined ? defaultAutomationsFile() : options.automationsFile;
+  const allowExec = options.allowExec ?? isExecEnabled();
+  const execRing: ExecRing = createExecRing(options.execHistoryCapacity ?? EXEC_HISTORY_CAPACITY);
+  const fsMaxReadBytes = options.fsMaxReadBytes ?? DEFAULT_MAX_READ_BYTES;
+  const fsMaxTreeEntries = options.fsMaxTreeEntries ?? DEFAULT_MAX_TREE_ENTRIES;
+
   const devices = new Map<WsConnection, DeviceState>();
   let wsHandle: WsServerHandle | null = null;
   let started = false;
   let starting: Promise<BridgeAddresses> | null = null;
 
   const apiServer = createServer((request, response) => {
-    try {
-      routeApi(request, response, {
-        logger,
-        version,
-        listSessions: () => listSessions(),
-      });
-    } catch (error) {
+    void routeApi(request, response, {
+      logger,
+      version,
+      listSessions: () => listSessions(),
+      workspace,
+      automationsFile,
+      allowExec,
+      execRing,
+      fsMaxReadBytes,
+      fsMaxTreeEntries,
+    }).catch((error: unknown) => {
       logger.error("http.api_handler_error", { error, path: request.url });
-      if (!response.headersSent) writeJson(response, 500, { error: "internal_error" });
+      if (!response.headersSent) writeError(response, 500, "internal_error", "the bridge failed to answer this request");
       else response.end();
-    }
+    });
   });
 
   const deviceServer = createServer((request, response) => {
@@ -430,14 +479,149 @@ interface RouteContext {
   logger: Logger;
   version: string;
   listSessions: () => AgentSession[];
+  workspace: string;
+  automationsFile: string | null;
+  allowExec: boolean;
+  execRing: ExecRing;
+  fsMaxReadBytes: number;
+  fsMaxTreeEntries: number;
 }
 
-function routeApi(request: IncomingMessage, response: ServerResponse, context: RouteContext): void {
-  const path = (request.url ?? "/").split("?")[0];
+type WorkspaceAnswer = { ok: true; workspace: string } | { ok: false; status: number; code: string; message: string };
+
+/**
+ * `?workspace=` (optional) names a directory inside the extension's workspace.
+ * Anything that escapes it, does not exist, or is not a directory answers 400
+ * before a single syscall reads outside the root.
+ */
+function resolveWorkspace(root: string, request: IncomingMessage): WorkspaceAnswer {
+  const requested = requestUrl(request).searchParams.get("workspace");
+  if (requested === null || requested === "") return { ok: true, workspace: root };
+
+  const resolved = resolveInsideWorkspace(root, requested);
+  if (!resolved.ok) {
+    return {
+      ok: false,
+      status: 400,
+      code: resolved.code === "not_found" ? "workspace_not_found" : resolved.code,
+      message: resolved.message,
+    };
+  }
+  // A file is not a workspace: reporting git or fs facts for it would be a lie.
+  if (!isDirectory(resolved.absolute)) {
+    return { ok: false, status: 400, code: "workspace_not_a_directory", message: `"${resolved.relative}" is not a directory` };
+  }
+  return { ok: true, workspace: resolved.absolute };
+}
+
+/** Returns the workspace to use, or writes the 4xx and returns null. */
+function answerWorkspace(response: ServerResponse, answer: WorkspaceAnswer): string | null {
+  if (answer.ok) return answer.workspace;
+  writeError(response, answer.status, answer.code, answer.message);
+  return null;
+}
+
+function handleAutomations(response: ServerResponse, context: RouteContext): void {
+  const loaded = readAutomations(context.automationsFile);
+  if (!loaded.ok) {
+    // Honest 500: the file exists but cannot be understood, so an empty list
+    // would read as "you have no automations".
+    writeError(response, 500, loaded.code, loaded.message);
+    return;
+  }
+  writeJson(response, 200, { automations: loaded.automations });
+}
+
+function handleAutomationDetail(response: ServerResponse, context: RouteContext, id: string): void {
+  const loaded = readAutomations(context.automationsFile);
+  if (!loaded.ok) {
+    writeError(response, 500, loaded.code, loaded.message);
+    return;
+  }
+  const automation = findAutomation(loaded.automations, id);
+  if (automation === null) {
+    writeError(
+      response,
+      404,
+      "automation_not_found",
+      `no automation with id "${id}" in ${context.automationsFile ?? "(no automations file)"}`,
+    );
+    return;
+  }
+  // The mobile editor parses the automation itself, not a wrapper.
+  writeJson(response, 200, automation);
+}
+
+async function handleExec(request: IncomingMessage, response: ServerResponse, context: RouteContext): Promise<void> {
+  if (request.method !== "POST") {
+    methodNotAllowedJson(response, "POST");
+    return;
+  }
+  if (!context.allowExec) {
+    context.logger.warn("http.exec_refused", { reason: "opt_in_absent", env: ALLOW_EXEC_ENV });
+    writeError(
+      response,
+      403,
+      "exec_disabled",
+      `running commands is disabled: start the bridge with ${ALLOW_EXEC_ENV}=1 to allow it`,
+    );
+    return;
+  }
+
+  const workspace = answerWorkspace(response, resolveWorkspace(context.workspace, request));
+  if (workspace === null) return;
+
+  const body = await readJsonBody(request, 16 * 1024);
+  if (!body.ok) {
+    writeError(response, body.code === "payload_too_large" ? 413 : 400, body.code, body.message);
+    return;
+  }
+  const candidate = body.value as { command?: unknown } | null;
+  const command = candidate !== null && typeof candidate === "object" ? candidate.command : undefined;
+  if (typeof command !== "string") {
+    writeError(response, 400, "invalid_body", 'the body must be {"command": "<command line>"}');
+    return;
+  }
+
+  const tokenized = tokenizeCommand(command);
+  if (!tokenized.ok) {
+    writeError(response, 400, tokenized.code, tokenized.message);
+    return;
+  }
+
+  const startedAt = Date.now();
+  const result = await runCommand({ command, cwd: workspace });
+  const record = context.execRing.add({
+    command: command.trim(),
+    at: new Date().toISOString(),
+    status: statusOfResult(result),
+    exitCode: result.exitCode,
+    output: result.output,
+  });
+  context.logger.info("http.exec_ran", {
+    id: record.id,
+    file: tokenized.argv[0],
+    status: record.status,
+    exitCode: record.exitCode,
+    durationMs: Date.now() - startedAt,
+  });
+
+  if (result.spawnError !== null && !result.timedOut) {
+    // The process never started (missing binary, permissions). A 200 with a
+    // null exit code would read as "ran and said nothing": it did not run.
+    writeError(response, 502, "command_spawn_failed", result.spawnError);
+    return;
+  }
+
+  writeJson(response, 200, { id: record.id, exitCode: record.exitCode, output: record.output });
+}
+
+async function routeApi(request: IncomingMessage, response: ServerResponse, context: RouteContext): Promise<void> {
+  const path = (request.url ?? "/").split("?")[0] ?? "/";
 
   if (path === "/api/health") {
-    if (request.method !== "GET" && request.method !== "HEAD") {
-      methodNotAllowed(response);
+    if (!isRead(request)) {
+      legacyMethodNotAllowed(response);
       return;
     }
     writeJson(response, 200, {
@@ -450,11 +634,109 @@ function routeApi(request: IncomingMessage, response: ServerResponse, context: R
   }
 
   if (path === "/api/sessions") {
-    if (request.method !== "GET" && request.method !== "HEAD") {
-      methodNotAllowed(response);
+    if (!isRead(request)) {
+      legacyMethodNotAllowed(response);
       return;
     }
     writeJson(response, 200, context.listSessions());
+    return;
+  }
+
+  if (path === "/api/git/status") {
+    if (!isRead(request)) {
+      methodNotAllowedJson(response, "GET");
+      return;
+    }
+    const workspace = answerWorkspace(response, resolveWorkspace(context.workspace, request));
+    if (workspace === null) return;
+
+    const result = await readGitStatus(workspace);
+    if (!result.ok) {
+      // Not a repository conflicts with this request (409); a host without the
+      // git binary cannot serve the capability at all (501).
+      writeError(response, result.code === "git_unavailable" ? 501 : 409, result.code, result.message);
+      return;
+    }
+    writeJson(response, 200, result.report);
+    return;
+  }
+
+  if (path === "/api/automations") {
+    if (!isRead(request)) {
+      methodNotAllowedJson(response, "GET");
+      return;
+    }
+    handleAutomations(response, context);
+    return;
+  }
+
+  if (path.startsWith("/api/automations/")) {
+    if (!isRead(request)) {
+      methodNotAllowedJson(response, "GET");
+      return;
+    }
+    const raw = path.slice("/api/automations/".length);
+    let id = raw;
+    try {
+      id = decodeURIComponent(raw);
+    } catch {
+      id = raw;
+    }
+    if (id === "") {
+      writeError(response, 404, "automation_not_found", "no automation id in the path");
+      return;
+    }
+    handleAutomationDetail(response, context, id);
+    return;
+  }
+
+  if (path === "/api/exec/history") {
+    if (!isRead(request)) {
+      methodNotAllowedJson(response, "GET");
+      return;
+    }
+    writeJson(response, 200, { commands: context.execRing.list() });
+    return;
+  }
+
+  if (path === "/api/exec") {
+    await handleExec(request, response, context);
+    return;
+  }
+
+  if (path === "/api/fs/read") {
+    if (!isRead(request)) {
+      methodNotAllowedJson(response, "GET");
+      return;
+    }
+    const workspace = answerWorkspace(response, resolveWorkspace(context.workspace, request));
+    if (workspace === null) return;
+
+    const requested = requestUrl(request).searchParams.get("path");
+    const result = readWorkspaceFile(workspace, requested, context.fsMaxReadBytes);
+    if (!result.ok) {
+      writeError(response, FS_STATUS[result.code], result.code, result.message);
+      return;
+    }
+    writeJson(response, 200, result.body);
+    return;
+  }
+
+  if (path === "/api/fs/tree") {
+    if (!isRead(request)) {
+      methodNotAllowedJson(response, "GET");
+      return;
+    }
+    const workspace = answerWorkspace(response, resolveWorkspace(context.workspace, request));
+    if (workspace === null) return;
+
+    const requested = requestUrl(request).searchParams.get("path");
+    const result = listWorkspaceTree(workspace, requested, context.fsMaxTreeEntries);
+    if (!result.ok) {
+      writeError(response, FS_STATUS[result.code], result.code, result.message);
+      return;
+    }
+    writeJson(response, 200, result.body);
     return;
   }
 

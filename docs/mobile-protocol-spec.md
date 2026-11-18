@@ -81,6 +81,164 @@ Si el daemon es más nuevo: la app funciona con la versión mínima común
 (daemon compatible hacia atrás). Si la app es más nueva: el daemon responde
 `426` y la UI sugiere actualizar el daemon (§5).
 
+### 4.1 Superficie de datos del puente (`proto 1`)
+
+La sirve la extensión Pi de §9 sobre el túnel de §4. Las formas de abajo son
+las que **ya parsean** los módulos móviles, campo por campo
+(`mobile/lib/git.ts`, `mobile/lib/automations.ts`, `mobile/lib/terminal.ts`):
+un campo de más se ignora, uno mal tipado convierte la pantalla en error. La
+implementación vive en `pi-extension/src/{git,automations,exec,fs}.ts`.
+
+Reglas comunes a todos los endpoints:
+
+- Toda respuesta JSON —de `43721` y de `43722`— lleva el header de identidad
+  `x-gentle-bridge: gentle-movil/1` (§9.2). Un proceso ajeno en el puerto puede
+  fabricar un cuerpo parecido, no ese header: el impostor sigue siendo
+  detectable.
+- Todo error es `{"error":{"code":"<code>","message":"<frase>"}}` con el
+  status indicado. Nunca hay 2xx vacío ni lista vacía que signifique «falló».
+- **Workspace**: raíz = cwd de la extensión. `?workspace=<dir>` (opcional en
+  `git/status`, `exec`, `fs/read` y `fs/tree`) elige un directorio existente
+  **dentro** de la raíz; cualquier ruta que escape (`..`, absoluta de afuera,
+  symlink hacia afuera) → `400 path_outside_workspace`. Si no existe →
+  `400 workspace_not_found`; si es un archivo → `400 workspace_not_a_directory`.
+- Ningún endpoint escribe en disco. El único que ejecuta algo es
+  `POST /api/exec`, y solo con el opt-in explícito.
+
+#### `GET /api/git/status`
+
+`git status --porcelain=v1 -z --untracked-files=all` + `git diff --numstat -z` +
+`git diff --cached --numstat -z`, spawn con array de argumentos (`execFile`,
+nunca un shell). `200`:
+
+```json
+{"workspace":"/home/me/proj","branch":"feat/auth-login","ahead":2,"behind":0,
+ "files":[{"path":"src/a.ts","status":"modified","additions":3,"deletions":1,"staged":true}]}
+```
+
+- `workspace`: la raíz usada (la pedida o la cwd).
+- `branch`: rama actual; `null` con HEAD detached (nunca la palabra `HEAD`).
+- `ahead` / `behind`: commits contra el upstream; `null` si la rama no tiene
+  upstream (no se inventa `0`).
+- `files[].status`: `added` (incluye untracked y copias), `modified` (incluye
+  `T`/`U`), `deleted`, `renamed`.
+- `files[].additions` / `files[].deletions`: enteros ≥ 0 del `numstat` (un
+  binario cuenta `0`/`0`); en untracked `additions` es el conteo real de líneas
+  del archivo y `deletions` es `0`.
+- `files[].staged`: `true` si el cambio está en el índice.
+- `files[].path`: relativo a la raíz del repo (lo que imprime `git status`, igual
+  desde un subdirectorio). Un archivo tocado en índice y en worktree aparece dos
+  veces, una por lado, como lo imprime git.
+
+Errores: `409 not_a_git_repository` (el workspace no está en un work tree),
+`501 git_unavailable` (el host no tiene el binario `git`), `400` de workspace
+(arriba).
+
+#### `GET /api/automations`
+
+Lee `~/.pi/gentle-movil/automations.json` (o `GENTLE_MOVIL_AUTOMATIONS_FILE`),
+un archivo que la extensión posee. `200`:
+
+```json
+{"automations":[{"id":"nightly","name":"Limpieza nocturna","schedule":"0 3 * * *",
+  "enabled":true,"lastRun":{"at":"2026-11-18T03:00:00.000Z","ok":true,"summary":"ok"},
+  "nextRun":"2026-11-19T03:00:00.000Z"}]}
+```
+
+`lastRun` es `null` o `{at, ok, summary}` (`summary` string o `null`); `nextRun`
+es ISO-8601 o `null`; `steps` (`string[]`) solo aparece si el archivo lo declara.
+Archivo ausente → `200 {"automations":[]}` (no hay nada configurado).
+
+Errores: `500 automations_unreadable` con el motivo real en `message` — el
+error de `JSON.parse` incluido, o el campo exacto que no valida
+(`automations[2].enabled is not a boolean`). Un archivo roto **no** se degrada a
+lista vacía.
+
+#### `GET /api/automations/<id>`
+
+`200` con **el objeto solo**, sin wrapper (es lo que parsea el editor):
+
+```json
+{"id":"nightly","name":"Limpieza nocturna","schedule":"0 3 * * *","enabled":true,
+ "lastRun":null,"nextRun":null,"steps":["bun run lint"]}
+```
+
+Errores: `404 automation_not_found` (mensaje con el id pedido),
+`500 automations_unreadable` como arriba.
+
+#### `GET /api/exec/history`
+
+Ring en memoria del proceso, tope 50, más nuevo al final. `200`:
+
+```json
+{"commands":[{"id":"cmd-m9x1-1","command":"bun test","at":"2026-11-18T14:32:00.000Z",
+  "status":"sent","exitCode":1,"output":"..."}]}
+```
+
+`status`: `pending` (encolado, hoy no se usa), `sent` (el proceso corrió, con
+cualquier exit code), `failed` (no arrancó, timeout o señal). `exitCode` es
+entero o `null`; `output` es el stream crudo combinado (stdout+stderr en orden de
+llegada, escapes incluidos) o `null` si no produjo nada. El ring no se persiste:
+un reinicio del puente empieza vacío, que es la verdad de lo que este proceso
+corrió.
+
+#### `POST /api/exec`
+
+Body `{"command":"<línea de comando>"}`. **Solo corre** si el puente arrancó con
+`GENTLE_MOVIL_ALLOW_EXEC=1` (o `createBridge({allowExec:true})`).
+
+`200`:
+
+```json
+{"id":"cmd-m9x1-1","exitCode":0,"output":"hola"}
+```
+
+Un exit code distinto de 0 **no** es un error HTTP: es un resultado (200, con el
+código real). Sin shell nunca: la línea se parte en argv (comillas y `\` como un
+shell, sin expansión) y se ejecuta con `spawn(file, args)`.
+
+Errores: `403 exec_disabled` (falta el opt-in; el comando **no** se ejecuta ni
+entra al historial), `400 shell_unsupported` (la línea necesita shell: `|`, `&&`,
+`;`, `>`, `$`, backticks, globs, `#`, salto de línea, comilla sin cerrar),
+`400 invalid_command` (vacío o > 4096 bytes), `400 invalid_body`, `400 invalid_json`,
+`413 payload_too_large`, `400` de workspace, y `502 command_spawn_failed` cuando el
+proceso no llegó a arrancar (binario inexistente, permisos): ese comando queda
+`failed` en el historial, nunca un 200 con exit code `null`.
+
+Límites: timeout 30 s (se mata con SIGKILL y se registra `failed` con la marca
+en `output`), salida combinada ≤ 64 KiB por comando (se corta con
+`… [cortado: N bytes ocultos]`, nunca en silencio).
+
+#### `GET /api/fs/read?path=<rel>`
+
+Lee un archivo de texto dentro del workspace. `200`:
+
+```json
+{"path":"src/a.ts","size":1234,"encoding":"utf8","content":"export {};\n"}
+```
+
+`path` es relativo al workspace con `/`, `size` son los bytes leídos.
+
+Errores: `400 path_outside_workspace`, `404 not_found`, `400 not_a_file`
+(es un directorio), `413 file_too_large` (> 512 KiB), `415 binary_file`
+(byte NUL o UTF-8 inválido).
+
+#### `GET /api/fs/tree?path=<rel>`
+
+Un nivel de listado. `200`:
+
+```json
+{"path":"","truncated":false,"entries":[
+  {"name":"src","path":"src","type":"dir","size":null},
+  {"name":"README.md","path":"README.md","type":"file","size":812}]}
+```
+
+`type`: `dir` | `file` | `symlink` | `other`; `size` solo para archivos regulares
+(`null` en el resto, nunca estimado). Orden: directorios primero, después por
+nombre. `path` vacío = la raíz del workspace. Errores: los mismos que
+`fs/read` más `400 not_a_directory`; el listado se corta a 500 entradas con
+`truncated: true`.
+
 ## 5. Auto-actualización del daemon
 
 En cada conexión: `GET /api/version` por el túnel → si difiere de la versión
@@ -141,8 +299,13 @@ Reemplaza al daemon de §3-§5. Ya no hay binario, ni instalación, ni `sudo`: e
 
 | Puerto | Bind | Superficie |
 |---|---|---|
-| 43721 | `127.0.0.1` | API HTTP: identidad y sesiones (CLI, `doctor`, teléfono) |
+| 43721 | `127.0.0.1` | API HTTP: identidad, sesiones y datos (git, automatizaciones, exec, fs) para el CLI, `doctor` y el teléfono |
 | 43722 | `127.0.0.1` | Canal de dispositivos: WebSocket en `/ws/device` |
+
+Los endpoints de datos de `43721` están documentados en §4.1. Toda respuesta
+JSON de los dos puertos lleva el header `x-gentle-bridge: gentle-movil/1`
+(`<bridge>/<proto>` de §9.2): junto con el payload de identidad, es la prueba de
+que quien escucha es esta extensión.
 
 Nunca se bindea `0.0.0.0` ni ninguna otra interfaz; el host no es configurable.
 Los puertos sí, por entorno: `GENTLE_MOVIL_API_PORT` y
@@ -258,3 +421,15 @@ en el host, ya tiene la sesión del usuario.
   offline (`node --test pi-extension/test/`, 18 verdes) incluido el cliente que
   desaparece a mitad de frame. El modo proceso suelto devuelve `deliver: "echo"`:
   sin agente no se finge una sesión viva.
+- L5 (T8b, `proto: 1`): §4.1 documenta la superficie de datos que las pantallas
+  conectadas ya llamaban: `GET /api/git/status` (status porcelana + numstat
+  reales), `GET /api/automations` y `GET /api/automations/<id>` (archivo
+  `~/.pi/gentle-movil/automations.json`), `GET /api/exec/history` y
+  `POST /api/exec` (ring de 50 en memoria; el comando solo corre con
+  `GENTLE_MOVIL_ALLOW_EXEC=1`, sin shell, con timeout y tope de salida) y
+  `GET /api/fs/{read,tree}` (lectura y listado dentro del workspace). Las formas
+  son las que parsean `mobile/lib/{git,automations,terminal}.ts`; todo error es
+  `{"error":{"code","message"}}` con el status real (`409` no-repo, `501` sin
+  git, `500` automatizaciones ilegibles con el error de parseo, `403` exec sin
+  opt-in, `413`/`415` de fs). Se agrega el header `x-gentle-bridge` a toda
+  respuesta JSON. Tests: `node --test pi-extension/test/` 32 verdes.
