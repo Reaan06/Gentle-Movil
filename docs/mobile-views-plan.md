@@ -172,16 +172,60 @@ each with a one-line capability list; footer note `Puedes cambiarlo en Ajustes.`
 **Empezar**.
 
 States: `pristine` (Ambos preselected), `saving` (button spinner), `error`
-(`No pudimos guardar. Reintentar`), `success` (replace stack with V5, or V14 if only Local —
-or V5 with Local tab enabled).
+(`No pudimos guardar. Reintentar`), `success` (route by mode: includes Local → **V21 suite
+installer** first, then the tunnel path; connected-only → V1 QR scan; local-only → V21 only,
+no QR — owner amendment L10).
 
 Reactions:
 
 | Tap | Reaction | Call | Notes |
 |---|---|---|---|
 | card | selects (optimistic) | — | Conectado is offered only if a device exists from V3 |
-| **Empezar** | writes `mode` to local store, seeds tabs | `sqliteOpen` | local-only → Overview replaced by V14 as the root tab |
+| **Empezar** | writes `mode` to local store, routes by mode | `sqliteOpen` | both → V21 → V1; PC-only → V1; local-only → V21 → V14, no scan |
 | local-only selected | shows second note `El modo conectado se puede activar luego.` | — | no tunnel attempted |
+
+### V21 — Suite installer (on the phone)
+Artboard: `design/mobile-app-onboarding/05-suite-install`
+Purpose: pick and install the Gentle suite components ON THE PHONE for local mode
+(owner amendment L10: "elegir que instalar si quiere en el movil también"). Runs before
+the QR scan whenever the chosen mode includes local.
+
+Elements: three selectable component rows — **gentle-shell** (agent: chat, code,
+automations), **engram** (persistent memory), **gentle-ai** (background jobs and
+subagents) — each with icon, one-line description and a check marker; note
+`gentle-shell necesita engram para recordar`; primary CTA `Instalar N componentes →`
+(singular `Instalar 1 componente →`, disabled at 0); secondary `Instalar todo`.
+
+States per component: `selected` (default: all three checked), `deselected` (stays for
+later from Ajustes), `installing` (animated bar), `ok` (check + `instalado`), `fail`
+(danger border + `Reintentar <componente>` primary CTA and `Continuar de todos modos`).
+
+Flow order (owner amendment L10): mode choice (V4) → suite install (V21, only when local
+is included) → QR scan (V1) → pairing progress (V3) → mode entry (V5/V14). Local-only:
+V4 → V21 → V14, nothing scans. PC-only: V4 → V1 directly, no phone-side install.
+
+Reactions:
+
+| Tap | Reaction | Call | Notes |
+|---|---|---|---|
+| row | toggles selection | — | engram auto-checks when gentle-shell is checked |
+| **Instalar N** | installs the picked set inside the app sandbox, per-component state | `fs_*` FFI | honest per-component failure, never blocks the others |
+| **Continuar de todos modos** | proceeds with whatever succeeded | — | failures stay installable later from Ajustes |
+
+Implementation (T7b part 1, `/suite-install`): the selection reducer with the
+dependency rule, the per-component install runner (`installing` → `ok` | `fail`,
+never blocking the others), the `{component, ok|fail, raw}` log and the record live
+in `mobile/lib/suite.ts` and are pinned by `mobile/test/suite-install.test.mjs`;
+`mobile/app/suite-install.tsx` is the rendering shell. Dependency is enforced in
+state, not announced: checking gentle-shell checks engram, unchecking engram
+unchecks gentle-shell (engram alone stays valid). Result persisted in
+`AsyncStorage` under `gentle-movil:suite` as
+`{ gentleShell, engram, gentleAi }`, written after every component settles (a
+failure persists as `false`) so Ajustes can read it later. The installer is still
+**simulated** (600–900 ms per row, logged as `simulado · …`): the real `fs_*`
+sandbox install belongs to the local-mode slice (T9). Routing as implemented: V4
+`ambos` | `local` → V21, `conectado` → V1; on completion `ambos` → V1, `local` stays
+on V21 and logs `local route pending` honestly while the V14 root is still a stub.
 
 ---
 

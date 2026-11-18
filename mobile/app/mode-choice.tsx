@@ -5,6 +5,7 @@ import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { logger } from '../lib/logger';
+import { MODE_STORAGE_KEY, routeForMode, type AppMode } from '../lib/suite';
 import { colors, elevation, radius, spacing, typography } from '../lib/theme';
 
 /**
@@ -13,19 +14,21 @@ import { colors, elevation, radius, spacing, typography } from '../lib/theme';
  * §V4).
  *
  * Three radio cards (`Ambos` preselected) and one CTA that persists the choice
- * in `AsyncStorage` under `gentle-movil:mode` before routing:
+ * in `AsyncStorage` under `gentle-movil:mode` before routing. The route depends
+ * on whether local is included (`routeForMode` in `mobile/lib/suite.ts`):
  *
  * - `conectado` → V1 (`/scan-qr`), the PC side of the flow;
- * - `local` → `/local` (still a stub: it is logged as `local route pending`,
- *   never silently swallowed);
- * - `ambos` → `/scan-qr` first, local stays enabled there.
+ * - `ambos` → V21 suite installer (`/suite-install`), which continues to V1;
+ * - `local` → V21 suite installer too; the local root is still a stub, so V21
+ *   logs `local route pending` instead of pretending a route exists (never
+ *   silently swallowed).
  */
 
-/** AsyncStorage key of the persisted mode. */
-export const MODE_STORAGE_KEY = 'gentle-movil:mode';
+/** AsyncStorage key of the persisted mode (also read by V21). */
+export { MODE_STORAGE_KEY };
 
 /** The three modes of the artboard. */
-export type AppMode = 'conectado' | 'local' | 'ambos';
+export type { AppMode };
 
 interface ModeCard {
   mode: AppMode;
@@ -58,11 +61,6 @@ const CARDS: readonly ModeCard[] = [
     secondary: 'El repo se sincroniza al volver.',
   },
 ];
-
-/** Route the CTA pushes for the chosen mode (`null` when still a stub). */
-function routeFor(mode: AppMode): string | null {
-  return mode === 'local' ? '/local' : '/scan-qr';
-}
 
 /** Tiny icon shapes drawn with Views — no extra SVG dependency in this slice. */
 function ModeIcon({ mode }: { mode: AppMode }) {
@@ -113,15 +111,11 @@ export default function ModeChoiceScreen() {
       // remembered — say so instead of pretending it was saved.
       log.failure('persist-mode', error, null);
     }
-    const target = routeFor(mode);
+    // `ambos` and `local` both install the phone-side suite first (V21, owner
+    // amendment L10); only `conectado` goes straight to the QR scan.
+    const target = routeForMode(mode);
+    log.info('siguiente paso', { mode, target });
     try {
-      if (target === null) {
-        log.warn('local route pending', { mode });
-        return;
-      }
-      if (target === '/local') {
-        log.warn('local route pending', { mode });
-      }
       router.push(target);
     } catch (error) {
       log.failure('navigate', error, { mode, target });
