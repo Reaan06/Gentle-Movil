@@ -179,6 +179,12 @@ pub extern "C" fn gc_ssh_connect(cfg_json: *const c_char) -> *mut c_char {
 /// `manifest` is the signed release manifest `{"sha256":"<64 hex>","signature":"<hex>"}`,
 /// whose signature covers the `sha256` string (§3.2).
 ///
+/// The three provisioning steps are bound to each other: `upload` records the digest of the
+/// bytes it wrote for `remotePath`, `verify` marks the digest it actually accepted, and
+/// `start` refuses a `remotePath` whose recorded digest was never verified — so verifying one
+/// payload cannot authorize an uploaded one. A `start` on an unverified path answers
+/// `{"ok":false,"error":{"kind":"ssh",…}}` and runs nothing on the host.
+///
 /// Output: `{"ok":true,"step":"detect","result":{…}}`.
 #[no_mangle]
 pub extern "C" fn gc_provision_step(session_id: u64, step_json: *const c_char) -> *mut c_char {

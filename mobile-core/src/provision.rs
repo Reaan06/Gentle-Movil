@@ -27,12 +27,17 @@
 //! ## Security posture
 //!
 //! * A binary is never started before [`verify_manifest`] accepted both its SHA-256 and
-//!   its ed25519 release signature (§3.2, §8).
+//!   its ed25519 release signature (§3.2, §8), *and* the process recorded that verification
+//!   for the exact bytes it uploaded to that path. The three steps are bound through a
+//!   process-wide registry, so "verify this other payload" cannot authorize an uploaded
+//!   path and [`start_daemon`] refuses unverified bytes.
 //! * The previous binary is copied to `<path>.prev` *before* the upload overwrites it, and
 //!   [`rollback`] restores it, which is the §5 failure window.
 //! * Every remote path is single-quote escaped before it reaches a shell, so a malicious
 //!   or merely odd path cannot inject a command on the host.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -83,6 +88,64 @@ const SFTP_HANDLE: u8 = 102;
 const SFTP_OPEN_WRITE_CREATE_TRUNCATE: u32 = 2 | 8 | 16;
 /// Exit code [`rollback`] uses to report "there is nothing to restore".
 const ROLLBACK_NOTHING_TO_RESTORE: u32 = 3;
+
+/// What this process did with one remote daemon path: the digest of the bytes it uploaded
+/// there and whether a release manifest covered exactly those bytes (§3.2, S7). Together they
+/// bind upload → verify → start, so verifying some other payload authorizes nothing.
+#[derive(Debug)]
+struct Provisioned {
+    /// Lowercase hex SHA-256 of the bytes [`upload_daemon`] wrote to the path.
+    digest: String,
+    /// Whether [`verify_manifest`] accepted a manifest for exactly `digest`.
+    verified: bool,
+}
+
+/// Process-wide provisioning registry, keyed by remote daemon path.
+static PROVISIONED: OnceLock<Mutex<HashMap<String, Provisioned>>> = OnceLock::new();
+
+/// The registry, created on first use.
+fn registry() -> &'static Mutex<HashMap<String, Provisioned>> {
+    PROVISIONED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Lock the registry, reporting a poisoned lock as an error instead of panicking (§7).
+fn lock_registry() -> Result<MutexGuard<'static, HashMap<String, Provisioned>>, CoreError> {
+    registry().lock().map_err(|_| {
+        CoreError::ssh(
+            "the provisioning registry is unusable: a previous failure poisoned it, so no daemon can be started in this process",
+        )
+    })
+}
+
+/// Record that `remote_path` now holds `digest`, clearing any earlier verification of it.
+fn record_upload(remote_path: &str, digest: &str) -> Result<(), CoreError> {
+    let entry = Provisioned {
+        digest: digest.to_string(),
+        verified: false,
+    };
+    lock_registry()?.insert(remote_path.to_string(), entry);
+    Ok(())
+}
+
+/// Mark every path holding exactly `digest` as verified; a different digest authorizes nothing.
+fn record_verification(digest: &str) -> Result<(), CoreError> {
+    let mut registry = lock_registry()?;
+    for entry in registry.values_mut().filter(|entry| entry.digest == digest) {
+        entry.verified = true;
+    }
+    Ok(())
+}
+
+/// The §3.2 gate: refuse a path whose uploaded bytes this process never verified.
+fn require_verified(remote_path: &str) -> Result<(), CoreError> {
+    let entry = lock_registry()?.get(remote_path).map(|entry| entry.verified);
+    if entry == Some(true) {
+        return Ok(());
+    }
+    Err(CoreError::ssh(format!(
+        "the binary at {remote_path} was not verified by this process: upload its bytes and verify a release manifest for those exact bytes before starting it"
+    )))
+}
 
 /// Where the daemon runs: what the host is and which binary slice it needs (§3.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +294,10 @@ pub async fn upload_daemon(
     let output = session.exec_once(&chmod).await?;
     expect_success("chmod +x on the uploaded daemon", output)?;
 
+    // These exact bytes are what a later `start` would execute, so record them as unverified
+    // (a previous verification of this path no longer covers what is on the host).
+    record_upload(remote_path, &sha256_hex(local_bytes))?;
+
     Ok(UploadResult {
         remote_path: remote_path.to_string(),
         bytes_written: local_bytes.len() as u64,
@@ -284,6 +351,10 @@ pub fn verify_manifest(
         ));
     }
 
+    // Only the digest that passed both checks becomes startable; verifying other bytes leaves
+    // whatever was uploaded for a path unverified.
+    record_verification(&digest)?;
+
     Ok(VerifyReport {
         sha256: digest,
         verified: true,
@@ -299,15 +370,26 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 ///
 /// Uses the §5 window ([`START_TIMEOUT`]). A daemon that does not answer in time is
 /// terminated and reported, and the caller's next step is [`rollback`].
+///
+/// This is the only production entry point, and it refuses a `remote_path` whose uploaded
+/// bytes this process never verified (§3.2, S7): uploading unsigned bytes, verifying some
+/// other payload and starting the uploaded path is not possible.
 pub async fn start_daemon(
     session: &SshSession,
     remote_path: &str,
     port: u16,
 ) -> Result<StartResult, CoreError> {
+    if remote_path.trim().is_empty() {
+        return Err(CoreError::ssh("the remote daemon path must not be empty"));
+    }
+    require_verified(remote_path)?;
     start_daemon_with_timeout(session, remote_path, port, START_TIMEOUT).await
 }
 
 /// [`start_daemon`] with an explicit readiness window, so offline tests do not wait 10 s.
+///
+/// Readiness primitive only: it does **not** consult the provisioning registry, so production
+/// callers must go through [`start_daemon`], which applies the §3.2 verification gate first.
 ///
 /// The window bounds the probe itself, and any failure after the detached start kills that
 /// exact pid before returning: a stale daemon must not survive [`rollback`] (§5, S7).

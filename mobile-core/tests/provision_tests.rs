@@ -15,8 +15,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use mobile_core::cabi;
 use mobile_core::device_key;
 use mobile_core::provision::{
-    detect_host, register_device_with_timeout, rollback, sha256_hex, start_daemon_with_timeout,
-    upload_daemon, verify_manifest, verify_release_signature, ReleaseManifest,
+    detect_host, register_device_with_timeout, rollback, sha256_hex, start_daemon,
+    start_daemon_with_timeout, upload_daemon, verify_manifest, verify_release_signature,
+    ReleaseManifest,
 };
 use mobile_core::ssh::{
     BoxFuture, ChannelEvent, ConnectRequest, ExecOutput, SshCredential, SshSession, Transport,
@@ -25,6 +26,9 @@ use mobile_core::ssh::{
 
 const FP: &str = "aa11bb22cc33dd44ee55ff6600778899aa11bb22cc33dd44ee55ff6600778899";
 const REMOTE_PATH: &str = "/home/reaan/.gentle-movil/daemon";
+/// Remote path the C ABI test uses. The provisioning registry is process-wide and keyed by
+/// path, so this test needs a path no other test uploads to.
+const ABI_REMOTE_PATH: &str = "/home/reaan/.gentle-movil/daemon-abi";
 const DEVICE_PUBKEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 const INVITE: &str = "inv_7Qp2";
 
@@ -633,6 +637,123 @@ fn verify_release_signature_checks_the_bytes_themselves() {
     assert!(!verify_release_signature("nope", payload, &signature_hex));
 }
 
+// --------------------------------------------------------------------------------------
+// The provisioning registry binds upload -> verify -> start
+// --------------------------------------------------------------------------------------
+
+/// Script and run one upload of `bytes` to `path`, returning the session that did it.
+async fn upload_for(script: &Arc<Shared>, path: &str, bytes: &[u8]) -> SshSession {
+    script.push_exec(exec_ok("")); // backup copy
+    script.push_exec(exec_ok("")); // chmod +x
+    script.push_sftp(sftp_ok_sequence(1));
+    let session = mock_session(script).await;
+    upload_daemon(&session, bytes, path).await.expect("uploaded");
+    session
+}
+
+/// Assert `start` refused because these bytes were never verified, and that the host ran
+/// nothing for the refused start (`uploaded_commands` is what the uploads themselves ran).
+fn assert_unverified(
+    error: mobile_core::CoreError,
+    path: &str,
+    script: &Shared,
+    uploaded_commands: usize,
+) {
+    assert_eq!(error.kind(), "ssh");
+    let message = error.to_string();
+    assert!(
+        message.contains("was not verified by this process"),
+        "{message}"
+    );
+    assert!(message.contains(path), "the message must name the path: {message}");
+    let commands = script.commands();
+    assert!(
+        !commands.iter().any(|command| command.contains("nohup")),
+        "a refused start must not execute anything: {commands:?}"
+    );
+    assert_eq!(commands.len(), uploaded_commands, "{commands:?}");
+}
+
+#[tokio::test]
+async fn start_refuses_a_path_that_was_uploaded_but_never_verified() {
+    // Every registry test uses its own remote path: the registry is process-wide and the
+    // offline suite runs these tests in parallel.
+    let path = "/tmp/gc-provision-registry/never-verified/daemon";
+    let script = shared();
+    let session = upload_for(&script, path, &[0xa1u8; 64]).await;
+
+    let error = start_daemon(&session, path, 43722)
+        .await
+        .expect_err("an unverified upload must not start");
+    assert_unverified(error, path, &script, 2);
+}
+
+#[tokio::test]
+async fn verifying_different_bytes_does_not_authorize_the_uploaded_path() {
+    let path = "/tmp/gc-provision-registry/other-bytes/daemon";
+    let release = device_key::generate();
+    let script = shared();
+    let session = upload_for(&script, path, &[0xb2u8; 64]).await;
+
+    // A legitimate, correctly signed *other* payload: verifying it must authorize nothing.
+    let other = vec![0xb3u8; 48];
+    let manifest = signed_binary(&release, &other);
+    let report = verify_manifest(&release.public_hex, &other, &manifest).expect("other verified");
+    assert!(report.verified);
+
+    let error = start_daemon(&session, path, 43722)
+        .await
+        .expect_err("verifying other bytes must not authorize the upload");
+    assert_unverified(error, path, &script, 2);
+}
+
+#[tokio::test]
+async fn start_runs_a_path_whose_uploaded_bytes_were_verified() {
+    let path = "/tmp/gc-provision-registry/verified/daemon";
+    let release = device_key::generate();
+    let binary = vec![0xc3u8; 96];
+    let manifest = signed_binary(&release, &binary);
+
+    let script = shared();
+    let session = upload_for(&script, path, &binary).await;
+    script.push_exec(exec_ok("6060\n")); // detached start
+    script.push_tcp(TcpReply::Events(vec![])); // readiness probe answers
+
+    verify_manifest(&release.public_hex, &binary, &manifest).expect("verified");
+    // Verifying twice is idempotent and keeps the path startable.
+    verify_manifest(&release.public_hex, &binary, &manifest).expect("still verified");
+
+    let started = start_daemon(&session, path, 43722)
+        .await
+        .expect("a verified upload starts");
+    assert_eq!(started.pid, 6060);
+    assert_eq!(started.port, 43722);
+
+    let commands = script.commands();
+    assert_eq!(commands.len(), 3, "{commands:?}");
+    assert!(commands[2].starts_with("sh -c 'nohup "), "{}", commands[2]);
+}
+
+#[tokio::test]
+async fn re_uploading_after_verification_returns_the_path_to_unverified() {
+    let path = "/tmp/gc-provision-registry/re-uploaded/daemon";
+    let release = device_key::generate();
+    let binary = vec![0xd4u8; 72];
+    let manifest = signed_binary(&release, &binary);
+
+    let script = shared();
+    let session = upload_for(&script, path, &binary).await;
+
+    verify_manifest(&release.public_hex, &binary, &manifest).expect("verified");
+    // The bytes on the host were rewritten, so the earlier verification no longer covers them.
+    upload_for(&script, path, &binary).await;
+
+    let error = start_daemon(&session, path, 43722)
+        .await
+        .expect_err("a re-upload is unverified again");
+    assert_unverified(error, path, &script, 4);
+}
+
 #[tokio::test]
 async fn start_reports_the_detached_pid_and_port() {
     let script = shared();
@@ -1212,7 +1333,7 @@ fn c_abi_drives_the_whole_provisioning_sequence() {
     assert_eq!(answer["result"]["arch"], "aarch64");
 
     let upload = CString::new(format!(
-        r#"{{"step":"upload","remotePath":"{REMOTE_PATH}","dataHex":"{}"}}"#,
+        r#"{{"step":"upload","remotePath":"{ABI_REMOTE_PATH}","dataHex":"{}"}}"#,
         mobile_core::fingerprint::hex_lower(&binary)
     ))
     .expect("no NUL");
@@ -1236,7 +1357,7 @@ fn c_abi_drives_the_whole_provisioning_sequence() {
     assert_eq!(answer["result"]["sha256"], manifest.sha256);
 
     let start = CString::new(format!(
-        r#"{{"step":"start","remotePath":"{REMOTE_PATH}","port":43722}}"#
+        r#"{{"step":"start","remotePath":"{ABI_REMOTE_PATH}","port":43722}}"#
     ))
     .expect("no NUL");
     let answer = call_json(cabi::gc_provision_step(session_id, start.as_ptr()));
@@ -1252,7 +1373,7 @@ fn c_abi_drives_the_whole_provisioning_sequence() {
     assert_eq!(answer["result"]["daemon_version"], "0.6.2");
 
     let rollback = CString::new(format!(
-        r#"{{"step":"rollback","remotePath":"{REMOTE_PATH}"}}"#
+        r#"{{"step":"rollback","remotePath":"{ABI_REMOTE_PATH}"}}"#
     ))
     .expect("no NUL");
     let answer = call_json(cabi::gc_provision_step(session_id, rollback.as_ptr()));
@@ -1260,7 +1381,7 @@ fn c_abi_drives_the_whole_provisioning_sequence() {
     assert_eq!(answer["error"]["kind"], "ssh");
     assert_eq!(
         answer["error"]["message"],
-        "ssh: cannot roll back: the host has no previous daemon binary at /home/reaan/.gentle-movil/daemon.prev"
+        "ssh: cannot roll back: the host has no previous daemon binary at /home/reaan/.gentle-movil/daemon-abi.prev"
     );
 }
 
