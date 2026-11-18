@@ -4,10 +4,12 @@
  *
  * What is pinned here:
  * - the `gc://pair` payload shape the app parses (`mobile/lib/qr-parse.ts`);
- * - status exit codes for "nothing listening" and "extension reachable" on the
- *   loopback ports (43721 device surface / 43722 by default);
+ * - status exit codes for the three loopback states (43721 control surface /
+ *   43722 device surface by default): bridge identity confirmed, a port that
+ *   answers with something else (the real camera-preview impostor), and nothing
+ *   listening at all;
  * - doctor's four S9 checks and its honest non-zero exit when the extension is
- *   absent;
+ *   absent or when the port answers as something that is not the bridge;
  * - the self-contained QR renderer (no npm dependency: the CLI must run with
  *   Node alone).
  *
@@ -70,17 +72,50 @@ function freePort() {
   });
 }
 
-/** An HTTP 204 listener on a fresh loopback port (a reachable extension stand-in). */
-function listeningServer() {
+/** The identity document the bridge contract fixes (both sides implement it). */
+const BRIDGE_HEALTH = {
+  app: 'gentle-shell',
+  bridge: 'gentle-movil',
+  proto: 1,
+  version: '0.4.1',
+};
+
+/** A fresh loopback HTTP server started by the test itself, on an ephemeral port. */
+function stubServer(handler) {
   return new Promise((resolve, reject) => {
-    const server = createServer((_req, res) => {
-      res.statusCode = 204;
-      res.end();
-    });
+    const server = createServer(handler);
     server.once('error', reject);
     server.listen(0, '127.0.0.1', () =>
       resolve({ server, port: server.address().port }),
     );
+  });
+}
+
+/** A real bridge stand-in: `GET /api/health` answers the contract document. */
+function bridgeServer(overrides = {}) {
+  return stubServer((req, res) => {
+    if (req.url !== '/api/health') {
+      res.statusCode = 404;
+      res.end('not found');
+      return;
+    }
+    res.setHeader('content-type', 'application/json');
+    res.statusCode = 200;
+    res.end(JSON.stringify({ ...BRIDGE_HEALTH, ...overrides }));
+  });
+}
+
+/**
+ * The impostor from the real incident: a leftover Rust daemon answering 200 on
+ * the extension port with a camera-preview page (etag `camera-v2-preview-v1`).
+ * Nothing about this response is the bridge, yet it is a perfectly good HTTP 200.
+ */
+function impostorServer() {
+  return stubServer((_req, res) => {
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+    res.setHeader('etag', 'camera-v2-preview-v1');
+    res.statusCode = 200;
+    res.end('<!doctype html><title>camera preview</title>');
   });
 }
 
@@ -201,22 +236,97 @@ test('status exits 1 with an honest line when nothing listens on loopback', asyn
   const result = await runCli(['status'], { GENTLE_MOVIL_PORTS: ports.join(',') });
   assert.equal(result.status, 1, result.stderr);
   for (const port of ports) {
-    assert.match(result.stdout, new RegExp(`127\\.0\\.0\\.1:${port}`), `port ${port} is named`);
+    const line = result.stdout
+      .split('\n')
+      .find((entry) => entry.includes(`127.0.0.1:${port}`));
+    assert.ok(line, `port ${port} is named:\n${result.stdout}`);
+    assert.match(line, /^\s*\u2717 /, `nothing listening is a ✗ line: ${line}`);
+    assert.match(line, /unreachable/, line);
+    assert.match(line, /ECONNREFUSED \u2014 nothing listening/, line);
   }
-  assert.match(result.stdout, /nothing listening/, result.stdout);
+  assert.match(result.stdout, /extension: not reachable/, result.stdout);
   assert.equal(result.stderr, '');
 });
 
-test('status exits 0 when the extension answers on every loopback port', async () => {
-  const servers = [await listeningServer(), await listeningServer()];
+test('status exits 0 only when every loopback port identifies as the bridge', async () => {
+  const servers = [await bridgeServer(), await bridgeServer()];
   try {
     const ports = servers.map((entry) => entry.port).join(',');
     const result = await runCli(['status'], { GENTLE_MOVIL_PORTS: ports });
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /HTTP 204/, 'the HTTP answer is reported per port');
+    assert.equal(result.stderr, '');
+    for (const { port } of servers) {
+      const line = result.stdout
+        .split('\n')
+        .find((entry) => entry.includes(`127.0.0.1:${port}`));
+      assert.ok(line, `port ${port} is named:\n${result.stdout}`);
+      assert.match(line, /^\s*\u2713 /, `bridge identity is a ✓ line: ${line}`);
+      assert.match(line, /reachable/, line);
+      assert.match(line, /app=gentle-shell bridge=gentle-movil proto=1/, line);
+      assert.match(line, /version 0\.4\.1/, line);
+    }
+    assert.match(result.stdout, /extension: reachable/, result.stdout);
   } finally {
     for (const { server } of servers) await closeServer(server);
   }
+});
+
+test('status reports a port that answers as an impostor, never as success', async () => {
+  const servers = [await bridgeServer(), await impostorServer()];
+  try {
+    const [bridge, impostor] = servers;
+    const result = await runCli(['status'], {
+      GENTLE_MOVIL_PORTS: servers.map((entry) => entry.port).join(','),
+    });
+    assert.equal(result.status, 1, 'an answering impostor port is not a reachable bridge');
+    assert.equal(result.stderr, '');
+
+    const bridgeLine = result.stdout
+      .split('\n')
+      .find((line) => line.includes(`127.0.0.1:${bridge.port}`));
+    assert.match(bridgeLine, /^\s*\u2713 /, `the real bridge still passes: ${bridgeLine}`);
+
+    const impostorLine = result.stdout
+      .split('\n')
+      .find((line) => line.includes(`127.0.0.1:${impostor.port}`));
+    assert.ok(impostorLine, `impostor port is named:\n${result.stdout}`);
+    assert.match(impostorLine, /^\s*\u2717 /, `an impostor is a ✗ line: ${impostorLine}`);
+    assert.match(impostorLine, /not the bridge/, impostorLine);
+    assert.match(impostorLine, /port answering, but it is not the Gentle Shell bridge/, impostorLine);
+    assert.match(impostorLine, /HTTP 200/, 'the misleading 200 is reported as what was seen');
+    assert.match(impostorLine, /content-type text\/html/, impostorLine);
+    assert.match(impostorLine, /etag camera-v2-preview-v1/, impostorLine);
+    assert.doesNotMatch(impostorLine, /reachable/, 'never claims the impostor is reachable');
+
+    assert.match(result.stdout, /extension: not the bridge/, result.stdout);
+    assert.doesNotMatch(result.stdout, /extension: reachable/, result.stdout);
+  } finally {
+    for (const { server } of servers) await closeServer(server);
+  }
+});
+
+test('status rejects a document that only partly carries the identity', async () => {
+  const servers = [
+    await bridgeServer({ proto: 2 }),
+    await bridgeServer({ bridge: 'other-bridge' }),
+  ];
+  try {
+    const result = await runCli(['status'], {
+      GENTLE_MOVIL_PORTS: servers.map((entry) => entry.port).join(','),
+    });
+    assert.equal(result.status, 1, result.stdout);
+    assert.match(result.stdout, /proto=2/, 'the observed proto is named');
+    assert.match(result.stdout, /bridge="other-bridge"/, 'the observed bridge is named');
+  } finally {
+    for (const { server } of servers) await closeServer(server);
+  }
+});
+
+test('status keeps GENTLE_MOVIL_PORTS validation loud (exit 2)', async () => {
+  const result = await runCli(['status'], { GENTLE_MOVIL_PORTS: 'nope,43721' });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /GENTLE_MOVIL_PORTS is invalid/);
+  assert.equal(result.stdout, '');
 });
 
 test('doctor prints the four S9 checks and fails honestly without the extension', async () => {
@@ -236,8 +346,8 @@ test('doctor prints the four S9 checks and fails honestly without the extension'
   assert.match(result.stdout, /127\.0\.0\.1/, 'the extension check names the loopback surface');
 });
 
-test('doctor passes its extension check when a listener answers on loopback', async () => {
-  const servers = [await listeningServer(), await listeningServer()];
+test('doctor passes its extension check when the bridge identifies itself', async () => {
+  const servers = [await bridgeServer(), await bridgeServer()];
   try {
     const ports = servers.map((entry) => entry.port).join(',');
     const result = await runCli(['doctor'], { GENTLE_MOVIL_PORTS: ports });
@@ -246,6 +356,29 @@ test('doctor passes its extension check when a listener answers on loopback', as
       .find((line) => line.includes('extension'));
     assert.ok(extensionLine, result.stdout);
     assert.match(extensionLine, /^\u2713 /, `extension check must pass: ${extensionLine}`);
+    assert.match(extensionLine, /app=gentle-shell bridge=gentle-movil proto=1/, extensionLine);
+  } finally {
+    for (const { server } of servers) await closeServer(server);
+  }
+});
+
+test('doctor fails its extension check on a port answering as an impostor', async () => {
+  const servers = [await bridgeServer(), await impostorServer()];
+  try {
+    const result = await runCli(['doctor'], {
+      GENTLE_MOVIL_PORTS: servers.map((entry) => entry.port).join(','),
+    });
+    assert.equal(result.status, 1, 'an impostor is a failed preflight');
+    assert.equal(result.stderr, '', 'checks report on stdout, no stack traces');
+
+    const extensionLine = result.stdout
+      .split('\n')
+      .find((line) => line.includes('extension'));
+    assert.ok(extensionLine, result.stdout);
+    assert.match(extensionLine, /^\u2717 /, `impostor must fail the check: ${extensionLine}`);
+    assert.match(extensionLine, /port answering, but it is not the Gentle Shell bridge/, extensionLine);
+    assert.match(extensionLine, /etag camera-v2-preview-v1/, extensionLine);
+    assert.doesNotMatch(extensionLine, /app=gentle-shell/, 'no identity claim on a failed line');
   } finally {
     for (const { server } of servers) await closeServer(server);
   }

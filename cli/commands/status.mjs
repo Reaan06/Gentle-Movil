@@ -3,11 +3,13 @@
  * `gentle-movil status` — is the Gentle Shell/Pi extension answering on
  * loopback? (S2: there is no daemon anymore, only the agent's own extension.)
  *
- * Probes 127.0.0.1:43721 (control surface) and 127.0.0.1:43722 (device surface
- * the tablet tunnels into) with a short HTTP GET, falling back to a TCP connect
- * so "listening but not HTTP" is reported honestly. Exit 0 only when every
- * configured port answers; 1 when any does not; 2 when GENTLE_MOVIL_PORTS is
- * malformed.
+ * Probing 127.0.0.1:43721 (control surface) and 127.0.0.1:43722 (device surface
+ * the tablet tunnels into) asks the bridge to identify itself
+ * (`GET /api/health` → `app:"gentle-shell"`, `bridge:"gentle-movil"`, `proto:1`).
+ * Three states are reported honestly: the bridge, a port answering as something
+ * else (a leftover daemon, never a success), and nothing listening. Exit 0 only
+ * when every configured port identifies as the bridge; 1 otherwise; 2 when
+ * GENTLE_MOVIL_PORTS is malformed.
  */
 import {
   allReachable,
@@ -32,6 +34,16 @@ export async function run(_args) {
   if (allReachable(results)) {
     console.log('\nextension: reachable — the tablet can tunnel to the agent through SSH.');
     return 0;
+  }
+
+  const impostors = results.filter((result) => result.state === 'impostor');
+  if (impostors.length > 0) {
+    console.log(
+      `\nextension: not the bridge — ${impostors
+        .map((result) => `127.0.0.1:${result.port}`)
+        .join(', ')} answered, but not as Gentle Shell/Pi. Stop whatever owns that port and start the extension (no daemon, no sudo).`,
+    );
+    return 1;
   }
 
   console.log(

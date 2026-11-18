@@ -7,7 +7,10 @@
  * 1. sshd is active (systemd unit `sshd`, then `ssh` on distros that name it so);
  * 2. the ed25519 SSH host key is readable (TOFU fingerprint source);
  * 3. a LAN IPv4 address exists (the tablet must reach this host);
- * 4. the Gentle Shell/Pi extension answers on loopback 43721/43722.
+ * 4. the Gentle Shell/Pi extension identifies itself on loopback 43721/43722
+ *    (`GET /api/health` → `app:"gentle-shell"`, `bridge:"gentle-movil"`,
+ *    `proto:1`). A port that only answers HTTP is not the bridge: it is reported
+ *    as an impostor, naming what was observed.
  *
  * Exit 1 when any check fails, so "why can't the tablet connect?" is one
  * command. Missing extension is a normal, honestly reported failure — never a
@@ -18,7 +21,6 @@ import { execFileSync } from 'node:child_process';
 
 import { ED25519_HOST_KEY, detectSshPort, lanAddress } from '../lib/pairing.mjs';
 import {
-  allReachable,
   describeProbe,
   extensionPorts,
   probeExtensionPorts,
@@ -86,11 +88,12 @@ export async function run(_args) {
   })) && ok;
 
   ok = (await check(
-    `Gentle Shell extension reachable on loopback ${ports.join('/')}`,
+    `Gentle Shell extension identified on loopback ${ports.join('/')}`,
     async () => {
       const results = await probeExtensionPorts(ports);
-      if (!allReachable(results)) {
-        throw new Error(results.map(describeProbe).join('; '));
+      const failing = results.filter((result) => !result.reachable);
+      if (failing.length > 0) {
+        throw new Error(failing.map(describeProbe).join('; '));
       }
       return results.map(describeProbe).join('; ');
     },
