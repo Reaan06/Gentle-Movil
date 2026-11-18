@@ -20,6 +20,13 @@
 
 import { requireNativeModule } from 'expo-modules-core';
 
+import {
+  RUNTIME_DEFAULT_TIMEOUT_MS,
+  RUNTIME_MAX_TIMEOUT_MS,
+  runtimeUnavailableEnvelope,
+} from './src/runtime.ts';
+import type { RuntimeMethod } from './src/runtime.ts';
+
 /** Function names of the frozen C ABI (`gc_*` symbols). */
 export type GcFunction =
   | 'gc_abi_version'
@@ -148,4 +155,95 @@ export async function sshChannelRead(payloadJson: string): Promise<string> {
 /** `gc_ssh_channel_close` — `{sessionId, channelId}`. */
 export async function sshChannelClose(payloadJson: string): Promise<string> {
   return callGc('gc_ssh_channel_close', payloadJson);
+}
+
+/* ------------------------------------------------------------------ *
+ * Bundled phone runtime (T9a)
+ *
+ * Second native module of this Expo module: `GentleRuntime` execs the two
+ * binaries the APK ships as libraries — `nativeLibraryDir/libnode.so` and
+ * `nativeLibraryDir/libgentle_ai.so` — with `LD_LIBRARY_PATH` pointing at that
+ * same directory (see `scripts/fetch-runtime.sh`). Same rules as the core:
+ * every argument is an argv array (never a shell string) and every answer is a
+ * JSON envelope, so `src/runtime.ts` (pure, tested by `mobile/test/runtime.test.mjs`)
+ * can turn it into a typed result.
+ *
+ * Graceful absence: this module and `GentleCore` are registered separately, so a
+ * build that has the core but not the runtime (or Expo Go) answers
+ * `{"ok":false,…,"error":{"kind":"Unavailable"}}` instead of throwing.
+ * ------------------------------------------------------------------ */
+
+/** Shape of the Kotlin runtime module (`GcRuntimeModule.kt`). */
+export interface GentleRuntimeNativeModule {
+  /** Execs `libnode.so` with `args`; answers `{ok, exitCode, stdout, stderr}`. */
+  runNode(args: string[], timeoutMs: number): Promise<string>;
+  /** Execs `libgentle_ai.so` with `args`. */
+  runGentleAi(args: string[], timeoutMs: number): Promise<string>;
+  /** Where the binaries are and whether they are executable (diagnostics). */
+  runtimeInfo(): Promise<string>;
+}
+
+let runtimeModule: GentleRuntimeNativeModule | null = null;
+let runtimeLoadError = '';
+
+try {
+  runtimeModule = requireNativeModule<GentleRuntimeNativeModule>('GentleRuntime');
+} catch (error) {
+  runtimeLoadError = error instanceof Error ? error.message : String(error);
+}
+
+/** True when the `GentleRuntime` native module is registered in this build. */
+export function runtimeModuleAvailable(): boolean {
+  return runtimeModule !== null;
+}
+
+/** Why the runtime module is missing (`''` when it is registered). */
+export function runtimeModuleUnavailableReason(): string {
+  return runtimeModule === null ? runtimeLoadError : '';
+}
+
+/**
+ * Dispatches one runtime call and always answers an envelope string.
+ * Never rejects: a transport failure or a missing module becomes
+ * `{ok:false,…,"error":{"kind":"Unavailable"|"NativeError"}}`.
+ */
+export async function callRuntime(
+  method: RuntimeMethod | string,
+  args: readonly string[],
+  timeoutMs: number,
+): Promise<string> {
+  if (runtimeModule === null) {
+    return runtimeUnavailableEnvelope(
+      runtimeLoadError || 'el módulo nativo GentleRuntime no está registrado en esta build',
+    );
+  }
+  // A non-finite timeout (NaN/Infinity) would reach the bridge as garbage.
+  const requested = Number.isFinite(timeoutMs) ? Math.trunc(timeoutMs) : RUNTIME_DEFAULT_TIMEOUT_MS;
+  const bounded = Math.min(Math.max(requested, 1_000), RUNTIME_MAX_TIMEOUT_MS);
+  const argv = args.map((arg) => String(arg));
+  try {
+    if (method === 'runNode') {
+      return await runtimeModule.runNode(argv, bounded);
+    }
+    if (method === 'runGentleAi') {
+      return await runtimeModule.runGentleAi(argv, bounded);
+    }
+    return runtimeUnavailableEnvelope(`El runtime no expone «${String(method)}».`);
+  } catch (error) {
+    return runtimeUnavailableEnvelope(error instanceof Error ? error.message : String(error));
+  }
+}
+
+/** `runtimeInfo` — resolved paths, so a device report can name the real files. */
+export async function runtimeInfo(): Promise<string> {
+  if (runtimeModule === null) {
+    return runtimeUnavailableEnvelope(
+      runtimeLoadError || 'el módulo nativo GentleRuntime no está registrado en esta build',
+    );
+  }
+  try {
+    return await runtimeModule.runtimeInfo();
+  } catch (error) {
+    return runtimeUnavailableEnvelope(error instanceof Error ? error.message : String(error));
+  }
 }

@@ -27,7 +27,8 @@
       "bundler": "metro"
     },
     "plugins": [
-      "expo-router"
+      "expo-router",
+      "./plugins/with-legacy-packaging"
     ],
     "splash": {
       "image": "./assets/splash-icon.png",
