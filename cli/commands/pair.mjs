@@ -8,9 +8,14 @@
  * the real ed25519 fingerprint (`/etc/ssh/*_key.pub`) and a locally generated
  * invite token/code. Nothing is fetched over HTTP and nothing leaves the box.
  *
- * moshi mode keeps the owner's decision: the QR carries the SSH password so
- * scanning alone provisions the tablet. `--invite-only` skips the password and
- * carries the pairing code instead.
+ * password-in-the-QR mode keeps the owner's decision: the QR carries the SSH
+ * password so scanning alone provisions the tablet. `--invite-only` skips the
+ * password and carries the pairing code instead.
+ *
+ * The art is measured against the terminal (`process.stdout.columns`, then
+ * `COLUMNS`): a code wider than the terminal would wrap, and a wrapped code is
+ * not scannable, so the renderer drops quiet-zone modules first and prints the
+ * payload as text when even the bare matrix cannot fit.
  *
  * Stdin that is not a TTY can never answer the password prompt, so `pair`
  * refuses loudly instead of hanging (or silently pairing without `pw`): the
@@ -27,9 +32,9 @@ import {
   randomCode,
   randomToken,
 } from '../lib/pairing.mjs';
-import { renderTerminalQr } from '../lib/qr.mjs';
+import { renderQrBlock } from '../lib/qr.mjs';
 
-/** Reads the SSH password without echoing it (moshi: the QR carries it). */
+/** Reads the SSH password without echoing it (the QR carries it). */
 function promptPassword() {
   if (!process.stdin.isTTY) {
     // Piped/scripted invocation: never hang waiting for a TTY, and never
@@ -72,7 +77,7 @@ function promptPassword() {
       }
     };
     process.stdout.write(
-      'SSH password for the QR (moshi mode — it rides inside the QR for 5 min): ',
+      'SSH password for the QR (it goes inside the QR for 5 min): ',
     );
     stdin.setRawMode?.(true);
     stdin.on('data', onData);
@@ -95,7 +100,10 @@ const main = async (args = []) => {
 
   const expiresAt = new Date(Date.now() + INVITE_TTL_SECONDS * 1000).toISOString();
 
-  console.log(renderTerminalQr(uri));
+  const qr = renderQrBlock(uri);
+
+  console.log(qr.art);
+  if (qr.note !== null) console.log(qr.note);
   console.log(`gc://pair  host=${host}  port=${port}  user=${user}`);
   console.log(`fingerprint (ed25519, sha256): ${fp.slice(0, 32)}…${fp.slice(-8)}`);
   console.log(`token: ${token} (generated locally, ${INVITE_TTL_SECONDS / 60} min TTL hint)`);
@@ -105,7 +113,9 @@ const main = async (args = []) => {
       'mode: invite-only — no SSH password in the QR; the app pairs with the already-authorized key or typed credential',
     );
   } else {
-    console.log('mode: moshi — the QR carries the SSH password (single use, 5 min)');
+    console.log(
+      'mode: password in the QR — the QR carries the SSH password (single use, 5 min)',
+    );
   }
   if (host === '127.0.0.1') {
     console.log(

@@ -2,7 +2,7 @@
 
 App móvil (Expo + core Rust con russh) que conecta la tablet del dueño con Gentle Shell/Pi corriendo en su PC. Dos modos:
 
-## Modo conectado — moshi puro
+## Modo conectado — la contraseña va en el QR
 
 Escaneás un QR que genera `gentle-movil pair` en la PC (host, puerto SSH, usuario, contraseña, huella del host). La app se conecta por SSH (russh, sin sudo), detecta la extensión Gentle Shell corriendo en loopback (43721/43722), registra la clave ed25519 del teléfono en tus `authorized_keys` y abre un túnel SSH. Todo lo que la app habla con la extensión viaja por ese túnel. Tras el primer emparejamiento, las conexiones siguientes van solo con la clave ed25519 — sin contraseña.
 

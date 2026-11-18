@@ -142,8 +142,8 @@ export function lanAddress({ interfaces = networkInterfaces() } = {}) {
  * Build the `gc://pair?v=1` URI printed as a QR (protocol spec §1).
  *
  * Field names are frozen: `v host port user token fp` are required by the app,
- * `pw` is the moshi password, `code` the invite-only fallback and
- * `dport` the extension surface (43722). `pw` is percent-encoded by
+ * `pw` is the SSH password carried in the QR, `code` the invite-only fallback
+ * and `dport` the extension surface (43722). `pw` is percent-encoded by
  * `URLSearchParams` and decoded by `mobile/lib/qr-parse.ts`.
  */
 export function buildPairUri({ host, port, user, token, fp, pw = '', code = '' }) {

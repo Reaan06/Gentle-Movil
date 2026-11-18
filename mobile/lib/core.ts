@@ -35,7 +35,7 @@ export interface PairInfo {
   fp: string;
   /** Pairing code from the QR (empty when the host generates an invite-only QR). */
   code: string;
-  /** SSH password carried in the QR (moshi model; empty on invite-only QRs). */
+  /** SSH password carried in the QR (empty on invite-only QRs). */
   pw: string;
   /** Daemon device-surface port (43722 when omitted in the QR, spec §4). */
   dport: number;

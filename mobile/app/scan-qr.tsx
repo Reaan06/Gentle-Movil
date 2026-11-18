@@ -33,7 +33,15 @@ const LEDE = 'Se conecta por SSH en tu red local. El código es de un solo uso y
 const CAPTION_PAUSED = 'Vista de referencia: así se ve el código que vas a escanear.';
 const CAPTION_LIVE = 'Apunta al QR de Gentle Movil. Se lee solo, sin tocar la pantalla.';
 
-/** Decorative QR size in the paused state (artboard: 194px inside 258px). */
+/**
+ * Size of the paused reference code, in px.
+ *
+ * The preview is a **hint**, not the screen: at ~88px it stays a small stamp
+ * inside the viewfinder frame, so the frame, the caption and the SSH
+ * alternative keep the focus (owner feedback: the reference code filled the
+ * viewport). The QR that actually matters is drawn by `pair` on the PC.
+ */
+const PREVIEW_SIZE = 88;
 const PREVIEW_GRID = 15;
 const PREVIEW_SEED = 20_261_117;
 
@@ -432,10 +440,10 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   previewQr: {
-    // 70% of the (now bigger) frame, keeps the artboard's proportion.
-    width: '70%',
-    height: '70%',
-    opacity: 0.42,
+    // Compact reference stamp (px), centred inside the viewfinder frame.
+    width: PREVIEW_SIZE,
+    height: PREVIEW_SIZE,
+    opacity: 0.38,
   },
   previewRow: {
     flex: 1,

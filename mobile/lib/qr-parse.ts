@@ -231,8 +231,8 @@ export function parsePairUri(uri: string): Result<PairInfo, QrParseError> {
     return incomplete('invalid-fp', 'fp');
   }
 
-  // Optional `pw` (moshi model): the SSH password, percent-encoded by the CLI
-  // and decoded here. Present ⇒ V3 provisions over SSH with no typing.
+  // Optional `pw`: the SSH password carried in the QR, percent-encoded by the
+  // CLI and decoded here. Present ⇒ V3 provisions over SSH with no typing.
   let pw = '';
   const pwRaw = params.get('pw');
   if (pwRaw !== undefined) {

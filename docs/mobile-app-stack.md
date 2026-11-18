@@ -23,7 +23,7 @@ tienda. Por eso el core queda **delgado y estable** (`connect`, `read`, `write`,
 ## Los dos modos (ambos obligatorios desde el día 1, Android + iOS)
 
 ### Modo conectado — controlar su PC
-1. Emparejamiento: QR (como moshi) o datos SSH manuales (IP/usuario/clave).
+1. Emparejamiento: QR con la contraseña del host o datos SSH manuales (IP/usuario/clave).
 2. El QR NO lleva claves privadas: host/puerto/usuario + token de un solo uso.
    El teléfono genera su par ed25519 y el host registra su clave pública.
 3. La app instala por SSH (SFTP) el binario del daemon si falta, verificando
@@ -68,12 +68,12 @@ gc://pair?v=1&host=<ip|hostname>&port=<ssh>&user=<u>&token=<one-time>&fp=<huella
 
 - L1 (2026-11-17): «Vamos a definir el stack. La aplicacion debe funcionar
   localmente para el usuario y debe poder conectarse mediante SSH escaneando un QR
-  como en moshi. debe poder ver sus sessiones activas crear automatizaciones y
+  como con la contraseña en el QR. debe poder ver sus sessiones activas crear automatizaciones y
   controlar su cli desde el movil y poder inicialo tambien desde el telefono...
   Expo junto a rust con OTA EAS Update». Decisión: Expo + Rust + EAS Update.
 - L2 (2026-11-17): «que la gente cuando lo instale directamente tambien lo pueda
   abrir desde la aplicacion y desarrollar desde su movil» → onboarding 100% móvil:
-  la app instala el daemon por SSH (patrón moshi).
+  la app instala el daemon por SSH (contraseña del host en el QR).
 - L3 (2026-11-17): «deben poder utilizar gentle-shell desde sus dispositivos y que
   se pueda conectar a sus pc tambien pero si no se quiere conectar y desarrollar
   desde el movil por cualquier motivo que tambien pueda» → dual-mode obligatorio,

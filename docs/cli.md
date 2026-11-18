@@ -66,7 +66,7 @@ Con el symlink instalado, es simplemente `gentle-movil pair`, `gentle-movil doct
 
 | Comando | Qué hace | Fuente |
 |---|---|---|
-| `pair` | Arma **localmente** el payload `gc://pair?v=1` y lo muestra como QR en la terminal (arte half-block, zona de silencio de 2 módulos). Campos: `host` (IP LAN leída de las interfaces), `port` (de `/etc/ssh/sshd_config`, 22 si falta), `user` (el usuario que corre el CLI), `fp` (huella ed25519, SHA-256 sobre `/etc/ssh/*_key.pub`), `token` (**generado en cada invocación**, prefijo `inv_`), `pw` (contraseña SSH en modo moshi, percent-encoded) y `dport=43722`. Modo `--invite-only`: sin `pw`, el QR lleva `code` (`AB12-CD34`, también local). Sin TTY en stdin y sin `--invite-only` no adivina ni cuelga: exit 1 con mensaje que nombra la bandera. Exit 0 cuando imprime el QR. | `cli/commands/pair.mjs` |
+| `pair` | Arma **localmente** el payload `gc://pair?v=1` y lo muestra como QR en la terminal (arte half-block, un carácter por módulo: el ancho dibujado es `módulos + 2·zona de silencio`). El arte se ajusta al ancho del terminal (`process.stdout.columns`; en pipe, `COLUMNS`; si no, 80): si no entra, baja la zona de silencio 2 → 1 → 0 y lo dice en una línea (`QR shrunk to fit N columns …`), y si ni la matriz pelada entra **no dibuja arte** (un QR envuelto no se puede escanear) e imprime el payload como texto nombrando el ancho que falta. Campos: `host` (IP LAN leída de las interfaces), `port` (de `/etc/ssh/sshd_config`, 22 si falta), `user` (el usuario que corre el CLI), `fp` (huella ed25519, SHA-256 sobre `/etc/ssh/*_key.pub`, siempre 64 hex: es la forma que el parser del teléfono acepta), `token` (**generado en cada invocación**, prefijo `inv_`), `pw` (contraseña SSH en el QR, percent-encoded) y `dport=43722`. Modo `--invite-only`: sin `pw`, el QR lleva `code` (`AB12-CD34`, también local). Sin TTY en stdin y sin `--invite-only` no adivina ni cuelga: exit 1 con mensaje que nombra la bandera. Exit 0 cuando imprime el QR. | `cli/commands/pair.mjs` |
 | `status` | Le pide identidad a la extensión Gentle Shell/Pi en loopback: `GET /api/health` en `127.0.0.1:43721` (superficie de control) y `127.0.0.1:43722` (superficie de dispositivos, blanco del túnel). Imprime una línea honesta por puerto en uno de tres estados: `reachable — bridge identity confirmed (app=gentle-shell bridge=gentle-movil proto=1, version …)`, `not the bridge — port answering, but it is not the Gentle Shell bridge — observed HTTP 200, content-type …, etag …, body starts …`, o `unreachable — ECONNREFUSED — nothing listening`. **Exit 0** solo si **todos** los puertos se identifican como el puente; **1** en cualquier otro caso (incluido el impostor); 2 si `GENTLE_MOVIL_PORTS` está mal formado. | `cli/commands/status.mjs` |
 | `doctor` | Preflight del host con cuatro checks (S9): 1) `sshd` activo (systemd `sshd` y luego `ssh`), 2) host key ed25519 legible (`/etc/ssh/ssh_host_ed25519_key.pub`, fuente del TOFU), 3) IP LAN detectada (≠ `127.0.0.1`), 4) la extensión **se identifica** en loopback `43721`/`43722` (mismos tres estados que `status`: puente, impostor o nada escuchando). Sin sudo y sin red más allá de loopback. Exit 1 si algún check falla — es la respuesta a "¿por qué no conecta la tablet?". | `cli/commands/doctor.mjs` |
 | `help` | Ayuda. | inline |
@@ -77,6 +77,10 @@ Con el symlink instalado, es simplemente `gentle-movil pair`, `gentle-movil doct
   (`43721,43722` por defecto). Existe para pruebas y para una extensión que
   escuche en otro puerto; valores inválidos fallan ruidosamente (exit 2) en vez
   de sondear defaults en silencio.
+- `COLUMNS` — ancho del terminal que `pair` usa para ajustar el QR cuando la
+  salida no es un TTY (pipes, scripts, CI: ahí `process.stdout.columns` no
+  existe). Gana el ancho real del TTY cuando lo hay; un valor ausente o no
+  numérico cae al default de 80 columnas.
 
 ## Identidad del puente
 
@@ -214,9 +218,29 @@ de escapes en pipes y el fallback a texto plano con locale no-UTF-8.
   `engines.node >=20`, `scripts.test`, **sin dependencias**) solo para declarar el
   comando y el test; **no hay `npm install`**. `pair` sin TTY ya no adivina: sin
   `--invite-only` falla con exit 1 y mensaje que nombra la bandera (antes bajaba a
-  invite-only en silencio, o sea un QR sin `pw` presentado como moshi). El render
+  invite-only en silencio, o sea un QR sin `pw` presentado como si llevara la
+  contraseña). El render
   QR detecta locale UTF-8 (`LC_ALL`/`LC_CTYPE`/`LANG`) y, si no lo es, imprime el
   payload `gc://pair?…` en texto plano en vez de mojibake half-block. Nuevo
   `cli/completions/gentle-movil.fish` y `cli/test/entry.test.mjs` (9 tests):
   shebang+exec, symlink, `package.json`, stdin cerrado, pipes sin escapes, locale.
   Total `node --test cli/test/`: 23 verdes.
+- T4b (esta enmienda, S4): el QR de `pair` se ajusta al terminal en vez de
+  imprimirse a ancho fijo. Motivo: el dueño lo reportó "muy grande" y en un
+  terminal angosto el arte se **envuelve**, y un QR envuelto no se puede
+  escanear. Regla implementada: un carácter por módulo ⇒ ancho = `módulos +
+  2·zona de silencio`; si no entra en el ancho disponible (`process.stdout.columns`,
+  luego `COLUMNS`, luego 80) la zona de silencio baja 2 → 1 → 0 y `pair` imprime
+  una línea diciéndolo; si ni la matriz pelada entra (un QR de emparejamiento
+  real son 41-49 módulos), no se dibuja arte y se imprime el payload como texto
+  nombrando el ancho que falta. El payload **no cambió**: `fp` sigue siendo 64
+  hex porque `mobile/lib/qr-parse.ts` (`normalizeFingerprint`) y
+  `mobile-core/src/qr.rs` solo aceptan esa forma; base64url habría exigido tocar
+  el parser del teléfono, y además acortar `fp` no baja la versión del símbolo
+  (el resto del URI ya llena la misma versión). El apodo interno del modo con
+  contraseña salió de la ayuda y de esta doc: ahora dice "contraseña en el
+  QR"/"password in the QR". Tests
+  nuevos en `cli/test/cli.test.mjs`: escalera de ajuste por ancho, `COLUMNS`
+  con prioridad TTY→env→80, arte nunca más ancho que 60 ni 40 columnas, y el
+  fallback angosto imprimiendo el mismo payload. Total `node --test cli/test/`:
+  27 verdes.
