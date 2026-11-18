@@ -45,8 +45,20 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CLANG"
 export CC_aarch64_linux_android="$CLANG"
 export AR_aarch64_linux_android="$TC/llvm-ar"
 
-"$CARGO" build --release --target aarch64-linux-android --manifest-path "$ROOT/mobile-core/Cargo.toml"
+# `jni-shim` is mandatory here: the shim module is cfg-gated behind it, so a build
+# without the feature produces a library with **no** `Java_…` symbol at all and every
+# GcNative call on the device throws UnsatisfiedLinkError.
+"$CARGO" build --release --features jni-shim --target aarch64-linux-android --manifest-path "$ROOT/mobile-core/Cargo.toml"
+
+LIB="$ROOT/mobile-core/target/aarch64-linux-android/release/libmobile_core.so"
+JNI_SYMBOLS="$(strings -a "$LIB" | grep -o 'Java_com_gentlemovil_core_GcNative_[A-Za-z]*' | sort -u || true)"
+if [ -z "$JNI_SYMBOLS" ]; then
+  echo "error: $LIB exports no Java_com_gentlemovil_core_GcNative_ symbol." >&2
+  echo "       The JNI shim was not compiled in: check that the build passes --features jni-shim." >&2
+  exit 1
+fi
 
 mkdir -p "$(dirname "$OUT")"
 cp "$ROOT/mobile-core/target/aarch64-linux-android/release/libmobile_core.so" "$OUT"
 echo "installed: $OUT ($(stat -c%s "$OUT") bytes)"
+echo "jni symbols: $(printf '%s\n' "$JNI_SYMBOLS" | wc -l)"

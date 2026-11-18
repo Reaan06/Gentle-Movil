@@ -444,6 +444,92 @@ fn read_channel_timeout(payload_json: *const c_char) -> Result<Duration, AbiErro
     ))
 }
 
+/// One Kotlin channel document, split into the arguments the channel ABI calls want.
+///
+/// Kotlin speaks one JSON document per call (`GcCoreModule` passes strings only), while
+/// [`gc_ssh_channel_write`] / [`gc_ssh_channel_read`] / [`gc_ssh_channel_close`] take the
+/// two handles as separate `u64` arguments. This is the single place that knows the
+/// document's shape, so the JNI shim splits nothing itself and a malformed document is
+/// reported once, in one wording.
+///
+/// Hidden from the docs on purpose: it is the JNI layer's marshalling seam, not part of
+/// the frozen C ABI surface the Kotlin module links against.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelCall {
+    /// Session handle `gc_ssh_connect` returned to the app.
+    pub session_id: u64,
+    /// Channel handle the `tunnel` step reported as `channel_id`.
+    pub channel_id: u64,
+    /// The rest of the document (the channel-specific payload), re-encoded as JSON.
+    pub payload: String,
+}
+
+/// Why a channel document could not be split into the handles the ABI needs.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelDocumentError {
+    /// Verbatim text the `input` envelope carries.
+    pub message: String,
+}
+
+impl ChannelDocumentError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+/// Split `{"sessionId":N,"channelId":M,…payload}` into the channel ABI's arguments.
+///
+/// The payload keeps every other field, so `bytes` (write) and `timeoutMs` (read) reach
+/// the ABI exactly as the app wrote them; a read document without `timeoutMs` therefore
+/// forwards `{}` and keeps the ABI's bounded default window, while `timeoutMs: 0` stays
+/// the non-blocking poll.
+///
+/// Handles must be non-negative integers — a JSON number, or a non-blank numeric string
+/// from a bridge that stringifies ids. Anything else is refused by name instead of
+/// silently becoming session 0, which would address the wrong channel.
+#[doc(hidden)]
+pub fn split_channel_document(input: &str) -> Result<ChannelCall, ChannelDocumentError> {
+    let mut document: Value = serde_json::from_str(input).map_err(|error| {
+        ChannelDocumentError::new(format!("the channel document is not valid JSON: {error}"))
+    })?;
+    let Value::Object(object) = &mut document else {
+        return Err(ChannelDocumentError::new(
+            "the channel document must be a JSON object",
+        ));
+    };
+    let session_id = take_handle(object, "sessionId")?;
+    let channel_id = take_handle(object, "channelId")?;
+    Ok(ChannelCall {
+        session_id,
+        channel_id,
+        payload: document.to_string(),
+    })
+}
+
+/// Remove `key` from `object` and read it as a handle, or name what was wrong.
+fn take_handle(
+    object: &mut serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<u64, ChannelDocumentError> {
+    let value = object.remove(key).ok_or_else(|| {
+        ChannelDocumentError::new(format!("the channel document needs a numeric {key}"))
+    })?;
+    let handle = match &value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    handle.ok_or_else(|| {
+        ChannelDocumentError::new(format!(
+            "the channel document needs a numeric {key}, not {value}"
+        ))
+    })
+}
+
 /// Standard alphabet of RFC 4648 base64, the encoding every byte payload uses here.
 const BASE64_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

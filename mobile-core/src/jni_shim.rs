@@ -105,6 +105,87 @@ pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshConnect(
     pointer_to_jstring(env, raw)
 }
 
+/// Error envelope for a channel document the split rejects (`input`, like the C ABI's own
+/// malformed-input kind). Same shape every other failure uses, never a crash.
+fn input_envelope(message: &str) -> *mut c_char {
+    let value = serde_json::json!({
+        "ok": false,
+        "error": { "kind": "input", "message": message },
+    });
+    match CString::new(value.to_string()) {
+        Ok(text) => text.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
+/// Shared body of the three channel shims: split the document, call the C ABI under
+/// `catch_unwind`, marshal the answer back.
+///
+/// Kotlin has no `u64` in its JSON document contract (`GcCoreModule` rule 2), so the
+/// `sessionId`/`channelId` handles ride inside the document. The split lives in
+/// [`crate::cabi::split_channel_document`] — next to the payload shapes it feeds and off
+/// this Android-only module — so it is compiled and tested by the offline suite; the shim
+/// keeps only marshalling.
+fn channel_shim(
+    env: &mut JNIEnv,
+    json: JString,
+    call: impl FnOnce(u64, u64, *const c_char) -> *mut c_char,
+) -> jstring {
+    let input = from_jstring(env, &json);
+    let raw = match crate::cabi::split_channel_document(&input) {
+        Ok(split) => match CString::new(split.payload) {
+            Ok(payload) => catch_unwind(AssertUnwindSafe(|| {
+                call(split.session_id, split.channel_id, payload.as_ptr())
+            }))
+            .unwrap_or_else(|_| panic_envelope()),
+            Err(_) => input_envelope("the channel document contains a NUL byte"),
+        },
+        Err(error) => input_envelope(&error.message),
+    };
+    pointer_to_jstring(env, raw)
+}
+
+/// `gc_ssh_channel_write(session_id, channel_id, {"bytes":"<base64>"})` from one Kotlin
+/// document `{"sessionId":N,"channelId":M,"bytes":"<base64>"}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshChannelWrite(
+    env: &mut JNIEnv,
+    _class: JClass,
+    json: JString,
+) -> jstring {
+    channel_shim(env, json, |session_id, channel_id, payload| {
+        crate::cabi::gc_ssh_channel_write(session_id, channel_id, payload)
+    })
+}
+
+/// `gc_ssh_channel_read(session_id, channel_id, {"timeoutMs":N})` from one Kotlin document
+/// `{"sessionId":N,"channelId":M,"timeoutMs":K}`. `timeoutMs` is optional and is passed
+/// through untouched, so an absent field keeps the C ABI's bounded default window and `0`
+/// stays a non-blocking poll.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshChannelRead(
+    env: &mut JNIEnv,
+    _class: JClass,
+    json: JString,
+) -> jstring {
+    channel_shim(env, json, |session_id, channel_id, payload| {
+        crate::cabi::gc_ssh_channel_read(session_id, channel_id, payload)
+    })
+}
+
+/// `gc_ssh_channel_close(session_id, channel_id)` from one Kotlin document
+/// `{"sessionId":N,"channelId":M}`; the document's remaining fields are unused.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshChannelClose(
+    env: &mut JNIEnv,
+    _class: JClass,
+    json: JString,
+) -> jstring {
+    channel_shim(env, json, |session_id, channel_id, _payload| {
+        crate::cabi::gc_ssh_channel_close(session_id, channel_id)
+    })
+}
+
 /// `gc_provision_step(session_id, step_json)`: Kotlin passes one JSON document
 /// `{"sessionId":N, ...step}`; this shim splits the handle out and forwards.
 #[unsafe(no_mangle)]
