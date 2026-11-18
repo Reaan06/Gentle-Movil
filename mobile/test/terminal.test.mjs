@@ -9,8 +9,11 @@
  * `mobile/test/git.test.mjs`) and pins:
  *
  * - the command history ring (append keeps the newest N, clear empties it);
- * - the send descriptor: trimmed, empty rejected, `pending: true` + `/api/exec`,
- *   with the honest note that the endpoint is not served yet;
+ * - the real send: trimmed, empty rejected without a request, `POST /api/exec`
+ *   with its JSON body on the wire, the real `exitCode`/`output` appended to the
+ *   ring on 200, and one honest copy per refusal (`exec_disabled`,
+ *   `shell_unsupported`, `invalid_command`, `payload_too_large`,
+ *   `command_spawn_failed`) or link failure (offline, timeout);
  * - the output model: raw chunks appended in order, ANSI escapes stripped for
  *   display with the newlines intact, and a real `truncado` marker at the cap;
  * - the exit-code copy (0 ok, non-zero danger with the code, null neutral);
@@ -26,20 +29,31 @@ import { utf8Encode } from '../lib/core.ts';
 import {
   AGENT_NOTE,
   CommandHistory,
+  COMMAND_SPAWN_FAILED_COPY,
   DURATION_CAP_COPY,
   EMPTY_COMMAND_COPY,
   EMPTY_COPY,
   ENDED_LABEL,
+  EXEC_DISABLED_COPY,
+  EXEC_DISABLED_NOTE,
   EXEC_HISTORY_PATH,
   EXEC_PATH,
   IDLE_LABEL,
   INCOMPLETE_HISTORY_COPY,
+  INVALID_COMMAND_COPY,
   MISSING_ENDPOINT_COPY,
   NO_AGENT_REASON,
   NOT_SENT_REASON,
   OFFLINE_COPY,
+  PAYLOAD_TOO_LARGE_COPY,
   RUNNING_LABEL,
-  SEND_PENDING_NOTE,
+  SENDING_COPY,
+  SEND_BROKEN_COPY,
+  SEND_OFFLINE_COPY,
+  SEND_REFUSED_TITLE,
+  SEND_TIMEOUT_COPY,
+  SEND_UNREACHABLE_TITLE,
+  SHELL_UNSUPPORTED_COPY,
   TRANSCRIPT_STATES,
   agentHeader,
   appendOutput,
@@ -217,32 +231,290 @@ test('(a) the ring cap never mutates the previous snapshot', () => {
   );
 });
 
-test('(b) sendIntent trims, rejects empty and stays honest about the endpoint', () => {
-  const intent = sendIntent('  bun test --watch  ');
-  assert.equal(intent.ok, true);
-  assert.equal(intent.intent.command, 'bun test --watch');
-  assert.equal(intent.intent.pending, true);
-  assert.equal(intent.intent.method, 'POST');
-  assert.equal(intent.intent.route, '/api/exec');
-  // The note must name the real gap, not pretend the command ran.
-  assert.match(intent.intent.note, /\/api\/exec/);
-  assert.match(intent.intent.note, /todavía no está conectado/);
-  assert.equal(SEND_PENDING_NOTE, intent.intent.note);
+test('(b) sendIntent trims, rejects empty without a request and posts over the channel', async () => {
+  const history = new CommandHistory(5, clock().now);
+  const channel = recordingChannel({ id: 'cmd-1', exitCode: 0, output: 'ok\n' });
+  const sent = await sendIntent('  bun test --watch  ', {
+    channel,
+    history,
+    logger: collectingLogger(),
+  });
+  assert.equal(sent.ok, true);
+  assert.equal(sent.entry.command, 'bun test --watch');
 
   for (const empty of ['', '   ', '\n\t ']) {
-    const rejected = sendIntent(empty);
+    const silent = recordingChannel({ id: 'nope', exitCode: 0, output: null });
+    const rejected = await sendIntent(empty, { channel: silent, history });
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.reason, 'empty');
+    assert.equal(rejected.message, EMPTY_COMMAND_COPY);
+    // Validation happens before the wire: nothing was written to the PC.
+    assert.deepEqual(silent.writes, []);
+  }
+});
+
+test('(b) sendIntent accepts non-string input as empty instead of throwing', async () => {
+  for (const bad of [undefined, null, 42, {}]) {
+    const rejected = await sendIntent(bad);
     assert.equal(rejected.ok, false);
     assert.equal(rejected.reason, 'empty');
     assert.equal(rejected.message, EMPTY_COMMAND_COPY);
   }
 });
 
-test('(b) sendIntent accepts non-string input as empty instead of throwing', () => {
-  for (const bad of [undefined, null, 42, {}]) {
-    const rejected = sendIntent(bad);
-    assert.equal(rejected.ok, false);
-    assert.equal(rejected.message, EMPTY_COMMAND_COPY);
+/* ------------------------------------------------------------------ *
+ * T7o — the send is a real POST /api/exec (protocol §4.1)
+ * ------------------------------------------------------------------ */
+
+/** A §4.1 refusal: `status` plus `{"error":{"code","message"}}`. */
+function refusalChannel(status, code, message) {
+  return recordingChannel({ error: { code, message } }, status);
+}
+
+test('(a) 403 exec_disabled: the honest opt-in copy and NO ring entry', async () => {
+  const history = new CommandHistory(5, clock().now);
+  const logger = collectingLogger();
+  const channel = refusalChannel(403, 'exec_disabled', 'running commands is disabled');
+
+  const result = await sendIntent('ls', { channel, history, logger });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'exec_disabled');
+  // The exact copy the spec pins: the missing opt-in, named.
+  assert.equal(
+    result.message,
+    'Enviar está desactivado en tu PC: la extensión necesita GENTLE_MOVIL_ALLOW_EXEC=1.',
+  );
+  assert.equal(result.message, EXEC_DISABLED_COPY);
+  // And it says nothing ran: the PC refused before spawning anything.
+  assert.equal(result.note, EXEC_DISABLED_NOTE);
+  assert.match(result.note, /no se ejecutó nada/i);
+  // The PC refused — not the phone: the card says so.
+  assert.equal(result.blame, 'pc');
+  assert.equal(result.title, SEND_REFUSED_TITLE);
+  // Nothing enters the ring, so no row pretends the command ran.
+  assert.equal(history.size(), 0);
+  // But the refusal is logged with its evidence.
+  assert.equal(logger.failures.length, 1);
+  assert.equal(logger.failures[0].step, 'exec-send');
+  assert.match(String(logger.failures[0].raw), /code=exec_disabled/);
+});
+
+test('(b) 200: the ring keeps the REAL exit code and output, status sent', async () => {
+  const history = new CommandHistory(5, clock().now);
+  const logger = collectingLogger();
+  const channel = recordingChannel({ id: 'cmd-m9x1-1', exitCode: 0, output: 'hola\n' });
+
+  const result = await sendIntent('echo hola', { channel, history, logger });
+  assert.equal(result.ok, true);
+  assert.equal(result.entry.id, 'cmd-m9x1-1');
+  assert.equal(result.entry.command, 'echo hola');
+  assert.equal(result.entry.status, 'sent');
+  assert.equal(result.entry.exitCode, 0);
+  assert.equal(result.entry.output, 'hola\n');
+  assert.deepEqual(result.exit, { label: 'exit 0', tone: 'ok' });
+  assert.equal(result.output.text, 'hola\n');
+
+  // The ring holds exactly that one entry, and the row is a real result.
+  assert.deepEqual(history.entries(), [result.entry]);
+  const vm = buildTerminalView({ kind: 'empty' }, history.entries());
+  assert.deepEqual(
+    vm.rows.map((row) => [row.command, row.statusLabel, row.exit.label, row.notSent]),
+    [['echo hola', 'enviado', 'exit 0', false]],
+  );
+  assert.equal(vm.pane.command, 'echo hola');
+  assert.equal(vm.pane.output.text, 'hola\n');
+  // A real result is not a "no enviado" row.
+  assert.deepEqual(vm.notSent, []);
+  // Nothing failed, so the log stayed quiet.
+  assert.deepEqual(logger.failures, []);
+});
+
+test('(c) 400 shell_unsupported: pipes are refused, nothing runs', async () => {
+  const history = new CommandHistory(5, clock().now);
+  const result = await sendIntent('ls | wc -l', {
+    channel: refusalChannel(400, 'shell_unsupported', 'the command needs a shell'),
+    history,
+    logger: collectingLogger(),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'shell_unsupported');
+  assert.equal(result.message, SHELL_UNSUPPORTED_COPY);
+  assert.match(result.message, /pipes/);
+  assert.match(result.message, /redirecciones/);
+  assert.equal(result.blame, 'pc');
+  assert.match(result.note, /no se ejecutó nada/i);
+  assert.equal(history.size(), 0);
+});
+
+test('(c) 400 invalid_command has its own copy', async () => {
+  const history = new CommandHistory(5, clock().now);
+  const result = await sendIntent('ls', {
+    channel: refusalChannel(400, 'invalid_command', 'command is empty'),
+    history,
+    logger: collectingLogger(),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'invalid_command');
+  assert.equal(result.message, INVALID_COMMAND_COPY);
+  assert.equal(history.size(), 0);
+});
+
+test('(d) 413 payload_too_large: its own copy, no ring entry', async () => {
+  const history = new CommandHistory(5, clock().now);
+  const logger = collectingLogger();
+  const result = await sendIntent('x'.repeat(100), {
+    channel: refusalChannel(413, 'payload_too_large', 'the body exceeds 16384 bytes'),
+    history,
+    logger,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'payload_too_large');
+  assert.equal(result.message, PAYLOAD_TOO_LARGE_COPY);
+  assert.equal(result.status, 413);
+  assert.equal(history.size(), 0);
+  assert.match(String(logger.failures[0].raw), /413/);
+});
+
+test('(e) 502 command_spawn_failed: never a fake 200 with a null code', async () => {
+  const history = new CommandHistory(5, clock().now);
+  const result = await sendIntent('no-such-binary --flag', {
+    channel: refusalChannel(502, 'command_spawn_failed', 'spawn no-such-binary ENOENT'),
+    history,
+    logger: collectingLogger(),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'command_spawn_failed');
+  assert.equal(result.message, COMMAND_SPAWN_FAILED_COPY);
+  assert.match(result.message, /no pudo arrancar/);
+  assert.equal(result.status, 502);
+  assert.match(result.raw, /ENOENT/);
+  assert.equal(history.size(), 0);
+});
+
+test('(f) a non-zero exit code is a real result with the danger tone', async () => {
+  const history = new CommandHistory(5, clock().now);
+  const channel = recordingChannel({
+    id: 'cmd-fail-1',
+    exitCode: 1,
+    output: `${ESC}[31mfail${ESC}[0m\n`,
+  });
+  const result = await sendIntent('bun test', { channel, history, logger: collectingLogger() });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.exit, { label: 'exit 1', tone: 'danger' });
+  // Display-ready output: escapes gone, the real exit code kept.
+  assert.equal(result.output.text, 'fail\n');
+  assert.equal(result.entry.exitCode, 1);
+
+  const vm = buildTerminalView({ kind: 'empty' }, history.entries());
+  assert.deepEqual(vm.rows.map((row) => [row.exit.label, row.exit.tone]), [['exit 1', 'danger']]);
+  assert.equal(vm.pane.exit.tone, 'danger');
+  assert.equal(vm.pane.output.text, 'fail\n');
+  // The transcript tone follows the same real code.
+  const ended = transcriptState(
+    history.entries().map((entry) => ({ ...entry, at: T0 })),
+    { now: T0 },
+  );
+  assert.equal(ended.tone, 'danger');
+  assert.deepEqual(ended.exit, { label: 'exit 1', tone: 'danger' });
+});
+
+test('(g) no tunnel: the send fails offline without a request or a ring entry', async () => {
+  const history = new CommandHistory(5, clock().now);
+  const logger = collectingLogger();
+  const result = await sendIntent('ls', { channel: null, history, logger });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'offline');
+  assert.equal(result.message, SEND_OFFLINE_COPY);
+  assert.match(result.message, /no salió del teléfono/);
+  // The phone could not reach the PC: the card never blames the PC.
+  assert.equal(result.blame, 'link');
+  assert.equal(result.title, SEND_UNREACHABLE_TITLE);
+  assert.equal(result.note, null);
+  assert.equal(history.size(), 0);
+  assert.equal(logger.failures.length, 1);
+  assert.equal(logger.failures[0].step, 'exec-send');
+
+  // A tunnel that refuses the write is offline too, with its raw evidence.
+  const refused = await sendIntent('ls', { channel: refusedChannel(), history, logger });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.reason, 'offline');
+  assert.equal(history.size(), 0);
+});
+
+test('(g) a silent tunnel is a timeout that never claims the command did not run', async () => {
+  const history = new CommandHistory(5, clock().now);
+  const result = await sendIntent('sleep 40', {
+    channel: silentChannel(),
+    history,
+    timeoutMs: 20,
+    logger: collectingLogger(),
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'timeout');
+  assert.equal(result.message, SEND_TIMEOUT_COPY);
+  assert.match(result.message, /pudo haber corrido/);
+  assert.equal(result.blame, 'link');
+  assert.equal(history.size(), 0);
+});
+
+test('(g) a broken 200 body is never a fabricated result', async () => {
+  const history = new CommandHistory(5, clock().now);
+  const bodies = [
+    { id: 'x' },
+    { id: 'x', exitCode: 1.5, output: null },
+    { id: 'x', exitCode: 0, output: 7 },
+  ];
+  for (const body of bodies) {
+    const result = await sendIntent('ls', {
+      channel: recordingChannel(body),
+      history,
+      logger: collectingLogger(),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, 'broken');
+    assert.equal(result.message, SEND_BROKEN_COPY);
+    assert.match(result.note, /revisá el historial/);
   }
+  assert.equal(history.size(), 0);
+});
+
+test('(h) the request really is POST /api/exec with the JSON body on the wire', async () => {
+  const history = new CommandHistory(5, clock().now);
+  const channel = recordingChannel({ id: 'cmd-1', exitCode: 0, output: 'x\n' });
+  const result = await sendIntent('  ls -la "mi carpeta"  ', {
+    channel,
+    history,
+    logger: collectingLogger(),
+  });
+  assert.equal(result.ok, true);
+
+  assert.equal(channel.writes.length, 1);
+  const wire = channel.writes[0];
+  const body = JSON.stringify({ command: 'ls -la "mi carpeta"' });
+  assert.match(wire, /^POST \/api\/exec HTTP\/1\.1\r\n/);
+  assert.equal(/^GET /.test(wire), false);
+  assert.match(wire, /Content-Type: application\/json\r\n/);
+  assert.ok(wire.includes(`Content-Length: ${Buffer.byteLength(body)}\r\n`));
+  // The body is the trimmed command, exactly once, after the blank line.
+  assert.ok(wire.endsWith(`\r\n\r\n${body}`));
+  assert.equal(wire.split('{"command"').length - 1, 1);
+});
+
+test('SENDING_COPY is the real progress line of the dock', () => {
+  assert.equal(SENDING_COPY, 'Enviando…');
+});
+
+test('the stale "endpoint not served" claim is gone from the module', async () => {
+  const terminal = await import('../lib/terminal.ts');
+  assert.equal('SEND_PENDING_NOTE' in terminal, false);
+  // Nothing in the exported copy still says the endpoint does not exist.
+  for (const [name, value] of Object.entries(terminal)) {
+    if (typeof value !== 'string') continue;
+    assert.equal(/todavía no expone POST \/api\/exec/i.test(value), false, name);
+    assert.equal(/todavía no está conectado/i.test(value), false, name);
+  }
+  assert.equal(/todavía no expone POST/i.test(terminal.NOT_SENT_REASON), false);
 });
 
 test('(c) ANSI escapes are stripped for display and the newlines stay', () => {

@@ -4,7 +4,8 @@
  * Everything here is pure or injected: no React Native import. The channel is
  * the core's `channelWrite`/`channelRead`/`channelClose` triple (see
  * `mobile/lib/core.ts` §MobileCore); this module frames a real
- * `GET <path> HTTP/1.1` request over it and parses the real response.
+ * `GET <path> HTTP/1.1` (or `POST` with a JSON body, protocol §4.1 `POST
+ * /api/exec`) request over it and parses the real response.
  *
  * Honesty rules (S7):
  * - every failure is returned as a typed `BridgeFailure` and logged by the
@@ -70,14 +71,22 @@ export interface BridgeSession {
 /** `/api/health` identity (protocol §4). */
 export interface BridgeHealth {
   proto: number;
-  name: string;
+  /** §9.2 identifies the bridge; older builds sent `name` instead of `bridge`. */
+  bridge?: string;
+  name?: string;
   version: string | null;
+  /** Application identity the bridge serves (`gentle-pi-extension`). */
+  app?: string;
 }
 
 /** Options for `bridgeRequest`. */
 export interface BridgeRequestOptions {
   /** Per-call timeout; the read window is this, divided across frames. */
   timeoutMs?: number;
+  /** HTTP method of the call; defaults to `GET` (nothing else is served). */
+  method?: 'GET' | 'POST';
+  /** Body serialized as JSON, with its real `Content-Length` (POST only). */
+  body?: unknown;
 }
 
 function failure(
@@ -97,6 +106,25 @@ export function buildGetRequest(path: string, host: string): Uint8Array {
     `Connection: close\r\n` +
     `Accept: application/json\r\n` +
     `\r\n`;
+  return utf8Encode(request);
+}
+
+/**
+ * Build the exact wire bytes of a JSON POST (protocol §4.1 `POST /api/exec`).
+ * `Content-Length` is the real byte length of the UTF-8 body, so the peer never
+ * has to guess where the body ends.
+ */
+export function buildPostRequest(path: string, host: string, body: unknown): Uint8Array {
+  const payload = JSON.stringify(body ?? null);
+  const request =
+    `POST ${path} HTTP/1.1\r\n` +
+    `Host: ${host}\r\n` +
+    `Connection: close\r\n` +
+    `Accept: application/json\r\n` +
+    `Content-Type: application/json\r\n` +
+    `Content-Length: ${utf8Encode(payload).length}\r\n` +
+    `\r\n` +
+    payload;
   return utf8Encode(request);
 }
 
@@ -124,7 +152,8 @@ export function isOfflineError(error: unknown): boolean {
 }
 
 /**
- * One HTTP GET over the tunnel channel. Opens nothing: the caller passes the
+ * One HTTP request over the tunnel channel (`GET` by default, `POST /api/exec`
+ * with a JSON body when asked). Opens nothing: the caller passes the
  * already-open channel (the `tunnel` provision step owns it).
  */
 export async function bridgeRequest<T>(
@@ -133,9 +162,13 @@ export async function bridgeRequest<T>(
   options: BridgeRequestOptions = {},
 ): Promise<BridgeResult<T>> {
   const timeoutMs = options.timeoutMs ?? 10_000;
+  const wire =
+    options.method === 'POST'
+      ? buildPostRequest(path, '127.0.0.1', options.body ?? null)
+      : buildGetRequest(path, '127.0.0.1');
   let raw = new Uint8Array();
   try {
-    const written = await channel.write(buildGetRequest(path, '127.0.0.1'));
+    const written = await channel.write(wire);
     if (written <= 0) {
       return {
         ok: false,

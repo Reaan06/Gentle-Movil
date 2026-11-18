@@ -10,8 +10,11 @@
  *
  * - the command history ring (`{id, command, at, status, exitCode, output}`,
  *   newest N kept, append/clear);
- * - the send descriptor: trimmed, empty rejected, always `pending: true` on
- *   `POST /api/exec` with the honest note that the endpoint is not served yet;
+ * - the send: `POST /api/exec` over the tunnel (protocol §4.1), trimmed, empty
+ *   rejected before the wire, the real `exitCode`/`output` appended to the ring
+ *   on 200, and one honest copy per refusal (`exec_disabled`,
+ *   `shell_unsupported`, `invalid_command`, `payload_too_large`,
+ *   `command_spawn_failed`) or link failure (offline, timeout);
  * - the output model: raw stream chunks appended in order, ANSI escapes
  *   stripped for display with the newlines intact, and a real `truncado`
  *   marker instead of a silent cut;
@@ -43,11 +46,11 @@
  * Everything else — a `waiting` card, thinking blocks, tool calls, approvals —
  * needs data the PC does not publish today and is NOT invented here.
  *
- * ## The endpoint this module expects (protocol §4)
+ * ## The endpoints this module uses (protocol §4.1)
  *
- * `loadHistory` performs `GET /api/exec/history` over the tunnel channel and
- * expects this body (the endpoint is a bridge extension of protocol §4; the
- * core only guarantees the tunnel and `/api/health` / `/api/sessions` today):
+ * `loadHistory` performs `GET /api/exec/history` and `sendIntent` performs
+ * `POST /api/exec` over the tunnel channel, both served by the Pi extension
+ * (`pi-extension/src/exec.ts`). The history body is:
  *
  * ```json
  * {
@@ -61,22 +64,27 @@
  * `status` is `pending | sent | failed`; `exitCode` is `null` or an integer;
  * `output` is `null` or the raw stream the command produced (escapes and all);
  * `at` is ISO-8601 or epoch milliseconds. An optional top-level `model`
- * (string) would name the agent model: §4.1 does not publish it today, so it is
- * read leniently and the pane header stays `shell` when it is absent.
+ * (string) is read leniently: when it is absent the pane header stays `shell`.
  *
- * ## What the PC does NOT serve yet
+ * ## What `POST /api/exec` answers
  *
- * There is no command endpoint: `POST /api/exec` does not exist. A command the
- * human typed is therefore recorded as `no enviado` with the reason, never
- * echoed as fake output and never reported as executed. `sendIntent` is the
- * descriptor of that gap, so the screen can log the route and show the note
- * instead of inventing an `OK` line.
+ * `200 {id, exitCode, output}` when the extension runs with
+ * `GENTLE_MOVIL_ALLOW_EXEC=1`: the command really ran, and its real exit code
+ * (non-zero included) and raw output are what the ring keeps. Without the
+ * opt-in the PC refuses with `403 exec_disabled` and **nothing runs**, which
+ * this module maps to its own copy (and a `No se ejecutó nada.` note), never to a
+ * silent success. `400 shell_unsupported` (the bridge spawns an argv, never a
+ * shell), `400 invalid_command`, `400 invalid_body`, `413 payload_too_large` and
+ * `502 command_spawn_failed` each keep their own honest copy; offline and
+ * timeout stay link failures, blamed on the phone/network, not on the PC.
  *
  * Honesty rules (S7), the same the other connected screens follow:
  * - no tunnel → `offline` (`Requiere conexión — el terminal corre en tu PC.`),
  *   never an empty success;
- * - an extension that does not expose the endpoint (404/501) → `error` with
- *   `La extensión no expone el terminal todavía`, never an empty history;
+ * - an extension that does not expose `/api/exec/history` (404/501) → `error`
+ *   with `La extensión no expone el terminal todavía`, never an empty history;
+ * - a send the PC refused keeps the PC's own copy and never a ring entry, so no
+ *   row claims a command ran when nothing did;
  * - incomplete/invalid entries → `error` carrying the raw evidence, never
  *   invented commands, exit codes or output;
  * - a timeout with a previous good answer → `stale` (`Datos de hace N min`);
@@ -97,7 +105,7 @@ import { logger } from './logger.ts';
 /** Endpoint expected from the bridge for the PC-side command history. */
 export const EXEC_HISTORY_PATH = '/api/exec/history';
 
-/** Endpoint a command would be posted to once the bridge serves it. */
+/** Endpoint that runs one command on the PC (protocol §4.1, opt-in only). */
 export const EXEC_PATH = '/api/exec';
 
 /** How many commands the local ring keeps (newest N). */
@@ -124,6 +132,8 @@ export interface CommandEntry {
   exitCode: number | null;
   /** Raw stream output (escapes included), `null` when there was none. */
   output: string | null;
+  /** Why it never ran, when the PC refused it; `null` for a PC history row. */
+  reason?: string | null;
 }
 
 /** Status copy of a row inside the PC history. */
@@ -142,6 +152,9 @@ export const EMPTY_COPY = 'Todavía no hay comandos en esta sesión.';
 /** Copy of the empty output pane. */
 export const PANE_EMPTY_COPY = 'Esperando la primera salida…';
 
+/** Copy of the pane when the command really ran and printed nothing. */
+export const PANE_NO_OUTPUT_COPY = 'El comando no produjo salida.';
+
 /** Copy when the tunnel is down (§V7 offline). */
 export const OFFLINE_COPY = 'Requiere conexión — el terminal corre en tu PC.';
 
@@ -157,13 +170,9 @@ export const ERROR_TITLE = 'No pudimos leer el historial';
 /** Copy of an unusable `/api/exec/history` body. */
 export const INCOMPLETE_HISTORY_COPY = 'La PC devolvió un historial incompleto.';
 
-/** Why a typed command never left the phone. */
+/** Why a command the phone typed never left it (per-entry reason). */
 export const NOT_SENT_REASON =
-  'no enviado: la extensión todavía no expone POST /api/exec.';
-
-/** Honest note of the send button (the endpoint does not exist yet). */
-export const SEND_PENDING_NOTE =
-  'Enviar todavía no está conectado: la extensión no expone POST /api/exec. El comando queda como no enviado.';
+  'no enviado: el comando quedó en el teléfono y la PC no confirmó que corrió.';
 
 /** Copy when the human taps send with an empty field. */
 export const EMPTY_COMMAND_COPY = 'Escribí un comando antes de enviarlo.';
@@ -190,6 +199,8 @@ export interface NewCommand {
   /** Epoch ms; defaults to the injected clock. */
   at?: number;
   id?: string;
+  /** Why it did not run, when the human should read it (`no enviado` rows). */
+  reason?: string | null;
 }
 
 /** Keep at most `capacity` of the newest entries (the input is never mutated). */
@@ -205,8 +216,9 @@ export function capHistory<T>(entries: readonly T[], capacity: number = HISTORY_
 
 /**
  * The local command history: a capped ring, oldest first, with append/clear.
- * It holds what the human typed here — a command stays `pending` until the PC
- * says otherwise, which today never happens (there is no `/api/exec`).
+ * It holds what the human typed here. The PC is the only thing that can turn a
+ * command into `sent`: `sendIntent` appends the entry only after a real 200
+ * `POST /api/exec`, with the real exit code and output.
  */
 export class CommandHistory {
   private list: CommandEntry[] = [];
@@ -230,6 +242,7 @@ export class CommandHistory {
       status: input.status ?? 'pending',
       exitCode: input.exitCode ?? null,
       output: input.output ?? null,
+      reason: input.reason ?? null,
     };
     this.list = capHistory([...this.list, entry], this.capacity);
     return this.list[this.list.length - 1];
@@ -248,50 +261,6 @@ export class CommandHistory {
   size(): number {
     return this.list.length;
   }
-}
-
-/* ------------------------------------------------------------------ *
- * Send descriptor
- * ------------------------------------------------------------------ */
-
-/** What tapping send means today: a real request to an endpoint that is absent. */
-export interface SendDescriptor {
-  /** Always true: nothing is: there is no `/api/exec` on the bridge yet. */
-  pending: true;
-  method: 'POST';
-  /** `/api/exec` — the route the command would be posted to. */
-  route: string;
-  /** The trimmed command. */
-  command: string;
-  /** Honest note the screen shows instead of a fake acknowledgement. */
-  note: string;
-}
-
-/** Outcome of a send attempt: the descriptor, or why there is nothing to send. */
-export type SendIntentResult =
-  | { ok: true; intent: SendDescriptor }
-  | { ok: false; reason: 'empty'; message: string };
-
-/**
- * Build the send descriptor of a typed command. An empty or whitespace-only
- * field is refused with `EMPTY_COMMAND_COPY`; anything that is not a string is
- * treated as empty instead of throwing at the UI.
- */
-export function sendIntent(command: unknown): SendIntentResult {
-  const trimmed = typeof command === 'string' ? command.trim() : '';
-  if (trimmed === '') {
-    return { ok: false, reason: 'empty', message: EMPTY_COMMAND_COPY };
-  }
-  return {
-    ok: true,
-    intent: {
-      pending: true,
-      method: 'POST',
-      route: EXEC_PATH,
-      command: trimmed,
-      note: SEND_PENDING_NOTE,
-    },
-  };
 }
 
 /* ------------------------------------------------------------------ *
@@ -387,6 +356,365 @@ export function exitChip(exitCode: number | null): ExitChip {
     return { label: 'sin código', tone: 'neutral' };
   }
   return { label: `exit ${exitCode}`, tone: exitCode === 0 ? 'ok' : 'danger' };
+}
+
+/* ------------------------------------------------------------------ *
+ * Send — POST /api/exec (protocol §4.1)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Deadline of one send. The PC kills a command at 30 s and then answers, so the
+ * phone waits a little longer instead of calling a real run a timeout.
+ */
+export const SEND_TIMEOUT_MS = 35_000;
+
+/** Progress copy of the dock while the request is in flight. */
+export const SENDING_COPY = 'Enviando…';
+
+/** Manyana copy: the PC ran nothing because it refused the command. */
+export const EXEC_DISABLED_COPY =
+  'Enviar está desactivado en tu PC: la extensión necesita GENTLE_MOVIL_ALLOW_EXEC=1.';
+
+/** Second line of the `exec_disabled` card: nothing ran. */
+export const EXEC_DISABLED_NOTE =
+  'No se ejecutó nada: la PC rechazó el comando antes de correrlo.';
+
+/** Copy when the command line needs a shell the bridge will never spawn. */
+export const SHELL_UNSUPPORTED_COPY =
+  'La PC no corre un shell: no se soportan pipes, redirecciones, globs ni variables ($VAR, `cmd`). Escribí el comando con sus argumentos.';
+
+/** Copy for a command the PC read as empty or too long. */
+export const INVALID_COMMAND_COPY =
+  'La PC rechazó el comando: está vacío o pasa los 4096 bytes.';
+
+/** Copy for a body the PC could not read as `{"command": "…"}`. */
+export const INVALID_BODY_COPY =
+  'La PC no entendió el pedido: el cuerpo tiene que ser {"command": "…"}.';
+
+/** Copy for a body over the 16 KiB the bridge accepts. */
+export const PAYLOAD_TOO_LARGE_COPY =
+  'El pedido superó los 16 KiB que acepta la PC: no se ejecutó nada.';
+
+/** Copy when the process never started (missing binary, permissions). */
+export const COMMAND_SPAWN_FAILED_COPY =
+  'La PC no pudo arrancar el comando: el binario no existe o no tiene permiso.';
+
+/** Copy for any other refusal the PC answered with. */
+export function sendRejectedCopy(status: number): string {
+  return `La PC rechazó el comando (status ${status}).`;
+}
+
+/** Copy when the extension does not serve `POST /api/exec`. */
+export function execUnavailableCopy(status: number): string {
+  return `La extensión no expone POST /api/exec (status ${status}).`;
+}
+
+/** Second line of every refusal: the command did not run. */
+export const NOTHING_RAN_NOTE = 'No se ejecutó nada.';
+
+/** Copy when there is no tunnel: the command never left the phone. */
+export const SEND_OFFLINE_COPY =
+  'Sin conexión con la PC: el comando no salió del teléfono.';
+
+/** Copy when the PC did not answer in time: the result is unknown, not failed. */
+export const SEND_TIMEOUT_COPY =
+  'La PC no respondió a tiempo: el comando pudo haber corrido, revisá el historial.';
+
+/** Copy when the answer cannot be read: nothing can be claimed about the run. */
+export const SEND_BROKEN_COPY =
+  'La PC devolvió una respuesta rota: no podemos afirmar que el comando corrió.';
+
+/** Second line of the broken case: the history is the only truth left. */
+export const SEND_BROKEN_NOTE = 'No sabemos si el comando corrió: revisá el historial.';
+
+/** Card title when the PC refused the command (not the phone's fault). */
+export const SEND_REFUSED_TITLE = 'La PC rechazó el comando';
+
+/** Card title when the phone could not get an answer (link failure). */
+export const SEND_UNREACHABLE_TITLE = 'No pudimos enviar el comando';
+
+/** Who refused: the PC said no, or the request never got an answer. */
+export type SendBlame = 'pc' | 'link';
+
+/** Why a send produced no real result. */
+export type SendFailureReason =
+  | 'exec_disabled'
+  | 'shell_unsupported'
+  | 'invalid_command'
+  | 'invalid_body'
+  | 'payload_too_large'
+  | 'command_spawn_failed'
+  | 'rejected'
+  | 'offline'
+  | 'timeout'
+  | 'broken';
+
+/** A real refusal or a link failure: the command did not come back with a result. */
+export interface SendFailure {
+  ok: false;
+  reason: SendFailureReason;
+  /** Card title: `La PC rechazó el comando` / `No pudimos enviar el comando`. */
+  title: string;
+  /** `pc` when the PC answered with a refusal, `link` when it never answered. */
+  blame: SendBlame;
+  /** Honest copy (es-AR) of this exact failure. */
+  message: string;
+  /** Extra line the card shows (`No se ejecutó nada.`), `null` when unused. */
+  note: string | null;
+  /** Raw evidence for the log (`status=403 code=exec_disabled …`). */
+  raw: string | null;
+  /** HTTP status the PC answered with, `null` when there was no answer. */
+  status: number | null;
+}
+
+/** What a send attempt produced: the real entry, or why there is none. */
+export type SendResult =
+  | {
+      ok: true;
+      /** Ring entry the PC's real exit code and output produced (`sent`). */
+      entry: CommandEntry;
+      /** Exit chip of that real code. */
+      exit: ExitChip;
+      /** Display-ready output (`null` when the command produced none). */
+      output: OutputView | null;
+    }
+  | SendFailure
+  | { ok: false; reason: 'empty'; message: string };
+
+/** Injectable dependencies of one send. */
+export interface SendDeps {
+  /** Tunnel channel to the PC; `null`/absent means there is no tunnel. */
+  channel?: TunnelChannel | null;
+  /** Ring that keeps the entry the PC really ran (status `sent`). */
+  history?: CommandHistory | null;
+  /** Failure sink; defaults to `logger.tag('terminal')`. */
+  logger?: TerminalLogger;
+  /** Deadline of the call (default `SEND_TIMEOUT_MS`). */
+  timeoutMs?: number;
+}
+
+/** 200 body of `POST /api/exec`: `{id, exitCode, output}` (protocol §4.1). */
+interface ExecAnswer {
+  id: string | null;
+  exitCode: number | null;
+  output: string | null;
+}
+
+/**
+ * Validate the §4.1 200 body. `exitCode` must be an integer or `null` and
+ * `output` a string or `null`; anything else is unusable, because a fabricated
+ * exit code would claim a result the PC never sent.
+ */
+function parseExecAnswer(body: unknown): ExecAnswer | null {
+  if (typeof body !== 'object' || body === null) {
+    return null;
+  }
+  const record = body as Record<string, unknown>;
+  const exitCode = record.exitCode;
+  if (exitCode !== null && (typeof exitCode !== 'number' || !Number.isInteger(exitCode))) {
+    return null;
+  }
+  const output = record.output;
+  if (output !== null && typeof output !== 'string') {
+    return null;
+  }
+  return {
+    id: typeof record.id === 'string' && record.id !== '' ? record.id : null,
+    exitCode: exitCode as number | null,
+    output: output as string | null,
+  };
+}
+
+/** `{error:{code,message}}` of a §4.1 refusal, read leniently. */
+function execError(body: unknown): { code: string | null; message: string | null } {
+  if (typeof body !== 'object' || body === null) {
+    return { code: null, message: null };
+  }
+  const error = (body as Record<string, unknown>).error;
+  if (typeof error !== 'object' || error === null) {
+    return { code: null, message: null };
+  }
+  const record = error as Record<string, unknown>;
+  return {
+    code: typeof record.code === 'string' && record.code !== '' ? record.code : null,
+    message: typeof record.message === 'string' && record.message !== '' ? record.message : null,
+  };
+}
+
+/**
+ * One refused status → its own honest failure. Mirrors `stateFromFailure` of
+ * `lib/git.ts`: every code the PC can answer with keeps its own copy, and an
+ * unknown one is still a real refusal with its status, never a success.
+ */
+function refusal(status: number, body: unknown): SendFailure {
+  const { code, message } = execError(body);
+  const raw = `status=${status} code=${code ?? 'sin código'} ${
+    message === null ? 'sin mensaje' : message.slice(0, 80)
+  }`;
+  const shared = { ok: false as const, blame: 'pc' as const, title: SEND_REFUSED_TITLE, raw, status };
+
+  if (code === 'exec_disabled' || (code === null && status === 403)) {
+    return {
+      ...shared,
+      reason: 'exec_disabled',
+      message: EXEC_DISABLED_COPY,
+      note: EXEC_DISABLED_NOTE,
+    };
+  }
+  if (code === 'shell_unsupported') {
+    return {
+      ...shared,
+      reason: 'shell_unsupported',
+      message: SHELL_UNSUPPORTED_COPY,
+      note: NOTHING_RAN_NOTE,
+    };
+  }
+  if (code === 'invalid_command') {
+    return {
+      ...shared,
+      reason: 'invalid_command',
+      message: INVALID_COMMAND_COPY,
+      note: NOTHING_RAN_NOTE,
+    };
+  }
+  if (code === 'invalid_body' || code === 'invalid_json') {
+    return { ...shared, reason: 'invalid_body', message: INVALID_BODY_COPY, note: NOTHING_RAN_NOTE };
+  }
+  if (code === 'payload_too_large' || status === 413) {
+    return {
+      ...shared,
+      reason: 'payload_too_large',
+      message: PAYLOAD_TOO_LARGE_COPY,
+      note: NOTHING_RAN_NOTE,
+    };
+  }
+  if (code === 'command_spawn_failed' || status === 502) {
+    return {
+      ...shared,
+      reason: 'command_spawn_failed',
+      message: COMMAND_SPAWN_FAILED_COPY,
+      note: NOTHING_RAN_NOTE,
+    };
+  }
+  if (status === 404 || status === 405 || status === 501) {
+    return {
+      ...shared,
+      reason: 'rejected',
+      message: execUnavailableCopy(status),
+      note: NOTHING_RAN_NOTE,
+    };
+  }
+  return {
+    ...shared,
+    reason: 'rejected',
+    message: sendRejectedCopy(status),
+    note: NOTHING_RAN_NOTE,
+  };
+}
+
+/** Link failure: the phone never got an answer from the PC. */
+function linkFailure(
+  reason: 'offline' | 'timeout' | 'broken',
+  message: string,
+  raw: string | null,
+  note: string | null = null,
+  status: number | null = null,
+): SendFailure {
+  return {
+    ok: false,
+    reason,
+    title: SEND_UNREACHABLE_TITLE,
+    blame: 'link',
+    message,
+    note,
+    raw,
+    status,
+  };
+}
+
+/**
+ * Send one command to the PC: `POST /api/exec` over the tunnel (protocol §4.1).
+ *
+ * - an empty/whitespace-only field is refused with `EMPTY_COMMAND_COPY` and
+ *   **nothing is written to the tunnel**;
+ * - no tunnel → `offline` (`SEND_OFFLINE_COPY`), never a fake send;
+ * - a refusal (403 `exec_disabled`, 400 `shell_unsupported`/`invalid_command`,
+ *   413, 502, …) keeps its own copy and **never enters the ring**: nothing ran;
+ * - a real `200` appends `{status: 'sent', exitCode, output}` to the ring with
+ *   the PC's own values and id. Non-zero exit codes are results, not errors.
+ *
+ * Every failure goes through the injected `failure(step, error, raw)` seam.
+ */
+export async function sendIntent(
+  command: unknown,
+  deps: SendDeps = {},
+): Promise<SendResult> {
+  const log = deps.logger ?? terminalLog;
+  const trimmed = typeof command === 'string' ? command.trim() : '';
+  if (trimmed === '') {
+    return { ok: false, reason: 'empty', message: EMPTY_COMMAND_COPY };
+  }
+
+  const channel = deps.channel ?? null;
+  if (channel === null) {
+    log.failure('exec-send', new Error('Sin túnel abierto hacia la PC.'), null);
+    return linkFailure('offline', SEND_OFFLINE_COPY, 'tunnel=null');
+  }
+
+  const result = await bridgeRequest<unknown>(channel, EXEC_PATH, {
+    method: 'POST',
+    body: { command: trimmed },
+    timeoutMs: deps.timeoutMs ?? SEND_TIMEOUT_MS,
+  });
+
+  if (!result.ok) {
+    const failure = result.failure;
+    const raw = rawOf(failure);
+    log.failure('exec-send', failure.error ?? new Error(failure.message), raw);
+    if (failure.kind === 'offline') {
+      return linkFailure('offline', SEND_OFFLINE_COPY, raw);
+    }
+    if (failure.kind === 'timeout') {
+      // The command may have run: never claim it did not.
+      return linkFailure('timeout', SEND_TIMEOUT_COPY, raw);
+    }
+    return linkFailure('broken', SEND_BROKEN_COPY, raw, SEND_BROKEN_NOTE);
+  }
+
+  if (result.status < 200 || result.status >= 300) {
+    const refused = refusal(result.status, result.body);
+    log.failure('exec-send', new Error(refused.message), refused.raw);
+    return refused;
+  }
+
+  const answer = parseExecAnswer(result.body);
+  if (answer === null) {
+    const raw = rawPrefix(result.body);
+    log.failure('exec-send-parse', new Error(SEND_BROKEN_COPY), raw);
+    return linkFailure('broken', SEND_BROKEN_COPY, raw, SEND_BROKEN_NOTE, result.status);
+  }
+
+  const known = {
+    command: trimmed,
+    status: 'sent' as const,
+    exitCode: answer.exitCode,
+    output: answer.output,
+    ...(answer.id === null ? {} : { id: answer.id }),
+  };
+  const entry: CommandEntry =
+    deps.history != null
+      ? deps.history.append(known)
+      : {
+          id: answer.id ?? `exec-${trimmed.length}-${Date.now()}`,
+          command: trimmed,
+          at: Date.now(),
+          status: 'sent',
+          exitCode: answer.exitCode,
+          output: answer.output,
+          reason: null,
+        };
+
+  return { ok: true, entry, exit: exitChip(entry.exitCode), output: renderOutput(entry.output) };
 }
 
 /* ------------------------------------------------------------------ *
@@ -951,9 +1279,8 @@ export async function loadHistory(
   }
 
   if (result.status < 200 || result.status >= 300) {
-    // The bridge answered, but not with a history. A missing endpoint is the
-    // expected state today (protocol §4 has no exec surface yet): it must read
-    // as "this is not available", never as "nothing ran yet".
+    // The bridge answered, but not with a history. A missing route reads as
+    // "this is not available", never as "nothing ran yet".
     const missing = result.status === 404 || result.status === 501;
     const message = missing ? MISSING_ENDPOINT_COPY : `La PC respondió ${result.status}.`;
     const raw = `status=${result.status} ${EXEC_HISTORY_PATH}`;
@@ -1077,7 +1404,7 @@ export function notSentRow(entry: CommandEntry): HistoryRow {
     status: 'pending',
     statusLabel: NOT_SENT_LABEL,
     notSent: true,
-    reason: NOT_SENT_REASON,
+    reason: entry.reason ?? NOT_SENT_REASON,
     exit: exitChip(null),
     output: null,
   };
@@ -1095,13 +1422,17 @@ function paneOf(rows: readonly HistoryRow[]): PaneView | null {
 }
 
 /**
- * Build the render model from a §V7 state plus the commands typed here that
- * never ran. Those are appended as `no enviado` rows in every state (they are
- * local truth, not PC truth) and never merged into the PC history.
+ * Build the render model from a §V7 state plus the commands typed here.
  *
- * The transcript (T7n) is derived from the same PC entries: real `at` stamps,
- * no fabricated agent events and no `waiting` state. `now` makes the elapsed
- * copy injectable.
+ * A local `pending` entry is a command that never ran: it is appended as a
+ * `no enviado` row with its reason and never merged into the PC history. A
+ * local `sent`/`failed` entry is a real result the PC returned (`POST
+ * /api/exec`): it is merged into `rows` (and therefore the pane) by id, so it
+ * disappears on its own once a history refresh carries the same id.
+ *
+ * The transcript (T7n) is derived from the PC entries: real `at` stamps, no
+ * fabricated agent events and no `waiting` state. `now` makes the elapsed copy
+ * injectable.
  */
 export function buildTerminalView(
   state: HistoryState,
@@ -1111,6 +1442,7 @@ export function buildTerminalView(
   const notSent = local
     .filter((entry) => entry.status === 'pending')
     .map((entry) => notSentRow(entry));
+  const realLocal = local.filter((entry) => entry.status !== 'pending').map(historyRow);
 
   const transcriptEntries: CommandEntry[] =
     state.kind === 'success' || state.kind === 'stale'
@@ -1143,21 +1475,25 @@ export function buildTerminalView(
 
   /** Shared projection of a history that may be live or cached. */
   const projection = (entries: readonly CommandEntry[], frozen: boolean) => {
-    const rows = entries.map(historyRow);
+    const known = new Set(entries.map((entry) => entry.id));
+    const rows = [...entries.map(historyRow), ...realLocal.filter((row) => !known.has(row.id))];
     return { rows, pane: paneOf(rows), frozen };
   };
 
   switch (state.kind) {
     case 'loading':
       return { ...base, state: 'loading', loading: true };
-    case 'empty':
+    case 'empty': {
+      const projected = projection([], false);
       return {
         ...base,
         state: 'empty',
+        ...projected,
         emptyMessage: EMPTY_COPY,
-        paneEmpty: PANE_EMPTY_COPY,
+        paneEmpty: projected.pane === null ? PANE_EMPTY_COPY : null,
         canSend: true,
       };
+    }
     case 'error':
       return {
         ...base,

@@ -14,6 +14,7 @@ import {
   bridgeRequest,
   bridgeSessions,
   buildGetRequest,
+  buildPostRequest,
   isOfflineError,
   splitResponse,
 } from '../lib/bridge.ts';
@@ -62,6 +63,28 @@ test('buildGetRequest writes the exact §4 wire bytes', () => {
     wire,
     'GET /api/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nAccept: application/json\r\n\r\n',
   );
+});
+
+test('buildPostRequest writes a real JSON POST with its Content-Length', async () => {
+  const body = { command: 'ls -la' };
+  const wire = utf8Decode(buildPostRequest('/api/exec', '127.0.0.1', body));
+  assert.equal(
+    wire,
+    'POST /api/exec HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n' +
+      'Accept: application/json\r\nContent-Type: application/json\r\n' +
+      `Content-Length: ${Buffer.byteLength(JSON.stringify(body))}\r\n\r\n` +
+      JSON.stringify(body),
+  );
+
+  // The same bytes on a live call: `bridgeRequest` defaults to GET, so a POST
+  // request must be asked for explicitly (protocol §4.1).
+  const channel = scriptedChannel([OK_WIRE({ id: 'cmd-1', exitCode: 0, output: null })]);
+  const result = await bridgeRequest(channel, '/api/exec', { method: 'POST', body });
+  assert.equal(result.ok, true);
+  assert.equal(result.status, 200);
+  const wrote = channel.log.find(([op]) => op === 'write');
+  assert.match(wrote[1], /^POST \/api\/exec HTTP\/1\.1/);
+  assert.ok(wrote[1].endsWith(`\r\n\r\n${JSON.stringify(body)}`));
 });
 
 test('splitResponse parses status + body', () => {

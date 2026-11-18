@@ -26,18 +26,25 @@ import {
 import { logger } from '../lib/logger';
 import {
   type CommandEntry,
+  type ExitChip,
   type ExitTone,
   type HistoryRow,
   type HistoryState,
+  type OutputView,
+  type SendFailure,
   type TerminalViewModel,
   type TranscriptEvent,
   type TranscriptStatus,
   AGENT_NOTE,
   CLEAR_LABEL,
   CLEAR_NOTE,
+  NOT_SENT_REASON,
   OUTPUT_DISPLAY_CAP,
+  PANE_NO_OUTPUT_COPY,
+  SENDING_COPY,
+  SEND_BROKEN_COPY,
   SEND_LABEL,
-  SEND_PENDING_NOTE,
+  SEND_UNREACHABLE_TITLE,
   CommandHistory,
   HistoryCache,
   buildTerminalView,
@@ -60,12 +67,16 @@ import { colors, elevation, radius, spacing, typography } from '../lib/theme';
  * with no tunnel the screen says `Requiere conexión — el terminal corre en tu
  * PC.`, a timeout after a good answer keeps the cached history under an amber
  * `Datos de hace N min` chip, and an extension that does not expose the
- * endpoint yet is an error card carrying the failure message — never an
- * invented command, exit code or output.
+ * endpoint is an error card carrying the failure message — never an invented
+ * command, exit code or output.
  *
- * The command endpoint (`POST /api/exec`) does not exist: typing a command and
- * tapping send records it as `no enviado` with the reason and logs
- * `route pending`. Nothing is echoed and nothing pretends to have run.
+ * Sending is a real `POST /api/exec` (protocol §4.1): the dock shows
+ * `Enviando…` while the request is in flight, and the answer is either the real
+ * exit chip plus output in the pane (a non-zero code is a result, not an error)
+ * or the failure card with the PC's own message and its raw evidence. A `403
+ * exec_disabled` says the **PC** refused because the extension needs
+ * `GENTLE_MOVIL_ALLOW_EXEC=1`, not that the phone failed, and it never leaves a
+ * row pretending the command ran.
  *
  * The transcript section (T7n) is derived from the same real history: its chip
  * is only ever `en curso` (newest entry `pending`, with the real elapsed time),
@@ -209,7 +220,7 @@ function NotSentRowView({ row }: { row: HistoryRow }) {
           <Text style={styles.notSentChipText}>{row.statusLabel}</Text>
         </View>
       </View>
-      <Text style={styles.notSentReason}>{row.reason ?? SEND_PENDING_NOTE}</Text>
+      <Text style={styles.notSentReason}>{row.reason ?? NOT_SENT_REASON}</Text>
       <Text style={styles.rowTime}>{row.atLabel}</Text>
     </View>
   );
@@ -224,14 +235,23 @@ function SkeletonRow() {
   );
 }
 
+/** What the pane paints: a real result, with its real exit chip. */
+interface PaneModel {
+  command: string;
+  exit: ExitChip;
+  /** `null` when the command ran and printed nothing (never invented). */
+  output: OutputView | null;
+}
+
 /** The monospace output pane (artboard `.terminal`). */
-function OutputPane({ vm, pane }: { vm: TerminalViewModel; pane: TerminalViewModel['pane'] }) {
+function OutputPane({ vm, pane }: { vm: TerminalViewModel; pane: PaneModel | null }) {
   return (
     <View style={styles.terminal} accessibilityLabel="Salida del terminal">
       <View style={styles.terminalBar}>
         <Text style={styles.terminalTitle} numberOfLines={1}>
           {vm.transcript.agent.label}
         </Text>
+        {pane !== null && <Chip label={pane.exit.label} tone={pane.exit.tone} />}
         <Text style={styles.terminalState} numberOfLines={1}>
           {stateLabel(vm)}
         </Text>
@@ -244,15 +264,21 @@ function OutputPane({ vm, pane }: { vm: TerminalViewModel; pane: TerminalViewMod
             <Text style={styles.panePrompt} numberOfLines={1}>
               {`$ ${pane.command}`}
             </Text>
-            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-              <Text style={styles.paneOutput} selectable>
-                {pane.output.text === '' ? ' ' : pane.output.text}
-              </Text>
-            </ScrollView>
-            {pane.output.truncated && (
-              <Text style={styles.paneNote}>
-                {`Salida recortada a ${OUTPUT_DISPLAY_CAP} caracteres (${pane.output.hidden} ocultos).`}
-              </Text>
+            {pane.output === null ? (
+              <Text style={styles.paneEmpty}>{PANE_NO_OUTPUT_COPY}</Text>
+            ) : (
+              <>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                  <Text style={styles.paneOutput} selectable>
+                    {pane.output.text === '' ? ' ' : pane.output.text}
+                  </Text>
+                </ScrollView>
+                {pane.output.truncated && (
+                  <Text style={styles.paneNote}>
+                    {`Salida recortada a ${OUTPUT_DISPLAY_CAP} caracteres (${pane.output.hidden} ocultos).`}
+                  </Text>
+                )}
+              </>
             )}
           </>
         )}
@@ -352,6 +378,8 @@ export default function TerminalControlScreen() {
   const [local, setLocal] = useState<CommandEntry[]>([]);
   const [draft, setDraft] = useState('');
   const [note, setNote] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const [sendFailure, setSendFailure] = useState<SendFailure | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [check, setCheck] = useState<ConnectionCheck | null>(null);
 
@@ -430,9 +458,9 @@ export default function TerminalControlScreen() {
   }, [load, inspectConnection]);
 
   /** Selected row wins the pane; otherwise the newest output is shown. */
-  const pane = useMemo(() => {
+  const pane: PaneModel | null = useMemo(() => {
     const selected = vm.rows.find((row) => row.id === selectedId) ?? null;
-    if (selected !== null && selected.output !== null) {
+    if (selected !== null) {
       return { command: selected.command, exit: selected.exit, output: selected.output };
     }
     return vm.pane;
@@ -446,30 +474,63 @@ export default function TerminalControlScreen() {
     setSelectedId((current) => (current === row.id ? null : row.id));
   }, []);
 
-  const send = useCallback(() => {
-    const intent = sendIntent(draft);
-    if (!intent.ok) {
-      setNote(intent.message);
+  const send = useCallback(async () => {
+    if (sending) {
       return;
     }
-    // The endpoint does not exist: log the route and record the command as
-    // `no enviado`. No optimistic output, no fake acknowledgement.
-    log.warn('route pending', {
-      route: intent.intent.route,
-      method: intent.intent.method,
-      reason: 'exec-endpoint-not-built',
-      command: intent.intent.command,
-    });
-    history.current.append({ command: intent.intent.command });
-    setLocal(history.current.entries());
-    setDraft('');
-    setNote(intent.intent.note);
-  }, [draft]);
+    setSendFailure(null);
+    setSending(true);
+    setNote(SENDING_COPY);
+    try {
+      // The real call: `POST /api/exec` over the tunnel (protocol §4.1).
+      const result = await sendIntent(draft, {
+        channel: bridgeChannel(),
+        history: history.current,
+        logger: log,
+      });
+      if (!result.ok) {
+        setNote(null);
+        if (result.reason === 'empty') {
+          setNote(result.message);
+          return;
+        }
+        // Nothing ran: the command stays in the dock as a `no enviado` row with
+        // the PC's own reason, and the card carries message + raw evidence.
+        setSendFailure(result);
+        history.current.append({ command: draft.trim(), reason: result.message });
+        setLocal(history.current.entries());
+        return;
+      }
+      // A real result: the ring already kept the real exit code and output.
+      setLocal(history.current.entries());
+      setSelectedId(result.entry.id);
+      setDraft('');
+      setNote(null);
+    } catch (error) {
+      // sendIntent reports typed failures; a throw here is unexpected and is
+      // never rendered as a successful send.
+      log.failure('exec-send', error, null);
+      setNote(null);
+      setSendFailure({
+        ok: false,
+        reason: 'broken',
+        title: SEND_UNREACHABLE_TITLE,
+        blame: 'link',
+        message: SEND_BROKEN_COPY,
+        note: null,
+        raw: String(error),
+        status: null,
+      });
+    } finally {
+      setSending(false);
+    }
+  }, [draft, sending]);
 
   const clear = useCallback(() => {
     history.current.clear();
     setLocal(history.current.entries());
     setSelectedId(null);
+    setSendFailure(null);
     setDraft('');
     setNote(CLEAR_NOTE);
     log.info('clear', { scope: 'local-view' });
@@ -572,6 +633,17 @@ export default function TerminalControlScreen() {
 
         {!vm.loading && vm.transcriptVisible && <TranscriptSection vm={vm} />}
 
+        {sendFailure !== null && (
+          <View style={styles.errorCard} accessibilityRole="alert" testID="terminal-send-error">
+            <Text style={styles.errorTitle}>{sendFailure.title}</Text>
+            <Text style={styles.errorMessage}>{sendFailure.message}</Text>
+            {sendFailure.note !== null && (
+              <Text style={styles.errorNote}>{sendFailure.note}</Text>
+            )}
+            {sendFailure.raw !== null && <Text style={styles.errorRaw}>{sendFailure.raw}</Text>}
+          </View>
+        )}
+
         {note !== null && (
           <View style={styles.noteCard} accessibilityRole="status">
             <Text style={styles.noteText}>{note}</Text>
@@ -637,26 +709,30 @@ export default function TerminalControlScreen() {
             placeholder="Escribí un comando…"
             placeholderTextColor={colors.faint}
             value={draft}
-            editable={vm.canSend}
+            editable={vm.canSend && !sending}
             onChangeText={setDraft}
-            onSubmitEditing={send}
+            onSubmitEditing={() => void send()}
             autoCapitalize="none"
             autoCorrect={false}
             returnKeyType="send"
-            style={[styles.input, !vm.canSend && styles.inputDisabled]}
+            style={[styles.input, (!vm.canSend || sending) && styles.inputDisabled]}
           />
           <Pressable
             accessibilityRole="button"
             accessibilityLabel={SEND_LABEL}
-            accessibilityState={{ disabled: !vm.canSend }}
-            disabled={!vm.canSend}
-            onPress={send}
+            accessibilityState={{ disabled: !vm.canSend || sending, busy: sending }}
+            disabled={!vm.canSend || sending}
+            onPress={() => void send()}
             style={({ pressed }) => [
               styles.send,
-              !vm.canSend && styles.sendDisabled,
-              pressed && vm.canSend && styles.sendPressed,
+              (!vm.canSend || sending) && styles.sendDisabled,
+              pressed && vm.canSend && !sending && styles.sendPressed,
             ]}>
-            <Text style={styles.sendGlyph}>→</Text>
+            {sending ? (
+              <ActivityIndicator size="small" color={colors.accentInk} />
+            ) : (
+              <Text style={styles.sendGlyph}>→</Text>
+            )}
           </Pressable>
         </View>
       </View>
@@ -781,6 +857,10 @@ const styles = StyleSheet.create({
   errorRaw: {
     ...typography.fine,
     color: colors.faint,
+  },
+  errorNote: {
+    ...typography.fine,
+    color: colors.text,
   },
   terminal: {
     borderRadius: radius.lg,
