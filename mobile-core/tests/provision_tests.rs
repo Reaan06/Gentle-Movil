@@ -15,9 +15,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use mobile_core::cabi;
 use mobile_core::device_key;
 use mobile_core::provision::{
-    detect_host, register_device_with_timeout, rollback, sha256_hex, start_daemon,
-    start_daemon_with_timeout, upload_daemon, verify_manifest, verify_release_signature,
-    ReleaseManifest,
+    detect_host, register_device_with_timeout, rollback, run_step_command_with_timeout, sha256_hex,
+    start_daemon, start_daemon_with_timeout, upload_daemon, verify_manifest,
+    verify_release_signature, ReleaseManifest, STEP_COMMAND_TIMEOUT,
 };
 use mobile_core::ssh::{
     BoxFuture, ChannelEvent, ConnectRequest, ExecOutput, SshCredential, SshSession, Transport,
@@ -40,6 +40,11 @@ const INVITE: &str = "inv_7Qp2";
 enum TcpReply {
     /// A channel that yields these events, then EOF.
     Events(Vec<ChannelEvent>),
+    /// A channel that yields these events and then parks forever: a peer that keeps the
+    /// tunnel open without sending anything, so a read can be timed out instead of EOF-ed.
+    Live(Vec<ChannelEvent>),
+    /// A channel whose writes come back as data frames (an app-level round trip).
+    Echo,
     /// The tunnel cannot be opened (the daemon port does not answer yet).
     Failure(String),
     /// The channel open never completes, like a host that stops answering mid-handshake.
@@ -177,19 +182,17 @@ impl TransportSession for ScriptedSession {
             .expect("targets")
             .push((target_host.to_string(), target_port));
         let reply = self.shared.pop_tcp();
-        match reply {
+        let shared = Arc::clone(&self.shared);
+        let channel = match reply {
             TcpReply::Failure(reason) => {
-                Box::pin(async move { Err(mobile_core::CoreError::ssh(reason)) })
+                return Box::pin(async move { Err(mobile_core::CoreError::ssh(reason)) })
             }
-            TcpReply::Stall => Box::pin(std::future::pending()),
-            TcpReply::Events(events) => {
-                let channel = TcpChannel {
-                    shared: Arc::clone(&self.shared),
-                    pending: AsyncMutex::new(events.into()),
-                };
-                Box::pin(async move { Ok(Box::new(channel) as Box<dyn TransportChannel>) })
-            }
-        }
+            TcpReply::Stall => return Box::pin(std::future::pending()),
+            TcpReply::Events(events) => TcpChannel::new(shared, events, false, false),
+            TcpReply::Live(events) => TcpChannel::new(shared, events, true, false),
+            TcpReply::Echo => TcpChannel::new(shared, Vec::new(), false, true),
+        };
+        Box::pin(async move { Ok(Box::new(channel) as Box<dyn TransportChannel>) })
     }
 
     fn open_subsystem<'a>(
@@ -216,13 +219,39 @@ impl TransportSession for ScriptedSession {
 struct TcpChannel {
     shared: Arc<Shared>,
     pending: AsyncMutex<VecDeque<ChannelEvent>>,
+    /// Park instead of answering EOF when the scripted queue is empty (an open peer).
+    park: bool,
+    /// Feed every written payload back into the read queue.
+    echo: bool,
+}
+
+impl TcpChannel {
+    fn new(
+        shared: Arc<Shared>,
+        events: Vec<ChannelEvent>,
+        park: bool,
+        echo: bool,
+    ) -> Self {
+        Self {
+            shared,
+            pending: AsyncMutex::new(events.into()),
+            park,
+            echo,
+        }
+    }
 }
 
 impl TransportChannel for TcpChannel {
     fn read<'a>(&'a self) -> BoxFuture<'a, Result<ChannelEvent, mobile_core::CoreError>> {
         Box::pin(async move {
-            let mut pending = self.pending.lock().await;
-            Ok(pending.pop_front().unwrap_or(ChannelEvent::Eof))
+            let next = self.pending.lock().await.pop_front();
+            match next {
+                Some(event) => Ok(event),
+                None if self.park => {
+                    std::future::pending::<Result<ChannelEvent, mobile_core::CoreError>>().await
+                }
+                None => Ok(ChannelEvent::Eof),
+            }
         })
     }
 
@@ -232,7 +261,15 @@ impl TransportChannel for TcpChannel {
             .lock()
             .expect("writes")
             .push(bytes.to_vec());
-        Box::pin(async { Ok(()) })
+        Box::pin(async move {
+            if self.echo {
+                self.pending
+                    .lock()
+                    .await
+                    .push_back(ChannelEvent::Data(bytes.to_vec()));
+            }
+            Ok(())
+        })
     }
 
     fn close(&self) -> BoxFuture<'_, Result<(), mobile_core::CoreError>> {
@@ -1798,5 +1835,374 @@ fn tunnel_step_rejects_a_payload_with_no_usable_forward() {
     assert!(
         script.tcp_targets().is_empty(),
         "a refused tunnel must not open a channel"
+    );
+}
+
+// --------------------------------------------------------------------------------------
+// Tunnel bytes over the C ABI (S4/S7): the channels the `tunnel` step opens are readable
+// and writable across separate calls, with bounded reads and honest EOF/timeout answers.
+// --------------------------------------------------------------------------------------
+
+/// Standard (padded) base64, spelled here so the tests need no extra crate.
+fn b64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let first = u32::from(chunk[0]);
+        let second = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let third = u32::from(chunk.get(2).copied().unwrap_or(0));
+        let triple = (first << 16) | (second << 8) | third;
+        out.push(ALPHABET[(triple >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(triple >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(triple >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[triple as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// One base64 digit of the standard alphabet.
+fn b64_value(byte: u8) -> u32 {
+    match byte {
+        b'A'..=b'Z' => u32::from(byte - b'A'),
+        b'a'..=b'z' => u32::from(byte - b'a') + 26,
+        b'0'..=b'9' => u32::from(byte - b'0') + 52,
+        b'+' => 62,
+        b'/' => 63,
+        other => panic!("invalid base64 byte {other}"),
+    }
+}
+
+/// Decode standard base64 for the read answers.
+fn b64_decode(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for chunk in text.as_bytes().chunks(4) {
+        let mut triple = 0u32;
+        let mut padding = 0usize;
+        for byte in chunk {
+            if *byte == b'=' {
+                padding += 1;
+                triple <<= 6;
+            } else {
+                triple = (triple << 6) | b64_value(*byte);
+            }
+        }
+        out.push((triple >> 16) as u8);
+        if padding < 2 {
+            out.push((triple >> 8) as u8);
+        }
+        if padding < 1 {
+            out.push(triple as u8);
+        }
+    }
+    out
+}
+
+/// `gc_ssh_channel_write` with a base64 payload.
+fn channel_write(session_id: u64, channel_id: u64, bytes: &[u8]) -> serde_json::Value {
+    let payload = CString::new(serde_json::json!({ "bytes": b64_encode(bytes) }).to_string())
+        .expect("no NUL");
+    call_json(cabi::gc_ssh_channel_write(
+        session_id,
+        channel_id,
+        payload.as_ptr(),
+    ))
+}
+
+/// `gc_ssh_channel_read` bounded by `timeout_ms`.
+fn channel_read(session_id: u64, channel_id: u64, timeout_ms: u64) -> serde_json::Value {
+    let payload = CString::new(serde_json::json!({ "timeoutMs": timeout_ms }).to_string())
+        .expect("no NUL");
+    call_json(cabi::gc_ssh_channel_read(
+        session_id,
+        channel_id,
+        payload.as_ptr(),
+    ))
+}
+
+/// `gc_ssh_channel_close`.
+fn channel_close(session_id: u64, channel_id: u64) -> serde_json::Value {
+    call_json(cabi::gc_ssh_channel_close(session_id, channel_id))
+}
+
+/// Run one `tunnel` step for `ports` and return the channel handles it reported.
+fn open_tunnels(session_id: u64, ports: &[u16]) -> Vec<u64> {
+    let forwards: Vec<serde_json::Value> = ports
+        .iter()
+        .map(|port| serde_json::json!({ "host": "127.0.0.1", "port": port }))
+        .collect();
+    let answer = provision_step(
+        session_id,
+        serde_json::json!({
+            "sessionId": session_id,
+            "step": "tunnel",
+            "forwards": forwards,
+        }),
+    );
+    assert_eq!(answer["ok"], true, "{answer}");
+    answer["result"]["forwards"]
+        .as_array()
+        .expect("forwards")
+        .iter()
+        .map(|forward| forward["channel_id"].as_u64().expect("channel id"))
+        .collect()
+}
+
+#[test]
+fn channel_write_then_read_round_trips_bytes_through_the_tunnel() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_tcp(TcpReply::Echo);
+    let channel = open_tunnels(session_id, &[43722])[0];
+
+    let request = b"GET /device/ws HTTP/1.1\r\nHost: 127.0.0.1:43722\r\n\r\n";
+    // Wire format pinned to RFC 4648: this payload base64s to exactly this text, so the
+    // payload below is canonical and not merely self-consistent with the test encoder.
+    const CANONICAL: &str = "R0VUIC9kZXZpY2Uvd3MgSFRUUC8xLjENCkhvc3Q6IDEyNy4wLjAuMTo0MzcyMg0KDQo=";
+    assert_eq!(b64_encode(request), CANONICAL);
+    let written = channel_write(session_id, channel, request);
+    assert_eq!(written["ok"], true, "{written}");
+    assert_eq!(written["result"]["written"], request.len() as u64);
+    // The bytes really reached the tunnel channel the `tunnel` step opened.
+    assert_eq!(script.written_tcp(), vec![request.to_vec()]);
+
+    let answer = channel_read(session_id, channel, 500);
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["result"]["eof"], false);
+    assert_eq!(answer["result"]["bytes"], CANONICAL);
+    assert_eq!(
+        b64_decode(answer["result"]["bytes"].as_str().expect("bytes")),
+        request.to_vec()
+    );
+}
+
+#[test]
+fn channel_read_honours_its_timeout_and_returns_empty_bytes() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_tcp(TcpReply::Live(Vec::new()));
+    let channel = open_tunnels(session_id, &[43721])[0];
+
+    let started = std::time::Instant::now();
+    let answer = channel_read(session_id, channel, 120);
+    let elapsed = started.elapsed();
+
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["result"]["bytes"], "");
+    assert_eq!(answer["result"]["eof"], false, "a timeout is not an end of stream");
+    assert!(
+        elapsed >= Duration::from_millis(100),
+        "the read must wait for the requested window: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the read must never block past its timeout: {elapsed:?}"
+    );
+}
+
+#[test]
+fn channel_read_reports_eof_after_the_remote_closes() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_tcp(TcpReply::Events(vec![ChannelEvent::Data(
+        b"HTTP/1.1 101 Switching Protocols\r\n\r\n".to_vec(),
+    )]));
+    let channel = open_tunnels(session_id, &[43721])[0];
+
+    let first = channel_read(session_id, channel, 500);
+    assert_eq!(first["ok"], true, "{first}");
+    assert_eq!(first["result"]["eof"], false);
+    assert_eq!(
+        b64_decode(first["result"]["bytes"].as_str().expect("bytes")),
+        b"HTTP/1.1 101 Switching Protocols\r\n\r\n".to_vec()
+    );
+
+    let second = channel_read(session_id, channel, 500);
+    assert_eq!(second["ok"], true, "{second}");
+    assert_eq!(second["result"]["eof"], true);
+    assert_eq!(second["result"]["bytes"], "");
+}
+
+#[test]
+fn unknown_and_stale_channel_ids_return_error_envelopes() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+
+    let unknown_read = channel_read(session_id, 4242, 50);
+    assert_eq!(unknown_read["ok"], false, "{unknown_read}");
+    assert_eq!(unknown_read["error"]["kind"], "ssh");
+    assert_eq!(
+        unknown_read["error"]["message"],
+        "ssh: unknown channel id 4242"
+    );
+
+    let unknown_write = channel_write(session_id, 4242, b"x");
+    assert_eq!(unknown_write["ok"], false, "{unknown_write}");
+    assert_eq!(unknown_write["error"]["kind"], "ssh");
+
+    let unknown_close = channel_close(session_id, 4242);
+    assert_eq!(unknown_close["ok"], false, "{unknown_close}");
+    assert_eq!(unknown_close["error"]["kind"], "ssh");
+
+    // An unknown session is the same envelope, never a panic.
+    let unknown_session = channel_read(9999, 1, 50);
+    assert_eq!(unknown_session["ok"], false, "{unknown_session}");
+    assert_eq!(unknown_session["error"]["kind"], "ssh");
+    assert_eq!(
+        unknown_session["error"]["message"],
+        "ssh: unknown session id 9999"
+    );
+
+    // Closing really frees the handle: the same id is stale afterwards.
+    script.push_tcp(TcpReply::Live(Vec::new()));
+    let channel = open_tunnels(session_id, &[43722])[0];
+    let closed = channel_close(session_id, channel);
+    assert_eq!(closed["ok"], true, "{closed}");
+    assert_eq!(closed["result"]["closed"], true);
+    let stale = channel_read(session_id, channel, 50);
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert_eq!(stale["error"]["kind"], "ssh");
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("unknown channel id"),
+        "{stale}"
+    );
+}
+
+#[test]
+fn channel_write_rejects_a_payload_that_is_not_usable_base64() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_tcp(TcpReply::Live(Vec::new()));
+    let channel = open_tunnels(session_id, &[43722])[0];
+
+    let bad = CString::new(r#"{"bytes":"not base64!!"}"#).expect("no NUL");
+    let answer = call_json(cabi::gc_ssh_channel_write(
+        session_id,
+        channel,
+        bad.as_ptr(),
+    ));
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["kind"], "input");
+
+    let empty = CString::new(r#"{"bytes":""}"#).expect("no NUL");
+    let answer = call_json(cabi::gc_ssh_channel_write(
+        session_id,
+        channel,
+        empty.as_ptr(),
+    ));
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["kind"], "input");
+    assert!(
+        script.written_tcp().is_empty(),
+        "nothing may reach the tunnel for a refused payload"
+    );
+}
+
+#[test]
+fn a_pending_read_does_not_delay_a_write_on_the_same_channel() {
+    // R3-001 at the ABI level: the tunnel reads and writes at the same time, so a read
+    // parked on an idle channel must not hold anything the write needs.
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_tcp(TcpReply::Live(Vec::new()));
+    let channel = open_tunnels(session_id, &[43722])[0];
+
+    let reader = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let answer = channel_read(session_id, channel, 1_500);
+        (answer, started.elapsed())
+    });
+    // Let the read reach the channel and park on it.
+    std::thread::sleep(Duration::from_millis(150));
+
+    let started = std::time::Instant::now();
+    let written = channel_write(session_id, channel, b"ping");
+    let write_elapsed = started.elapsed();
+    assert_eq!(written["ok"], true, "{written}");
+    assert!(
+        write_elapsed < Duration::from_millis(600),
+        "a pending read must not delay a write on the same channel: {write_elapsed:?}"
+    );
+
+    let (read_answer, read_elapsed) = reader.join().expect("reader thread");
+    assert_eq!(read_answer["ok"], true, "{read_answer}");
+    assert_eq!(read_answer["result"]["eof"], false);
+    assert!(
+        read_elapsed < Duration::from_secs(4),
+        "the bounded read must still end: {read_elapsed:?}"
+    );
+}
+
+#[test]
+fn a_stalled_step_command_returns_the_timeout_error_within_the_deadline() {
+    let script = shared();
+    script.stall_exec_containing("sleep 99");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+
+    let started = std::time::Instant::now();
+    let error = runtime
+        .block_on(async {
+            let session = mock_session(&script).await;
+            run_step_command_with_timeout(
+                &session,
+                "detect",
+                "sleep 99",
+                Duration::from_millis(80),
+            )
+            .await
+        })
+        .expect_err("a stalled command must time out");
+    let elapsed = started.elapsed();
+
+    assert_eq!(error.kind(), "ssh");
+    let message = error.to_string();
+    assert!(
+        message.contains("detect") && message.contains("did not complete within"),
+        "the timeout must name the step and the window: {message}"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(80),
+        "the call must wait for the deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the deadline must bound the call: {elapsed:?}"
+    );
+    // The stalled command really was the script the step composed.
+    assert_eq!(script.commands(), vec![posix_command("sleep 99")]);
+}
+
+#[test]
+fn the_step_command_deadline_is_bounded_and_above_the_app_side_timeouts() {
+    // `mobile/lib/provision.ts` bounds detect/register at 15 s, so the core deadline must
+    // sit above that (it is the backstop for a host that stops answering) and below a
+    // window the progress screen could never call sane.
+    assert!(
+        STEP_COMMAND_TIMEOUT >= Duration::from_secs(15),
+        "{STEP_COMMAND_TIMEOUT:?}"
+    );
+    assert!(
+        STEP_COMMAND_TIMEOUT <= Duration::from_secs(120),
+        "{STEP_COMMAND_TIMEOUT:?}"
     );
 }

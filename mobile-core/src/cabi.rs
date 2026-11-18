@@ -19,6 +19,9 @@
 //! | [`gc_pair_from_qr`] | URI | `{"ok":true,"pair":{...}}` |
 //! | [`gc_ssh_connect`] | connect config JSON | `{"ok":true,"sessionId":N,"result":{"sessionId":N,"fingerprint":"…"}}` |
 //! | [`gc_provision_step`] | session id + step JSON | `{"ok":true,"step":"…","result":{…}}` |
+//! | [`gc_ssh_channel_write`] | session id + channel id + `{"bytes":"<base64>"}` | `{"ok":true,"result":{"written":N}}` |
+//! | [`gc_ssh_channel_read`] | session id + channel id + optional `{"timeoutMs":N}` | `{"ok":true,"result":{"bytes":"<base64>","eof":false}}` |
+//! | [`gc_ssh_channel_close`] | session id + channel id | `{"ok":true,"result":{"closed":true}}` |
 //! | [`gc_device_key_generate`] | – | `{"ok":true,"key":{"public_hex":"…","secret":{"secret_seed":[..]}}}` |
 //! | [`gc_free`] | pointer from any `gc_*` | – |
 //!
@@ -34,11 +37,20 @@
 //! `{"ok":false,"error":{"kind":"panic","message":"…"}}` answer, so a Kotlin caller never
 //! sees an unwinding stack across `extern "C"` (which would abort the process).
 //!
-//! ## Session ids
+//! ## Session and channel ids
 //!
-//! The registry is [`MobileCore`]'s own: [`gc_ssh_connect`] allocates the id and
-//! [`gc_provision_step`] looks it up in the same map, so ids handed out here are the same
-//! ids the frozen `ffi` surface uses.
+//! The registry is [`MobileCore`]'s own: [`gc_ssh_connect`] allocates the session id,
+//! [`gc_provision_step`]'s `tunnel` step allocates the channel ids and
+//! [`gc_ssh_channel_read`] / [`gc_ssh_channel_write`] / [`gc_ssh_channel_close`] address
+//! exactly those ids in the same map, so ids handed out here are the same ids the frozen
+//! `ffi` surface uses. Channels therefore survive across separate calls: nothing is
+//! reopened per call.
+//!
+//! ## Byte payloads
+//!
+//! Bytes cross this boundary as standard (padded) RFC 4648 base64 inside the JSON envelope
+//! (`{"bytes":"<base64>"}`), because the native shells and the TS runtime all decode it
+//! natively.
 
 // The C ABI boundary is the single place where `unsafe` is permitted (see the module docs).
 #![allow(unsafe_code)]
@@ -48,12 +60,13 @@ use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::CoreError;
-use crate::ffi::{CoreErrorPayload, MobileCore, SessionId};
+use crate::ffi::{ChannelId, CoreErrorPayload, MobileCore, SessionId};
 use crate::fingerprint;
 use crate::provision::{
     detect_host, register_device, rollback, run_step_command, start_daemon, upload_daemon,
@@ -72,6 +85,12 @@ const KIND_INPUT: &str = "input";
 const KIND_PANIC: &str = "panic";
 /// Kind reported when a JSON record cannot be encoded (should be unreachable).
 const KIND_INTERNAL: &str = "internal";
+
+/// Read window used by [`gc_ssh_channel_read`] when the app omits `timeoutMs`.
+///
+/// A bounded default keeps a stalled host from blocking a native thread forever (§7): the
+/// app keeps the tunnel open and reads again, instead of waiting on a dead socket.
+pub const DEFAULT_READ_TIMEOUT_MS: u64 = 30_000;
 
 /// Process-wide facade, so every `gc_*` call shares one session registry.
 static CORE: Mutex<Option<Arc<MobileCore>>> = Mutex::new(None);
@@ -231,6 +250,100 @@ pub extern "C" fn gc_provision_step(session_id: u64, step_json: *const c_char) -
     })
 }
 
+/// `gc_ssh_channel_write(session_id, channel_id, payload_json)`: send bytes on a tunnel
+/// channel that the `tunnel` step opened.
+///
+/// Input: `{"bytes":"<base64>"}`, standard (padded) base64 of the payload. Output:
+/// `{"ok":true,"result":{"written":N}}` with the number of bytes handed to the transport.
+///
+/// The channel is the one `gc_provision_step`'s `tunnel` step reported as `channel_id` and
+/// it is held by the process-wide registry, so the bytes reach the very channel that step
+/// opened — nothing is reopened here.
+///
+/// An empty payload, a payload that is not standard base64, an unknown session id and an
+/// unknown channel id each answer the normal error envelope (`input` for the payload,
+/// `ssh` for the handles); none of them panics (S7).
+#[no_mangle]
+pub extern "C" fn gc_ssh_channel_write(
+    session_id: u64,
+    channel_id: u64,
+    payload_json: *const c_char,
+) -> *mut c_char {
+    let session_id = SessionId::from(session_id);
+    let channel_id = ChannelId::from(channel_id);
+    json_call(|| {
+        let payload = read_str(payload_json)?;
+        let payload: ChannelWrite = serde_json::from_str(payload).map_err(|error| {
+            AbiError::input(format!("channel write payload is not valid: {error}"))
+        })?;
+        let bytes = base64_decode(&payload.bytes)?;
+        if bytes.is_empty() {
+            return Err(AbiError::input(
+                "the channel write payload needs at least one byte",
+            ));
+        }
+        let written = bytes.len();
+        let core = core_arc()?;
+        core.session(session_id).map_err(AbiError::from)?;
+        block_on(core.channel_write(channel_id, bytes))?.map_err(AbiError::from)?;
+        Ok(json!({ "ok": true, "result": { "written": written } }))
+    })
+}
+
+/// `gc_ssh_channel_read(session_id, channel_id, payload_json)`: read from a tunnel channel.
+///
+/// Input: `{"timeoutMs":N}` (optional). A null pointer, `null` or an absent `timeoutMs`
+/// uses [`DEFAULT_READ_TIMEOUT_MS`]; `timeoutMs: 0` is a non-blocking poll.
+///
+/// Output: `{"ok":true,"result":{"bytes":"<base64>","eof":false}}`. The three outcomes
+/// are distinct:
+///
+/// | outcome | `bytes` | `eof` |
+/// |---|---|---|
+/// | data arrived | the bytes, base64 | `false` |
+/// | nothing arrived inside `timeoutMs` | `""` | `false` (a timeout is **not** an error) |
+/// | the host closed the channel | `""` | `true` |
+///
+/// The call never blocks past `timeoutMs`. Unknown session and channel ids answer the
+/// `ssh` error envelope (S7).
+#[no_mangle]
+pub extern "C" fn gc_ssh_channel_read(
+    session_id: u64,
+    channel_id: u64,
+    payload_json: *const c_char,
+) -> *mut c_char {
+    let session_id = SessionId::from(session_id);
+    let channel_id = ChannelId::from(channel_id);
+    json_call(|| {
+        let timeout = read_channel_timeout(payload_json)?;
+        let core = core_arc()?;
+        core.session(session_id).map_err(AbiError::from)?;
+        let read = block_on(core.channel_read_with_timeout(channel_id, timeout))?
+            .map_err(AbiError::from)?;
+        Ok(json!({
+            "ok": true,
+            "result": { "bytes": base64_encode(&read.bytes), "eof": read.eof },
+        }))
+    })
+}
+
+/// `gc_ssh_channel_close(session_id, channel_id)`: close a tunnel channel and free its id.
+///
+/// Output: `{"ok":true,"result":{"closed":true}}`. The id is stale afterwards, so a later
+/// read, write or close on it answers the `ssh` error envelope naming the unknown id
+/// instead of touching a dead channel.
+#[no_mangle]
+pub extern "C" fn gc_ssh_channel_close(session_id: u64, channel_id: u64) -> *mut c_char {
+    let session_id = SessionId::from(session_id);
+    let channel_id = ChannelId::from(channel_id);
+    json_call(|| {
+        let core = core_arc()?;
+        core.session(session_id).map_err(AbiError::from)?;
+        block_on(core.channel_close(channel_id))?.map_err(AbiError::from)?;
+        Ok(json!({ "ok": true, "result": { "closed": true } }))
+    })
+}
+
 /// `gc_device_key_generate()`: create the phone's ed25519 identity (§2.1).
 ///
 /// Output: `{"ok":true,"key":{"public_hex":"<64 hex>","secret":{"secret_seed":[..32 bytes]}}}`.
@@ -293,6 +406,130 @@ struct SshConnectConfig {
 /// The SSH port used when the config omits it.
 fn default_ssh_port() -> u16 {
     crate::qr::DEFAULT_PORT
+}
+
+/// The write payload [`gc_ssh_channel_write`] accepts.
+#[derive(Debug, Deserialize)]
+struct ChannelWrite {
+    /// Payload bytes as standard (padded) base64.
+    bytes: String,
+}
+
+/// The read payload [`gc_ssh_channel_read`] accepts.
+#[derive(Debug, Deserialize)]
+struct ChannelReadOptions {
+    /// How long the read may wait, in milliseconds; absent uses [`DEFAULT_READ_TIMEOUT_MS`].
+    #[serde(default, rename = "timeoutMs")]
+    timeout_ms: Option<u64>,
+}
+
+/// Decode the optional read payload into the window a read may wait.
+///
+/// A null pointer, an empty document and an absent `timeoutMs` all mean "the default
+/// window", so a caller that has nothing to say about timing still gets a bounded read.
+fn read_channel_timeout(payload_json: *const c_char) -> Result<Duration, AbiError> {
+    let default = Duration::from_millis(DEFAULT_READ_TIMEOUT_MS);
+    if payload_json.is_null() {
+        return Ok(default);
+    }
+    let payload = read_str(payload_json)?;
+    if payload.trim().is_empty() {
+        return Ok(default);
+    }
+    let options: ChannelReadOptions = serde_json::from_str(payload).map_err(|error| {
+        AbiError::input(format!("channel read payload is not valid: {error}"))
+    })?;
+    Ok(Duration::from_millis(
+        options.timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS),
+    ))
+}
+
+/// Standard alphabet of RFC 4648 base64, the encoding every byte payload uses here.
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard (padded) base64 of `bytes`.
+fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for chunk in bytes.chunks(3) {
+        let first = u32::from(chunk[0]);
+        let second = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let third = u32::from(chunk.get(2).copied().unwrap_or(0));
+        let triple = (first << 16) | (second << 8) | third;
+        out.push(BASE64_ALPHABET[(triple >> 18) as usize & 0x3f] as char);
+        out.push(BASE64_ALPHABET[(triple >> 12) as usize & 0x3f] as char);
+        out.push(if chunk.len() > 1 {
+            BASE64_ALPHABET[(triple >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            BASE64_ALPHABET[triple as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decode standard (padded) base64, reporting malformed input as an `input` error.
+///
+/// Strict on purpose: whitespace, unpadded groups, padding outside the last group and any
+/// character outside the alphabet are refused, so the app learns its payload was wrong
+/// instead of the core guessing what it meant.
+fn base64_decode(text: &str) -> Result<Vec<u8>, AbiError> {
+    let bytes = text.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err(AbiError::input(
+            "the bytes payload is not standard base64: its length is not a multiple of 4",
+        ));
+    }
+    let groups = bytes.len() / 4;
+    let mut out = Vec::with_capacity(groups * 3);
+    for (index, chunk) in bytes.chunks(4).enumerate() {
+        let last = index + 1 == groups;
+        let mut triple = 0u32;
+        let mut padding = 0usize;
+        for (position, byte) in chunk.iter().enumerate() {
+            let value = if *byte == b'=' {
+                // Padding belongs to the last group only, in its last two positions.
+                if !last || position < 2 {
+                    return Err(AbiError::input(
+                        "the bytes payload is not standard base64: unexpected padding",
+                    ));
+                }
+                padding += 1;
+                0
+            } else {
+                base64_value(*byte).ok_or_else(|| {
+                    AbiError::input(
+                        "the bytes payload is not standard base64: it contains a character outside the alphabet",
+                    )
+                })?
+            };
+            triple = (triple << 6) | u32::from(value);
+        }
+        out.push((triple >> 16) as u8);
+        if padding < 2 {
+            out.push((triple >> 8) as u8);
+        }
+        if padding < 1 {
+            out.push(triple as u8);
+        }
+    }
+    Ok(out)
+}
+
+/// Value of one base64 character, or `None` when it is outside the alphabet.
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
 }
 
 /// One provisioning step as it arrives over the ABI.

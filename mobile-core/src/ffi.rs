@@ -15,7 +15,9 @@
 //! | `sshConnect(host, port, user, cred) -> SessionId` | [`MobileCore::ssh_connect`] |
 //! | `sshDirectTcp(sessionId, targetHost, targetPort) -> ChannelId` | [`MobileCore::ssh_direct_tcp`] |
 //! | `channelRead(channelId) -> bytes` | [`MobileCore::channel_read`] |
+//! | `channelReadWithTimeout(channelId, timeout) -> {bytes, eof}` | [`MobileCore::channel_read_with_timeout`] |
 //! | `channelWrite(channelId, bytes)` | [`MobileCore::channel_write`] |
+//! | `channelClose(channelId)` | [`MobileCore::channel_close`] |
 //! | `execOnce(sessionId, cmd) -> {exitCode, stdout, stderr}` | [`MobileCore::exec_once`] |
 //! | `deviceKeyGenerate() -> PublicKey` | [`MobileCore::device_key_generate`] |
 //! | `deviceKeyPublic() -> PublicKey` | [`MobileCore::device_key_public`] |
@@ -26,11 +28,17 @@
 //! * `sftpPut` belongs to the daemon-provisioning task (T7) — it needs a real SFTP client
 //!   implementation, not a stub.
 //! * `sqliteOpen`/`openStore` belongs to the local-mode store task (T9).
-//! * §6 has **no teardown** call, so sessions and channels live as long as the
-//!   [`MobileCore`] value; see `risks` in the task report.
+//! * §6 has **no teardown** call, so sessions live as long as the [`MobileCore`] value and
+//!   a channel lives until [`MobileCore::channel_close`] (added with the tunnel client) or
+//!   the end of the process; see `risks` in the task report.
 //! * [`MobileCore::session_fingerprint`] / [`MobileCore::session_fingerprint_compact`] are
 //!   additive read-only accessors: §8 requires the host key fingerprint to be visible and
 //!   confirmable before the user trusts the host, and §6 forgot a way to read it.
+//! * [`MobileCore::channel_read_with_timeout`] and [`MobileCore::channel_close`] are additive
+//!   too: §6 froze `channelRead` as "empty `Vec` means EOF", which cannot tell "nothing
+//!   arrived yet" apart from "the peer closed", and it froze no way to release a channel.
+//!   The SSH tunnel of the pivot (`§4`, S4) needs both, so the frozen calls keep their exact
+//!   behaviour and these two carry the tunnel client.
 //!
 //! ## Device identity and the keystore
 //!
@@ -51,6 +59,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +99,19 @@ impl std::fmt::Display for CoreErrorPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.kind, self.message)
     }
+}
+
+/// One bounded read of a tunnel channel: what arrived and whether the peer closed it.
+///
+/// Additive to §6: [`MobileCore::channel_read`] keeps its frozen "empty `Vec` means EOF"
+/// convention, while the tunnel client needs the two cases apart — nothing arrived yet is
+/// not the same as the host closed the socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelRead {
+    /// Payload bytes; empty on a timeout and on EOF.
+    pub bytes: Vec<u8>,
+    /// Whether the peer closed the channel (or sent EOF).
+    pub eof: bool,
 }
 
 /// The stateful object the native shell owns and the TS layer calls into.
@@ -190,6 +212,57 @@ impl MobileCore {
             .map_err(CoreErrorPayload::from)
     }
 
+    /// `channelReadWithTimeout`: read the next frame, waiting at most `timeout`.
+    ///
+    /// Unlike [`MobileCore::channel_read`], the answer distinguishes the three outcomes the
+    /// tunnel client must tell apart:
+    ///
+    /// * data arrived → `bytes`, `eof: false`;
+    /// * the peer closed the channel → empty `bytes`, `eof: true`;
+    /// * nothing arrived inside `timeout` → empty `bytes`, `eof: false` (a timeout is **not**
+    ///   an error: the app keeps the tunnel open and reads again).
+    ///
+    /// The wait never exceeds `timeout`, so a stalled host cannot hang the app (§7).
+    pub async fn channel_read_with_timeout(
+        &self,
+        channel_id: ChannelId,
+        timeout: Duration,
+    ) -> Result<ChannelRead, CoreErrorPayload> {
+        let channel = self.channel(channel_id)?;
+        match tokio::time::timeout(timeout, channel.read()).await {
+            // The window closed with nothing to report: no bytes, no end of stream.
+            Err(_) => Ok(ChannelRead {
+                bytes: Vec::new(),
+                eof: false,
+            }),
+            Ok(Err(error)) => Err(CoreErrorPayload::from(error)),
+            Ok(Ok(ChannelEvent::Data(bytes))) => Ok(ChannelRead {
+                bytes,
+                eof: false,
+            }),
+            Ok(Ok(ChannelEvent::Eof)) => Ok(ChannelRead {
+                bytes: Vec::new(),
+                eof: true,
+            }),
+            Ok(Ok(ChannelEvent::ExtendedData { ext, .. })) => {
+                Err(CoreErrorPayload::from(CoreError::ssh(format!(
+                    "unexpected extended data frame (ext {ext}) on a tunnel channel"
+                ))))
+            }
+        }
+    }
+
+    /// `channelClose`: send EOF/close on the channel and free its handle.
+    ///
+    /// The handle is removed before the close is awaited, so the id is stale from then on:
+    /// a second call (or any later read/write) answers the unknown-channel error instead of
+    /// touching a dead channel.
+    pub async fn channel_close(&self, channel_id: ChannelId) -> Result<(), CoreErrorPayload> {
+        let channel = lock(&self.channels).remove(&channel_id);
+        let channel = channel.ok_or_else(|| CoreErrorPayload::from(unknown_channel(channel_id)))?;
+        channel.close().await.map_err(CoreErrorPayload::from)
+    }
+
     /// `execOnce`: run one command and collect its result (daemon detection, `uname -m`,
     /// `daemon restart`, … — §3, §5).
     pub async fn exec_once(
@@ -266,11 +339,14 @@ impl MobileCore {
     fn channel(&self, channel_id: ChannelId) -> Result<Arc<Channel>, CoreErrorPayload> {
         match lock(&self.channels).get(&channel_id) {
             Some(channel) => Ok(Arc::clone(channel)),
-            None => Err(CoreErrorPayload::from(CoreError::ssh(format!(
-                "unknown channel id {channel_id}"
-            )))),
+            None => Err(CoreErrorPayload::from(unknown_channel(channel_id))),
         }
     }
+}
+
+/// The `ssh` error for a channel id this process does not hold (§7: named, never a panic).
+fn unknown_channel(channel_id: ChannelId) -> CoreError {
+    CoreError::ssh(format!("unknown channel id {channel_id}"))
 }
 
 impl Default for MobileCore {

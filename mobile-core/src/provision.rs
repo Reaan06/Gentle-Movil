@@ -15,7 +15,9 @@
 //! `register` with a `command`/`script` (the idempotent `authorized_keys` install) and
 //! `tunnel` with `forwards`. The command steps go through [`run_step_command`]; `tunnel`
 //! opens one `direct-tcpip` channel per forward (the existing tunnel primitive) and returns
-//! the channel handle, because the core binds no local listening port.
+//! the channel handle, because the core binds no local listening port. Every composed step
+//! command is bounded by [`STEP_COMMAND_TIMEOUT`], so a host that stops answering fails the
+//! step honestly instead of hanging the progress screen.
 //!
 //! ## Offline testability
 //!
@@ -56,6 +58,15 @@ use crate::device_key::{self, PUBLIC_KEY_LEN};
 use crate::error::CoreError;
 use crate::fingerprint::{decode_hex, hex_lower, normalize};
 use crate::ssh::{Channel, ChannelEvent, ExecOutput, SshSession, DAEMON_PORT};
+
+/// How long a single progress step may take: a backstop for [`run_step_command`], the
+/// `exec` that runs the loopback probe and the `authorized_keys` install (S4/S5).
+///
+/// The app bounds each of those steps at 15 s on its side (`PROVISION_TIMEOUTS` of
+/// `mobile/lib/provision.ts`), so this window sits above that: it never preempts a step the
+/// progress screen still considers alive, and it still refuses to hang forever on a host
+/// that stopped answering (§7).
+pub const STEP_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long [`start_daemon`] waits for the daemon to answer on its port before the caller
 /// must [`rollback`] (§5: "if the restart does not answer within 10 s, revert").
@@ -307,17 +318,41 @@ pub struct CommandResult {
 /// A non-zero exit is returned as an `ssh` error naming the code and stderr (S7): the flow
 /// must stop at the failing step instead of running the next one against a host that was
 /// never verified.
+///
+/// The composed command is bounded by [`STEP_COMMAND_TIMEOUT`]: a host that stops answering
+/// mid-command is reported as a timeout instead of hanging the progress screen forever.
 pub async fn run_step_command(
     session: &SshSession,
     step: &str,
     command: &str,
+) -> Result<CommandResult, CoreError> {
+    run_step_command_with_timeout(session, step, command, STEP_COMMAND_TIMEOUT).await
+}
+
+/// [`run_step_command`] with an explicit deadline, so offline tests do not wait 30 s.
+///
+/// When the window closes the command future is dropped — closing its channel — and the
+/// error names the step and the window, never a silent success.
+pub async fn run_step_command_with_timeout(
+    session: &SshSession,
+    step: &str,
+    command: &str,
+    timeout: Duration,
 ) -> Result<CommandResult, CoreError> {
     if command.trim().is_empty() {
         return Err(CoreError::ssh(format!(
             "the {step} step needs a non-empty command to run"
         )));
     }
-    let output = session.exec_once(&posix(command)).await?;
+    let output = match tokio::time::timeout(timeout, session.exec_once(&posix(command))).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(CoreError::ssh(format!(
+                "{step} did not complete within {} ms: the host stopped answering",
+                timeout.as_millis()
+            )))
+        }
+    };
     if output.exit_code != 0 {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(CoreError::ssh(format!(
