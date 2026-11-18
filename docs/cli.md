@@ -12,6 +12,42 @@ la extensión (ver [Identidad del puente](#identidad-del-puente)): un daemon vie
 que quedó escuchando y contesta `HTTP 200` con una página cualquiera se reporta
 como «no es el puente», nunca como éxito.
 
+## Instalación
+
+El CLI es **un solo archivo ejecutable**: no hay `npm install`, ni `node_modules`, ni
+build. `package.json` existe sólo para declarar el `bin`, el motor (`node >=20`) y el
+script de tests; no tiene dependencias.
+
+```bash
+# 1. el comando en el PATH: un symlink al archivo del repo (sin copiar, sin instalar)
+ln -sf <repo>/cli/gentle-movil.mjs ~/.local/bin/gentle-movil
+# 2. el bit de ejecución (el repo ya lo trae; el symlink lo respeta)
+chmod +x <repo>/cli/gentle-movil.mjs
+# 3. completions de fish (opcional)
+cp <repo>/cli/completions/gentle-movil.fish ~/.config/fish/completions/
+```
+
+Funciona en **fish, bash, zsh y sh** y desde cualquier directorio, porque el script
+tiene shebang `#!/usr/bin/env node` y resuelve su propio directorio con
+`import.meta.url` (nunca `process.cwd()`): invocado a través del symlink carga
+`cli/commands/` y `cli/lib/` del repo real. `node` tiene que estar en el PATH del
+shell (`/usr/bin/node` alcanza; no hace falta fnm).
+
+Sin instalar nada también se puede correr directo, desde cualquier lado:
+
+```bash
+node <repo>/cli/gentle-movil.mjs --help
+<repo>/cli/gentle-movil.mjs --help
+```
+
+Comportamiento fuera de una terminal (pipes, CI, `</dev/null`):
+
+- sin escapes ANSI cuando stdout no es un TTY (el QR sale sin el fondo blanco);
+- `pair` **no espera** un stdin que no es TTY: con `--invite-only` imprime el QR con
+  el `code`; sin esa bandera falla con un mensaje claro y exit ≠ 0 (nunca hang);
+- si el locale no es UTF-8 (`LC_ALL`/`LC_CTYPE`/`LANG`), el arte half-block se
+  reemplaza por el payload `gc://pair?…` en texto plano, para no imprimir mojibake.
+
 ## Uso
 
 No hay `package.json` ni paso de instalación: alcanza Node ≥ 22.
@@ -23,11 +59,14 @@ node cli/gentle-movil.mjs status
 node cli/gentle-movil.mjs doctor
 ```
 
+Con el symlink instalado, es simplemente `gentle-movil pair`, `gentle-movil doctor`
+… en cualquiera de los cuatro shells.
+
 ## Comandos
 
 | Comando | Qué hace | Fuente |
 |---|---|---|
-| `pair` | Arma **localmente** el payload `gc://pair?v=1` y lo muestra como QR en la terminal (arte half-block, zona de silencio de 2 módulos). Campos: `host` (IP LAN leída de las interfaces), `port` (de `/etc/ssh/sshd_config`, 22 si falta), `user` (el usuario que corre el CLI), `fp` (huella ed25519, SHA-256 sobre `/etc/ssh/*_key.pub`), `token` (**generado en cada invocación**, prefijo `inv_`), `pw` (contraseña SSH en modo moshi, percent-encoded) y `dport=43722`. Modo `--invite-only` (o stdin no-TTY): sin `pw`, el QR lleva `code` (`AB12-CD34`, también local). Exit 0. | `cli/commands/pair.mjs` |
+| `pair` | Arma **localmente** el payload `gc://pair?v=1` y lo muestra como QR en la terminal (arte half-block, zona de silencio de 2 módulos). Campos: `host` (IP LAN leída de las interfaces), `port` (de `/etc/ssh/sshd_config`, 22 si falta), `user` (el usuario que corre el CLI), `fp` (huella ed25519, SHA-256 sobre `/etc/ssh/*_key.pub`), `token` (**generado en cada invocación**, prefijo `inv_`), `pw` (contraseña SSH en modo moshi, percent-encoded) y `dport=43722`. Modo `--invite-only`: sin `pw`, el QR lleva `code` (`AB12-CD34`, también local). Sin TTY en stdin y sin `--invite-only` no adivina ni cuelga: exit 1 con mensaje que nombra la bandera. Exit 0 cuando imprime el QR. | `cli/commands/pair.mjs` |
 | `status` | Le pide identidad a la extensión Gentle Shell/Pi en loopback: `GET /api/health` en `127.0.0.1:43721` (superficie de control) y `127.0.0.1:43722` (superficie de dispositivos, blanco del túnel). Imprime una línea honesta por puerto en uno de tres estados: `reachable — bridge identity confirmed (app=gentle-shell bridge=gentle-movil proto=1, version …)`, `not the bridge — port answering, but it is not the Gentle Shell bridge — observed HTTP 200, content-type …, etag …, body starts …`, o `unreachable — ECONNREFUSED — nothing listening`. **Exit 0** solo si **todos** los puertos se identifican como el puente; **1** en cualquier otro caso (incluido el impostor); 2 si `GENTLE_MOVIL_PORTS` está mal formado. | `cli/commands/status.mjs` |
 | `doctor` | Preflight del host con cuatro checks (S9): 1) `sshd` activo (systemd `sshd` y luego `ssh`), 2) host key ed25519 legible (`/etc/ssh/ssh_host_ed25519_key.pub`, fuente del TOFU), 3) IP LAN detectada (≠ `127.0.0.1`), 4) la extensión **se identifica** en loopback `43721`/`43722` (mismos tres estados que `status`: puente, impostor o nada escuchando). Sin sudo y sin red más allá de loopback. Exit 1 si algún check falla — es la respuesta a "¿por qué no conecta la tablet?". | `cli/commands/doctor.mjs` |
 | `help` | Ayuda. | inline |
@@ -85,8 +124,11 @@ cli/
     pairing.mjs         # datos locales del QR: token/code, huella, IP LAN, puerto SSH, URI
     qr.mjs              # encoder QR propio (byte mode, ECC L, v1-v10) + render de terminal
     loopback.mjs        # sondeo 127.0.0.1: identidad del puente (GET /api/health) + fallback TCP
+  completions/
+    gentle-movil.fish   # completions de fish (pair/status/doctor + --invite-only)
   test/
-    cli.test.mjs        # `node --test cli/test/`
+    cli.test.mjs        # contratos de los comandos y del sondeo
+    entry.test.mjs      # entrypoint: shebang/exec, symlink, package.json, TTY/locale
 ```
 
 **Agregar un comando = un archivo nuevo + una línea en `COMMANDS`** (en
@@ -116,7 +158,11 @@ y check ✓ de `doctor`; stub que contesta `200` con un cuerpo ajeno (etag
 `camera-v2-preview-v1`) → «not the bridge» y exit 1; documento con identidad
 incompleta (`proto:2`, `bridge:"other-bridge"`) → impostor; nada escuchando →
 «nothing listening», exit 1. También se fija que `GENTLE_MOVIL_PORTS` mal formado
-sigue saliendo con 2 y mensaje en stderr.
+sigue saliendo con 2 y mensaje en stderr. `cli/test/entry.test.mjs` cubre el CLI como
+comando instalado: shebang + bit de ejecución, invocación por symlink y desde un
+directorio ajeno al repo, `package.json` (bin/`type`/`engines`, sin dependencias),
+`pair` con stdin cerrado (QR con `--invite-only`, exit ≠ 0 sin la bandera), ausencia
+de escapes en pipes y el fallback a texto plano con locale no-UTF-8.
 
 ## Roadmap (para mejorar a futuro)
 
@@ -159,3 +205,18 @@ sigue saliendo con 2 y mensaje en stderr.
   impostor (nombrando lo observado: status, `content-type`, `etag`, prefijo del
   cuerpo) y nada escuchando; `status` sale 0 solo si **ambos** puertos se
   identifican. Tests nuevos con stubs `node:http` propios en puertos efímeros.
+- T4a (esta enmienda, S2/S9): el CLI pasó a ser un **comando real** instalable por
+  symlink en `~/.local/bin`, en fish/bash/zsh/sh y desde cualquier directorio. El
+  dispatcher resolvía `process.argv[1]` contra `import.meta.url` con comparación de
+  strings, lo que hacía que una invocación por symlink saliera 0 **en silencio**
+  (Node resuelve el symlink del entrypoint, el argv queda como se tipeó): ahora
+  compara `realpathSync`. Vuelve `package.json` mínimo (`bin`, `type: module`,
+  `engines.node >=20`, `scripts.test`, **sin dependencias**) solo para declarar el
+  comando y el test; **no hay `npm install`**. `pair` sin TTY ya no adivina: sin
+  `--invite-only` falla con exit 1 y mensaje que nombra la bandera (antes bajaba a
+  invite-only en silencio, o sea un QR sin `pw` presentado como moshi). El render
+  QR detecta locale UTF-8 (`LC_ALL`/`LC_CTYPE`/`LANG`) y, si no lo es, imprime el
+  payload `gc://pair?…` en texto plano en vez de mojibake half-block. Nuevo
+  `cli/completions/gentle-movil.fish` y `cli/test/entry.test.mjs` (9 tests):
+  shebang+exec, symlink, `package.json`, stdin cerrado, pipes sin escapes, locale.
+  Total `node --test cli/test/`: 23 verdes.

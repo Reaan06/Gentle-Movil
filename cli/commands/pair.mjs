@@ -11,6 +11,10 @@
  * moshi mode keeps the owner's decision: the QR carries the SSH password so
  * scanning alone provisions the tablet. `--invite-only` skips the password and
  * carries the pairing code instead.
+ *
+ * Stdin that is not a TTY can never answer the password prompt, so `pair`
+ * refuses loudly instead of hanging (or silently pairing without `pw`): the
+ * non-interactive form is explicit, `pair --invite-only`.
  */
 import {
   DEVICE_SURFACE_PORT,
@@ -28,9 +32,12 @@ import { renderTerminalQr } from '../lib/qr.mjs';
 /** Reads the SSH password without echoing it (moshi: the QR carries it). */
 function promptPassword() {
   if (!process.stdin.isTTY) {
-    // Piped/scripted invocation: never hang waiting for a TTY. No password
-    // means the invite-only payload, which is the honest fallback.
-    return Promise.resolve('');
+    // Piped/scripted invocation: never hang waiting for a TTY, and never
+    // pretend a password was given. The caller prints this and exits 1.
+    throw new Error(
+      'No SSH password to put in the QR: stdin is not a TTY, so the password prompt cannot run. ' +
+        'Use `gentle-movil pair --invite-only` for the interactive-free QR (pairing code, no password).',
+    );
   }
   return new Promise((resolve) => {
     const stdin = process.stdin;

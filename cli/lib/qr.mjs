@@ -444,13 +444,40 @@ export function encodeQr(text) {
 }
 
 /**
+ * Is the active locale UTF-8?
+ *
+ * The QR art is made of `▀▄█`, so it is only drawn when the terminal can be
+ * expected to render them. POSIX precedence is honoured: the first set of
+ * `LC_ALL`, `LC_CTYPE`, `LANG` wins (their values override each other), and an
+ * unset locale means the `C` default, which is not UTF-8.
+ */
+export function isUtf8Locale(env = process.env) {
+  const chosen = [env.LC_ALL, env.LC_CTYPE, env.LANG].find(
+    (value) => typeof value === 'string' && value.trim() !== '',
+  );
+  if (!chosen) return false;
+  return /utf-?8/i.test(chosen);
+}
+
+/**
  * Render a QR as terminal art (half blocks, 2-module quiet zone).
  *
  * On a TTY the field is painted white (`30;47`) so black modules read as black
  * on both dark and light terminal themes. Off a TTY the same art is emitted
- * without escapes (files, tests, logs).
+ * without escapes (files, tests, logs). Outside a UTF-8 locale the art would be
+ * mojibake, so the payload is printed as plain text instead (`utf8: false`).
  */
-export function renderTerminalQr(text, { isTTY = Boolean(process.stdout.isTTY), quietModules = 2 } = {}) {
+export function renderTerminalQr(
+  text,
+  { isTTY = Boolean(process.stdout.isTTY), quietModules = 2, utf8 = isUtf8Locale() } = {},
+) {
+  if (!utf8) {
+    return [
+      'QR art needs a UTF-8 locale (LC_ALL/LC_CTYPE/LANG) — printing the payload as text:',
+      text,
+    ].join('\n');
+  }
+
   const { size, modules } = encodeQr(text);
   const total = size + quietModules * 2;
   const isDark = (x, y) => {

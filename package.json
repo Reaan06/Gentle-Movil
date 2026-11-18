@@ -1,0 +1,17 @@
+{
+  "name": "gentle-movil",
+  "version": "0.1.0",
+  "description": "Host-side companion for the Gentle Movil app: pairing QR, loopback status and preflight checks. No daemon, no sudo, no dependencies.",
+  "type": "module",
+  "bin": {
+    "gentle-movil": "cli/gentle-movil.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test cli/test/"
+  },
+  "license": "MIT",
+  "private": true
+}

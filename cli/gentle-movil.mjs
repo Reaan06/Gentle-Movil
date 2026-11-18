@@ -11,10 +11,23 @@
  * - This file parses argv, dispatches, prints help/errors. Adding a command =
  *   adding one file + one line in COMMANDS below.
  *
- * Install as `gentle-movil` after `npm install` (see package.json `bin`), or
- * run directly: `node cli/gentle-movil.mjs <command>`.
+ * Install by symlinking this file onto PATH (see docs/cli.md `Instalación`):
+ * there is no `npm install` step and nothing to build. It also runs directly:
+ * `node cli/gentle-movil.mjs <command>`.
+ *
+ * Self-location is `import.meta.url`, never `process.cwd()`, so the CLI behaves
+ * the same from any directory and through the `~/.local/bin` symlink; the lazy
+ * command imports below are relative to this file and ride along.
  */
-import { pathToFileURL } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/** Absolute path of this entrypoint (the real file, even when symlinked). */
+export const SELF_PATH = fileURLToPath(import.meta.url);
+
+/** `cli/` directory — where commands/, lib/ and completions/ live. */
+export const CLI_DIR = dirname(SELF_PATH);
 
 const COMMANDS = {
   /** One-time pairing QR for the Gentle Movil app, rendered in the terminal. */
@@ -63,9 +76,25 @@ async function main(argv) {
   return await module.run(args);
 }
 
-const invokedDirectly =
-  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
-if (invokedDirectly) {
+/**
+ * Was this file the program the shell ran?
+ *
+ * Compared through `realpathSync` because Node resolves the entrypoint's
+ * symlink for `import.meta.url` while leaving `process.argv[1]` as typed: a
+ * string comparison would make `~/.local/bin/gentle-movil` exit 0 in silence.
+ */
+function invokedDirectly() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(entry) === realpathSync(SELF_PATH);
+  } catch {
+    return false;
+  }
+}
+
+const invokedDirectlyAsEntrypoint = invokedDirectly();
+if (invokedDirectlyAsEntrypoint) {
   try {
     process.exitCode = await main(process.argv.slice(2));
   } catch (error) {
