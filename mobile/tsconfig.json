@@ -1,0 +1,16 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "allowJs": false
+  },
+  "include": [
+    "app/**/*.ts",
+    "app/**/*.tsx",
+    "components/**/*.tsx",
+    "lib/**/*.ts",
+    "modules/**/*.ts",
+    "App.tsx",
+    "index.ts"
+  ]
+}

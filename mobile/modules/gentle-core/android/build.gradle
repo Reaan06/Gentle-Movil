@@ -1,0 +1,21 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'com.gentlemovil.core'
+version = '0.1.0'
+
+android {
+  namespace "com.gentlemovil.core"
+
+  defaultConfig {
+    versionCode 1
+    versionName "0.1.0"
+  }
+
+  compileOptions {
+    sourceCompatibility JavaVersion.VERSION_17
+    targetCompatibility JavaVersion.VERSION_17
+  }
+}
