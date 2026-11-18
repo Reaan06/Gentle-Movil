@@ -27,6 +27,7 @@ import {
   LOG_FILE,
   LOG_ROTATE_BYTES,
 } from '../lib/logger.ts';
+import { core } from '../lib/core.ts';
 import {
   MODE_STORAGE_KEY,
   SUITE_ROUTE,
@@ -34,15 +35,24 @@ import {
   serializeSuiteRecord,
 } from '../lib/suite.ts';
 import {
+  DEVICE_KEY_UNAVAILABLE_LABEL,
   EXPORT_ROUTE,
   INSTALLED_LABEL,
   MODE_ROUTE,
   NO_MODE_LABEL,
   NOT_INSTALLED_LABEL,
+  REVOKE_ROUTE,
   SIN_TUNEL_LABEL,
+  TOGGLE_OFF_LABEL,
+  TOGGLE_ON_LABEL,
+  TOGGLE_STORAGE_KEYS,
+  TOGGLE_UNSET_LABEL,
   TUNNEL_ROUTE,
   UNKNOWN_LABEL,
   loadSettings,
+    parseStoredToggle,
+  saveToggle,
+  serializeToggle,
 } from '../lib/settings.ts';
 
 /** App/build info the caller knows (`expo-constants` in the screen). */
@@ -116,7 +126,15 @@ test('(a) full record → stored mode and all three components installed', async
     suiteSection.rows.filter((row) => row.value !== '').map((row) => row.value),
     [INSTALLED_LABEL, INSTALLED_LABEL, INSTALLED_LABEL],
   );
-  assert.deepEqual(storage.reads.sort(), [MODE_STORAGE_KEY, SUITE_STORAGE_KEY].sort());
+  assert.deepEqual(
+    storage.reads.sort(),
+    [
+      MODE_STORAGE_KEY,
+      SUITE_STORAGE_KEY,
+      TOGGLE_STORAGE_KEYS.notificaciones,
+      TOGGLE_STORAGE_KEYS.puenteAutomatico,
+    ].sort(),
+  );
 });
 
 test('(b) empty storage → Sin elegir + No instalado, and it is NOT an error', async () => {
@@ -261,7 +279,7 @@ test('(g) every unbuilt destination is pending and names its route', async () =>
 
   assert.deepEqual(
     pending.map((action) => action.route).sort(),
-    [EXPORT_ROUTE, MODE_ROUTE, SUITE_ROUTE, TUNNEL_ROUTE].sort(),
+    [EXPORT_ROUTE, MODE_ROUTE, REVOKE_ROUTE, SUITE_ROUTE, TUNNEL_ROUTE].sort(),
   );
   for (const action of pending) {
     assert.equal(action.pending, true);
@@ -314,4 +332,236 @@ test('(h) diagnostics copy carries the real log file, capacity and rotation', as
   // The export action is the honest pending one.
   const exportAction = actionsOf(vm).find((action) => action.route === EXPORT_ROUTE);
   assert.equal(exportAction.pending, true);
+});
+
+/* ------------------------------------------------------------------ *
+ * T7m — the rest of artboard 10-settings: paired devices + revoke, the
+ * device-key fingerprint from the real core, the two persisted toggles and
+ * the storage-usage row. Same rules: only real data, and every unbuilt
+ * behavior says so.
+ * ------------------------------------------------------------------ */
+
+/** Byte length of the stored suite record, computed the honest way. */
+const suiteBytes = (raw) => Buffer.byteLength(raw, 'utf8');
+
+/** A reader and a writer over the same in-memory store (real persistence). */
+function fakeStore(initial = {}) {
+  const map = new Map(Object.entries(initial));
+  return {
+    map,
+    async read(key) {
+      return map.has(key) ? map.get(key) : null;
+    },
+    async write(key, value) {
+      map.set(key, value);
+    },
+  };
+}
+
+/** Real phone info the caller knows (`Constants.deviceName` + `Platform.OS`). */
+const PHONE = { deviceName: 'Pixel 8', os: 'android' };
+
+/** One toggle row out of the rendered model, by its id. */
+function toggleRow(vm, id) {
+  return vm.toggles.find((row) => row.id === id);
+}
+
+/** Row of a section, by section id and row id. */
+function rowOf(vm, sectionId, rowId) {
+  return vm.sections.find((section) => section.id === sectionId).rows.find((row) => row.id === rowId);
+}
+
+test('(i) core answers with a key → the fingerprint row shows the real one', async () => {
+  const storage = fakeReader();
+  const fingerprint = 'SHA256:9E42C71B053A88F0D6224BA9517EC310';
+  const deviceKey = {
+    async deviceKeyGenerate() {
+      return { publicKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample', fingerprint };
+    },
+  };
+
+  const vm = await loadSettings(storage.read, deps({ deviceKey }));
+
+  assert.equal(vm.deviceKey.available, true);
+  assert.equal(vm.deviceKey.fingerprint, fingerprint);
+  assert.equal(vm.deviceKey.value, fingerprint);
+  assert.equal(vm.deviceKey.cause, null);
+  const row = rowOf(vm, 'seguridad', 'device-key');
+  assert.equal(row.value, fingerprint);
+  assert.equal(row.tone, 'ok');
+  // The public key is never shown as if it were the fingerprint.
+  assert.notEqual(row.value, 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample');
+});
+
+test('(j) real core rejects CoreUnavailableError → no disponible + the real reason', async () => {
+  const storage = fakeReader();
+  const log = fakeLog();
+
+  // `core` is the real binding swap point: today it is the dev fallback.
+  const vm = await loadSettings(storage.read, deps({ deviceKey: core, logger: log }));
+
+  assert.equal(vm.deviceKey.available, false);
+  assert.equal(vm.deviceKey.value, DEVICE_KEY_UNAVAILABLE_LABEL);
+  assert.equal(vm.deviceKey.cause, 'core-unavailable');
+  // No fake fingerprint: the row carries the rejection verbatim.
+  assert.equal(vm.deviceKey.fingerprint, null);
+  assert.equal(vm.deviceKey.publicKey, null);
+  assert.match(vm.deviceKey.reason, /CoreUnavailableError/);
+  assert.match(vm.deviceKey.reason, /deviceKeyGenerate/);
+
+  const row = rowOf(vm, 'seguridad', 'device-key');
+  assert.equal(row.value, DEVICE_KEY_UNAVAILABLE_LABEL);
+  assert.equal(row.tone, 'warning');
+  assert.ok(row.detail.includes(vm.deviceKey.reason), 'the real reason is shown verbatim');
+
+  // A core that is not in the build is not a storage failure.
+  assert.equal(vm.storageError, null);
+  assert.deepEqual(log.failures, []);
+});
+
+test('(k) paired devices: this phone with the real tunnel host, Sin túnel without one', async () => {
+  const storage = fakeReader({ [MODE_STORAGE_KEY]: 'conectado' });
+  const tunnel = { sessionId: 'sess-7', host: 'reaan-pc', ports: [43721] };
+
+  const vm = await loadSettings(storage.read, deps({ tunnel, phone: PHONE }));
+
+  assert.equal(vm.devices.length, 1);
+  const device = vm.devices[0];
+  assert.match(device.title, /Pixel 8/);
+  assert.equal(device.value, 'reaan-pc');
+  assert.equal(device.live, true);
+  assert.match(device.detail, /sess-7/);
+
+  const section = vm.sections.find((s) => s.id === 'dispositivos');
+  const row = section.rows.find((r) => r.id === 'device-this-phone');
+  assert.equal(row.title, device.title);
+  assert.equal(row.value, 'reaan-pc');
+
+  // No tunnel: Sin túnel, and no invented host or device.
+  const without = await loadSettings(storage.read, deps({ phone: PHONE }));
+  assert.equal(without.devices.length, 1);
+  assert.equal(without.devices[0].value, SIN_TUNEL_LABEL);
+  assert.equal(without.devices[0].live, false);
+  assert.doesNotMatch(without.devices[0].detail, /reaan-pc/);
+  assert.equal(
+    rowOf(without, 'dispositivos', 'device-this-phone').value,
+    SIN_TUNEL_LABEL,
+  );
+});
+
+test('(l) revoke is an honest pending intent, for the real device row', async () => {
+  const storage = fakeReader();
+  const vm = await loadSettings(storage.read, deps({ phone: PHONE }));
+
+  const revoke = vm.devices[0].action;
+  assert.equal(revoke.pending, true);
+  assert.equal(revoke.route, REVOKE_ROUTE);
+  assert.equal(revoke.label, 'Revocar');
+  assert.ok(revoke.note.length > 0);
+  // The note says what revoking would really touch on the PC.
+  assert.match(revoke.note, /authorized_keys/);
+  // Same descriptor reaches the rendered row, so tapping logs `route pending`.
+  assert.deepEqual(rowOf(vm, 'dispositivos', 'device-this-phone').action, revoke);
+});
+
+test('(m) toggles persist under the documented keys and re-read', async () => {
+  const store = fakeStore();
+
+  const first = await loadSettings(store.read, deps());
+  assert.equal(toggleRow(first, 'notificaciones').enabled, null);
+  assert.equal(toggleRow(first, 'notificaciones').value, TOGGLE_UNSET_LABEL);
+  assert.equal(toggleRow(first, 'puenteAutomatico').enabled, null);
+  // Nothing stored is a fact, not a failure, and never a guessed default.
+  assert.equal(first.storageError, null);
+
+  await saveToggle(store.write, 'notificaciones', true);
+  await saveToggle(store.write, 'puenteAutomatico', true);
+  assert.equal(store.map.get(TOGGLE_STORAGE_KEYS.notificaciones), serializeToggle(true));
+  assert.equal(store.map.get(TOGGLE_STORAGE_KEYS.puenteAutomatico), serializeToggle(true));
+
+  const second = await loadSettings(store.read, deps());
+  assert.deepEqual(toggleRow(second, 'notificaciones').enabled, true);
+  assert.equal(toggleRow(second, 'notificaciones').value, TOGGLE_ON_LABEL);
+  assert.equal(toggleRow(second, 'puenteAutomatico').value, TOGGLE_ON_LABEL);
+
+  await saveToggle(store.write, 'notificaciones', false);
+  const third = await loadSettings(store.read, deps());
+  assert.deepEqual(toggleRow(third, 'notificaciones').enabled, false);
+  assert.equal(toggleRow(third, 'notificaciones').value, TOGGLE_OFF_LABEL);
+
+  // The stored value round-trips through the typed parsers.
+  assert.deepEqual(parseStoredToggle(serializeToggle(true)), { ok: true, enabled: true });
+  assert.deepEqual(parseStoredToggle(serializeToggle(false)), { ok: true, enabled: false });
+  assert.deepEqual(parseStoredToggle(null), { ok: true, enabled: null });
+
+  // Both toggles keep the honest note while their effect is not wired.
+  for (const row of third.toggles) {
+    assert.equal(row.effectWired, false);
+    assert.ok(row.note.length > 0);
+    assert.ok(row.storageKey.startsWith('gentle-movil:'));
+  }
+});
+
+test('(n) corrupt toggle value → typed error, never silently defaulted', async () => {
+  const storage = fakeReader({
+    [MODE_STORAGE_KEY]: 'local',
+    [TOGGLE_STORAGE_KEYS.notificaciones]: 'sí',
+  });
+  const log = fakeLog();
+
+  assert.deepEqual(parseStoredToggle('on'), { ok: true, enabled: true });
+  const parsed = parseStoredToggle('sí');
+  assert.equal(parsed.ok, false);
+  assert.ok(parsed.message.includes('sí'), 'the raw value is quoted in the message');
+
+  const vm = await loadSettings(storage.read, deps({ logger: log }));
+
+  assert.notEqual(vm.storageError, null);
+  assert.deepEqual(vm.storageError.keys, [TOGGLE_STORAGE_KEYS.notificaciones]);
+  assert.ok(vm.storageError.detail.includes(TOGGLE_STORAGE_KEYS.notificaciones));
+
+  const row = toggleRow(vm, 'notificaciones');
+  assert.equal(row.known, false);
+  assert.equal(row.enabled, null);
+  assert.equal(row.value, UNKNOWN_LABEL);
+  assert.equal(row.tone, 'warning');
+  assert.notEqual(row.value, TOGGLE_OFF_LABEL);
+  assert.notEqual(row.value, TOGGLE_UNSET_LABEL);
+  // The other toggle was never stored, so it stays honestly unset.
+  assert.equal(toggleRow(vm, 'puenteAutomatico').known, true);
+  assert.equal(toggleRow(vm, 'puenteAutomatico').value, TOGGLE_UNSET_LABEL);
+  // The rest of the screen still shows the real stored mode.
+  assert.equal(vm.modeLabel, 'Local');
+  assert.equal(log.failures.length, 1);
+  assert.equal(log.failures[0].raw.key, TOGGLE_STORAGE_KEYS.notificaciones);
+});
+
+test('(o) storage usage carries only real values, never a fabricated byte count', async () => {
+  const raw = serializeSuiteRecord({ gentleShell: true, engram: false, gentleAi: true });
+  const storage = fakeReader({ [SUITE_STORAGE_KEY]: raw });
+
+  const vm = await loadSettings(storage.read, deps());
+  const usage = vm.storageUsage;
+
+  assert.equal(usage.logLimitBytes, LOG_ROTATE_BYTES);
+  assert.equal(usage.logLimitLabel, `${Math.round(LOG_ROTATE_BYTES / 1024)} KB`);
+  assert.equal(usage.capacity, LOG_CAPACITY);
+  assert.equal(usage.logFile, LOG_FILE);
+  assert.equal(usage.suiteBytes, suiteBytes(raw));
+  assert.ok(usage.suiteLabel.endsWith('B'));
+
+  const row = rowOf(vm, 'diagnostico', 'storage');
+  assert.equal(row.value, usage.logLimitLabel);
+  // The only byte figure of the log is its rotation limit, said as a limit.
+  assert.match(row.detail, /hasta/);
+  assert.ok(row.detail.includes(`${suiteBytes(raw)} B`), 'the suite record size is the real one');
+
+  // With no stored suite record there is no byte count to show (never `0 B`).
+  const empty = await loadSettings(fakeReader().read, deps());
+  assert.equal(empty.storageUsage.suiteBytes, null);
+  assert.equal(empty.storageUsage.suiteLabel, 'sin registro de suite');
+  assert.doesNotMatch(rowOf(empty, 'diagnostico', 'storage').detail, /0 B/);
+
+  // The export text carries the same facts the screen shows.
+  assert.ok(vm.exportText.includes(DEVICE_KEY_UNAVAILABLE_LABEL));
 });

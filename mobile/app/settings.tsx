@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Platform, Pressable, ScrollView, StyleSheet, Switch, Text, View } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Constants from 'expo-constants';
 import { useRouter } from 'expo-router';
@@ -19,14 +19,19 @@ import {
 import { logger } from '../lib/logger';
 import {
   type AppInfo,
+  type PhoneInfo,
   type SettingsAction,
   type SettingsRow,
   type SettingsSection,
+  type SettingsToggleRow,
   type SettingsTone,
   type SettingsViewModel,
+  type ToggleId,
   type TunnelSnapshot,
   SETTINGS_TITLE,
+  TOGGLE_STORAGE_KEYS,
   loadSettings,
+  saveToggle,
 } from '../lib/settings';
 import { colors, elevation, radius, spacing, typography } from '../lib/theme';
 import { bridgeChannel, getActiveTunnel } from '../lib/tunnel-store';
@@ -50,7 +55,17 @@ import { bridgeChannel, getActiveTunnel } from '../lib/tunnel-store';
  * - the banner is the shared §V20 `ConnectionBanner` fed by a real
  *   `GET /api/health` over the current tunnel channel;
  * - the diagnostics row carries the real `logs/gentle-movil.log`, ring capacity
- *   and rotation limit of `lib/logger.ts`.
+ *   and rotation limit of `lib/logger.ts`, and the storage row only repeats
+ *   those constants plus the real byte size of the stored suite record;
+ * - the paired-device row is this phone with the real tunnel host, the real
+ *   phone label (`Constants.deviceName` / `Platform.OS`) and a Revoke intent
+ *   that is `pending: true` (it edits the PC's `authorized_keys`);
+ * - the device-key row calls the real `core.deviceKeyGenerate()`: a fingerprint
+ *   only when the core answers, `no disponible` with the real reason when it
+ *   rejects — never a fake fingerprint;
+ * - the two toggles really persist in AsyncStorage (`TOGGLE_STORAGE_KEYS`) and
+ *   each row keeps its honest note because the behavior behind it is not
+ *   wired yet.
  *
  * Every action whose destination is not built yet is `pending: true` in the
  * model, so tapping it logs `route pending` and the row keeps the honest note —
@@ -82,6 +97,15 @@ function appInfo(): AppInfo {
   return { version: version === '' ? null : version, build };
 }
 
+/** Real phone info: the device name expo exposes, else the real OS. */
+function phoneInfo(): PhoneInfo {
+  const name = Constants.deviceName;
+  return {
+    deviceName: typeof name === 'string' && name.trim() !== '' ? name.trim() : null,
+    os: Platform.OS,
+  };
+}
+
 /** The tunnel the pairing flow left open, as `lib/settings.ts` models it. */
 function tunnelSnapshot(): TunnelSnapshot | null {
   const active = getActiveTunnel();
@@ -108,13 +132,18 @@ function RowView({
   row,
   first,
   onAction,
+  toggle,
+  onToggle,
 }: {
   row: SettingsRow;
   first: boolean;
   onAction: (action: SettingsAction) => void;
+  toggle: SettingsToggleRow | null;
+  onToggle: (id: ToggleId, enabled: boolean) => void;
 }) {
   const tone = TONES[row.tone];
   const action = row.action;
+  const note = row.note ?? null;
 
   return (
     <View style={[styles.row, first && styles.rowFirst]} testID={`settings-row-${row.id}`}>
@@ -124,6 +153,7 @@ function RowView({
         {action !== null && action.pending && action.note !== null && (
           <Text style={styles.rowNote}>{action.note}</Text>
         )}
+        {note !== null && <Text style={styles.rowNote}>{note}</Text>}
       </View>
 
       {row.value !== '' && (
@@ -132,6 +162,18 @@ function RowView({
             {row.value}
           </Text>
         </View>
+      )}
+
+      {toggle !== null && row.toggle !== undefined && row.toggle !== null && (
+        <Switch
+          accessibilityLabel={`${row.title}: ${row.value}`}
+          value={toggle.enabled === true}
+          onValueChange={(next) => onToggle(row.toggle as ToggleId, next)}
+          trackColor={{ false: colors.bgSunken, true: colors.accent }}
+          thumbColor={colors.text}
+          ios_backgroundColor={colors.bgSunken}
+          testID={`settings-toggle-${toggle.id}`}
+        />
       )}
 
       {action !== null && (
@@ -151,10 +193,14 @@ function RowView({
 
 function SectionView({
   section,
+  toggles,
   onAction,
+  onToggle,
 }: {
   section: SettingsSection;
+  toggles: SettingsToggleRow[];
   onAction: (action: SettingsAction) => void;
+  onToggle: (id: ToggleId, enabled: boolean) => void;
 }) {
   return (
     <View style={styles.section}>
@@ -166,6 +212,12 @@ function SectionView({
             row={row}
             first={index === 0}
             onAction={onAction}
+            toggle={
+              row.toggle === null || row.toggle === undefined
+                ? null
+                : (toggles.find((candidate) => candidate.id === row.toggle) ?? null)
+            }
+            onToggle={onToggle}
           />
         ))}
       </View>
@@ -179,6 +231,7 @@ export default function SettingsScreen() {
   const lastGoodAt = useRef<number | null>(null);
   const [vm, setVm] = useState<SettingsViewModel | null>(null);
   const [loadFailure, setLoadFailure] = useState<string | null>(null);
+  const [toggleFailure, setToggleFailure] = useState<string | null>(null);
   const [check, setCheck] = useState<ConnectionCheck | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -189,6 +242,7 @@ export default function SettingsScreen() {
         await loadSettings((key) => AsyncStorage.getItem(key), {
           tunnel: tunnelSnapshot(),
           app: appInfo(),
+          phone: phoneInfo(),
         }),
       );
     } catch (error) {
@@ -198,6 +252,28 @@ export default function SettingsScreen() {
       setLoadFailure(error instanceof Error ? error.message : String(error));
     }
   }, []);
+
+  /**
+   * The toggles are the only write of this screen: the preference really lands
+   * in AsyncStorage under its documented key, and the row keeps saying that the
+   * behavior behind it is not wired yet.
+   */
+  const onToggle = useCallback(
+    (id: ToggleId, enabled: boolean) => {
+      log.info('toggle', { id, enabled, storageKey: TOGGLE_STORAGE_KEYS[id] });
+      setToggleFailure(null);
+      void (async () => {
+        try {
+          await saveToggle((key, value) => AsyncStorage.setItem(key, value), id, enabled);
+          await load();
+        } catch (error) {
+          log.failure('save-toggle', error, { id, enabled });
+          setToggleFailure(error instanceof Error ? error.message : String(error));
+        }
+      })();
+    },
+    [load],
+  );
 
   const runCheck = useCallback(async (reason: string) => {
     const tunnel = getActiveTunnel();
@@ -317,6 +393,14 @@ export default function SettingsScreen() {
           </View>
         )}
 
+        {toggleFailure !== null && (
+          <View style={styles.errorCard} accessibilityRole="alert" testID="settings-toggle-error">
+            <Text style={styles.errorTitle}>No pudimos guardar la preferencia</Text>
+            <Text style={styles.errorBody}>{toggleFailure}</Text>
+            <GhostButton label="Reintentar" onPress={() => void load()} />
+          </View>
+        )}
+
         {vm === null && loadFailure === null && (
           <View style={styles.section}>
             <SkeletonCard />
@@ -327,7 +411,13 @@ export default function SettingsScreen() {
 
         {vm !== null &&
           vm.sections.map((section) => (
-            <SectionView key={section.id} section={section} onAction={onAction} />
+            <SectionView
+              key={section.id}
+              section={section}
+              toggles={vm.toggles}
+              onAction={onAction}
+              onToggle={onToggle}
+            />
           ))}
 
         {vm !== null && (
