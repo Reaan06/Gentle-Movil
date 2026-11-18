@@ -1,17 +1,28 @@
 #!/usr/bin/env node
 /**
- * `gentle-movil doctor` — host-side preflight for the tablet pairing.
- * Each check prints a ✓/✗ line and the doctor exits non-zero if any failed,
- * so "why can't the tablet connect?" is one command.
+ * `gentle-movil doctor` — host-side preflight for the tablet pairing (S9).
+ *
+ * Four checks, each a ✓/✗ line, no sudo, no daemon, nothing beyond loopback:
+ *
+ * 1. sshd is active (systemd unit `sshd`, then `ssh` on distros that name it so);
+ * 2. the ed25519 SSH host key is readable (TOFU fingerprint source);
+ * 3. a LAN IPv4 address exists (the tablet must reach this host);
+ * 4. the Gentle Shell/Pi extension answers on loopback 43721/43722.
+ *
+ * Exit 1 when any check fails, so "why can't the tablet connect?" is one
+ * command. Missing extension is a normal, honestly reported failure — never a
+ * crash.
  */
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
-const HOST_KEY_CANDIDATES = [
-  '/etc/ssh/ssh_host_ed25519_key.pub',
-  '/etc/ssh/ssh_host_ecdsa_key.pub',
-  '/etc/ssh/ssh_host_rsa_key.pub',
-];
+import { ED25519_HOST_KEY, detectSshPort, lanAddress } from '../lib/pairing.mjs';
+import {
+  allReachable,
+  describeProbe,
+  extensionPorts,
+  probeExtensionPorts,
+} from '../lib/loopback.mjs';
 
 async function check(label, fn) {
   try {
@@ -24,62 +35,71 @@ async function check(label, fn) {
   }
 }
 
-function sshPort() {
+/** `systemctl is-active <unit>`; a missing/inactive unit throws an honest reason. */
+function activeUnit(unit) {
   try {
-    const port = readFileSync('/etc/ssh/sshd_config', 'utf8').match(/^\s*Port\s+(\d+)\s*$/m);
-    if (port) return Number(port[1]);
-  } catch {}
-  return 22;
-}
-
-function lanHost() {
-  // Same UDP trick as pair.mjs but synchronous enough for a doctor line.
-  return new Promise((resolve) => {
-    import('node:dgram').then(({ createSocket }) => {
-      const socket = createSocket('udp4');
-      const done = (v) => { try { socket.close(); } catch {} resolve(v); };
-      socket.once('error', () => done('127.0.0.1'));
-      socket.connect(80, '192.168.2.1', () => done(socket.address().address || '127.0.0.1'));
-      setTimeout(() => done('127.0.0.1'), 1500);
-    });
-  });
+    const state = execFileSync('systemctl', ['is-active', unit], { encoding: 'utf8' }).trim();
+    if (state === 'active') return unit;
+    throw new Error(`systemd reports "${state}"`);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('systemd reports')) throw error;
+    throw new Error(`systemctl unavailable (${error.code || error.message})`);
+  }
 }
 
 export async function run(_args) {
+  let ports;
+  try {
+    ports = extensionPorts();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    return 2;
+  }
+
   let ok = true;
 
-  ok &= await check('sshd is active on port 22', async () => {
-    const out = execFileSync('systemctl', ['is-active', 'sshd'], { encoding: 'utf8' }).trim();
-    if (out !== 'active') {
+  ok = (await check('sshd is active', async () => {
+    let unit;
+    try {
+      unit = activeUnit('sshd');
+    } catch (sshdError) {
       try {
-        const alt = execFileSync('systemctl', ['is-active', 'ssh'], { encoding: 'utf8' }).trim();
-        if (alt !== 'active') throw new Error('inactive');
-      } catch { throw new Error(`systemd reports "${out}"`); }
+        unit = activeUnit('ssh');
+      } catch {
+        throw sshdError;
+      }
     }
-    return `port ${sshPort()}`;
-  });
+    return `systemd: ${unit} · port ${detectSshPort()}`;
+  })) && ok;
 
-  ok &= await check('SSH host key readable (TOFU fingerprint source)', async () => {
-    for (const path of HOST_KEY_CANDIDATES) {
-      const blob = readFileSync(path, 'utf8').trim().split(/\s+/)[1];
-      if (blob) return path;
-    }
-    throw new Error('no readable host key (chmod the .pub or run doctor as the key owner)');
-  });
+  ok = (await check('SSH host key is readable (ed25519, TOFU source)', async () => {
+    const line = readFileSync(ED25519_HOST_KEY, 'utf8').trim();
+    const blob = line.split(/\s+/)[1];
+    if (!blob) throw new Error(`${ED25519_HOST_KEY} has no key body`);
+    return ED25519_HOST_KEY;
+  })) && ok;
 
-  ok &= await check('LAN address detected (tablet must be on the same network)', async () => {
-    const host = await lanHost();
-    if (host === '127.0.0.1') throw new Error('only loopback — check WiFi/network');
+  ok = (await check('LAN address detected (tablet must be on the same network)', async () => {
+    const host = lanAddress();
+    if (host === '127.0.0.1') throw new Error('only loopback — check WiFi/Ethernet');
     return host;
-  });
+  })) && ok;
 
-  ok &= await check('Companion daemon reachable on the admin surface', async () => {
-    const { adminHttpUrl } = await import('../../src/daemon.ts');
-    const response = await fetch(new URL('/', adminHttpUrl()), { signal: AbortSignal.timeout(3000) });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return adminHttpUrl();
-  });
+  ok = (await check(
+    `Gentle Shell extension reachable on loopback ${ports.join('/')}`,
+    async () => {
+      const results = await probeExtensionPorts(ports);
+      if (!allReachable(results)) {
+        throw new Error(results.map(describeProbe).join('; '));
+      }
+      return results.map(describeProbe).join('; ');
+    },
+  )) && ok;
 
-  console.log(ok ? '\nAll checks passed — `gentle-movil pair` should work.' : '\nSome checks failed — fix the ✗ lines before pairing.');
+  console.log(
+    ok
+      ? '\nAll checks passed — `gentle-movil pair` should work.'
+      : '\nSome checks failed — fix the ✗ lines before pairing.',
+  );
   return ok ? 0 : 1;
 }

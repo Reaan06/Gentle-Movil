@@ -1,28 +1,41 @@
 #!/usr/bin/env node
-/** `gentle-movil status` — local Companion daemon status summary. */
-import { execFileSync } from 'node:child_process';
-import { adminHttpUrl } from '../../src/daemon.ts';
+/**
+ * `gentle-movil status` — is the Gentle Shell/Pi extension answering on
+ * loopback? (S2: there is no daemon anymore, only the agent's own extension.)
+ *
+ * Probes 127.0.0.1:43721 (control surface) and 127.0.0.1:43722 (device surface
+ * the tablet tunnels into) with a short HTTP GET, falling back to a TCP connect
+ * so "listening but not HTTP" is reported honestly. Exit 0 only when every
+ * configured port answers; 1 when any does not; 2 when GENTLE_MOVIL_PORTS is
+ * malformed.
+ */
+import {
+  allReachable,
+  extensionPorts,
+  probeExtensionPorts,
+  probeLine,
+} from '../lib/loopback.mjs';
 
 export async function run(_args) {
-  let running = false;
-  let detail = '';
+  let ports;
   try {
-    const out = execFileSync('node', ['tools/daemon.mjs', 'status'], { encoding: 'utf8', cwd: new URL('../../', import.meta.url).pathname });
-    running = out.includes('is running');
-    detail = out.split('\n').filter((line) => /console:|binary:|pid/.test(line)).join('\n');
+    ports = extensionPorts();
   } catch (error) {
-    detail = error instanceof Error ? error.message : String(error);
+    console.error(error instanceof Error ? error.message : String(error));
+    return 2;
   }
 
-  let pairingSurface = 'unreachable';
-  try {
-    const response = await fetch(new URL('/api/pairing/start', adminHttpUrl()), { method: 'HEAD', signal: AbortSignal.timeout(3000) }).catch((e) => { throw e; });
-    pairingSurface = response.ok ? 'reachable' : `HTTP ${response.status}`;
-  } catch (error) {
-    pairingSurface = `unreachable: ${error instanceof Error ? error.message.split('\n')[0] : 'error'}`;
+  const results = await probeExtensionPorts(ports);
+  console.log('Gentle Shell extension (loopback):');
+  for (const result of results) console.log(`  ${probeLine(result)}`);
+
+  if (allReachable(results)) {
+    console.log('\nextension: reachable — the tablet can tunnel to the agent through SSH.');
+    return 0;
   }
 
-  console.log(`daemon:    ${running ? 'running' : 'not running'}${detail ? `\n${detail}` : ''}`);
-  console.log(`admin API: ${pairingSurface}`);
-  return running ? 0 : 1;
+  console.log(
+    '\nextension: not reachable — start Gentle Shell/Pi with its loopback extension (no daemon, no sudo).',
+  );
+  return 1;
 }
