@@ -34,7 +34,7 @@ import {
   randomToken,
   SSH_FINGERPRINT_HEX_LEN,
 } from '../lib/pairing.mjs';
-import { encodeQr, renderTerminalQr } from '../lib/qr.mjs';
+import { encodeQr, renderQrBlock, renderTerminalQr, terminalColumns } from '../lib/qr.mjs';
 
 const CLI = fileURLToPath(new URL('../gentle-movil.mjs', import.meta.url));
 const FP = 'a1'.repeat(32);
@@ -146,7 +146,7 @@ test('pair payload keeps the gc://pair?v=1 contract the app parses', () => {
   assert.equal(params.get('user'), 'reaan');
   assert.equal(params.get('token'), 'inv_TESTTOKEN');
   assert.equal(params.get('fp'), FP, '64-hex SHA-256 host fingerprint');
-  // moshi model: the SSH password rides percent-encoded, the app decodes `pw`.
+  // password-in-the-QR model: `pw` rides percent-encoded, the app decodes it.
   assert.equal(params.get('pw'), 'p@ss word');
   assert.equal(params.get('code'), null, 'the password mode does not send a code');
   assert.equal(params.get('dport'), '43722', 'extension device surface');
@@ -212,7 +212,9 @@ test('the QR renderer is self-contained and produces a valid matrix', () => {
     assert.equal(modules[6 * size + i], i % 2 === 0 ? 1 : 0, `timing row at ${i}`);
   }
 
-  const rendered = renderTerminalQr(payload, { isTTY: false });
+  // `columns: 200` pins the wide layout: the renderer reads the real terminal
+  // width (or `COLUMNS`) by default, and this test is about the matrix.
+  const rendered = renderTerminalQr(payload, { isTTY: false, columns: 200 });
   const lines = rendered.split('\n').filter((line) => line.length > 0);
   const width = size + 4; // 2-module quiet zone on each side
   assert.ok(lines.every((line) => line.length === width), 'quiet zone keeps a square code');
@@ -382,4 +384,115 @@ test('doctor fails its extension check on a port answering as an impostor', asyn
   } finally {
     for (const { server } of servers) await closeServer(server);
   }
+});
+
+/** Lines made only of QR half blocks and spaces: the drawn code, nothing else. */
+const ART_ONLY = /^[ \u2580\u2584\u2588]+$/;
+
+/** One full pairing URI, as `pair` builds it (invite-only shape). */
+function invitePayload() {
+  return buildPairUri({
+    host: '192.168.1.42',
+    port: 22,
+    user: 'reaan',
+    token: `inv_${'ab'.repeat(16)}`,
+    fp: FP,
+    code: 'WXYZ-9876',
+  });
+}
+
+test('the terminal QR fits a narrow terminal and reports how it shrank', () => {
+  const payload = invitePayload();
+  const { size } = encodeQr(payload);
+
+  const wide = renderQrBlock(payload, { isTTY: false, columns: 200 });
+  assert.equal(wide.note, null, 'a terminal that fits the code needs no shrink line');
+  assert.ok(
+    wide.art.split('\n').every((line) => line.length === size + 4),
+    'the 2-module quiet zone is kept when there is room',
+  );
+
+  // One column narrower than the preferred art, down to the bare matrix.
+  for (const columns of [size + 4, size + 3, size + 2, size + 1, size]) {
+    const { art } = renderQrBlock(payload, { isTTY: false, columns });
+    const lines = art.split('\n');
+    assert.ok(lines.every((line) => line.length <= columns), `no art line wraps at ${columns}`);
+    assert.ok(
+      lines.some((line) => /[\u2580\u2584\u2588]/.test(line)),
+      `the code is still drawn at ${columns} columns`,
+    );
+    assert.ok(lines.every((line) => ART_ONLY.test(line)), 'the art is the only thing drawn');
+  }
+
+  const snug = renderQrBlock(payload, { isTTY: false, columns: size + 2 });
+  assert.match(
+    snug.note ?? '',
+    new RegExp(`quiet zone 2 → 1, art ${size + 2} columns wide`),
+    `the shrink is reported in one line: ${snug.note}`,
+  );
+
+  // Narrower than the matrix itself: wrapping would be unscannable, so the code
+  // is not drawn and the reason is named.
+  const tooNarrow = renderQrBlock(payload, { isTTY: false, columns: size - 1 });
+  assert.doesNotMatch(tooNarrow.art, /[\u2580\u2584\u2588]/, 'no wrapped art');
+  assert.match(tooNarrow.art, new RegExp(`needs ${size} columns`), 'the needed width is named');
+  assert.match(tooNarrow.art, /^gc:\/\/pair\?v=1&/m, 'the payload stays available as text');
+});
+
+test('the terminal width comes from the TTY, then COLUMNS, then 80', () => {
+  assert.equal(terminalColumns({ stream: { columns: 42 }, env: { COLUMNS: '70' } }), 42);
+  assert.equal(terminalColumns({ stream: {}, env: { COLUMNS: '70' } }), 70);
+  assert.equal(terminalColumns({ stream: {}, env: {} }), 80);
+  assert.equal(terminalColumns({ stream: {}, env: { COLUMNS: 'wide' } }), 80, 'garbage is ignored');
+});
+
+test('pair --invite-only never draws art wider than COLUMNS', async () => {
+  for (const columns of [60, 40]) {
+    const result = await runCli(['pair', '--invite-only'], {
+      COLUMNS: String(columns),
+      LC_ALL: 'C.UTF-8',
+      LANG: '',
+      LC_CTYPE: '',
+    });
+    assert.equal(result.status, 0, result.stderr);
+
+    const art = result.stdout
+      .split('\n')
+      .filter((line) => ART_ONLY.test(line) && line.trim() !== '');
+    assert.ok(
+      art.every((line) => line.length <= columns),
+      `no art line exceeds ${columns} columns: ${art.map((line) => line.length).join(',')}`,
+    );
+    if (columns === 60) {
+      assert.ok(art.length > 0, 'a 60-column terminal is wide enough to draw the code');
+    } else {
+      assert.equal(art.length, 0, '40 columns cannot hold a 41+ module code');
+      assert.match(result.stdout, /too narrow/, 'the narrow terminal is explained honestly');
+    }
+    assert.doesNotMatch(result.stdout, /\u001b\[/, 'piped output carries no escapes');
+  }
+});
+
+test('the narrow fallback prints the same payload the QR encodes', async () => {
+  const result = await runCli(['pair', '--invite-only'], {
+    COLUMNS: '40',
+    LC_ALL: 'C.UTF-8',
+    LANG: '',
+    LC_CTYPE: '',
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  const uri = result.stdout.split('\n').find((line) => line.startsWith('gc://pair?v=1&'));
+  assert.ok(uri, `the payload is printed as text:\n${result.stdout}`);
+  const params = pairParams(uri);
+  assert.equal(params.get('v'), '1');
+  assert.match(
+    params.get('fp') ?? '',
+    /^[0-9a-f]{64}$/,
+    '64-hex fingerprint: the form the app parser accepts',
+  );
+  assert.equal(params.get('pw'), null, 'invite-only carries no password');
+  assert.match(params.get('code') ?? '', /^[A-Z0-9]{4}-[A-Z0-9]{4}$/);
+  assert.match(params.get('token') ?? '', /^inv_[0-9a-f]{32}$/);
+  assert.equal(params.get('dport'), '43722');
 });

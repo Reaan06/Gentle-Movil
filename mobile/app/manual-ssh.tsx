@@ -95,8 +95,8 @@ export default function ManualSshScreen() {
 
     const credential: SshCredential =
       auth === 'password'
-        ? { type: 'password', value: password }
-        : { type: 'key', path: keyPath.trim() };
+        ? { kind: 'password', value: password }
+        : { kind: 'key', path: keyPath.trim() };
 
     const log = logger.tag('manual-ssh');
     setStatus('connecting');

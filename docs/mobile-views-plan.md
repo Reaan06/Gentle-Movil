@@ -78,7 +78,7 @@ Toasts are 3 s, one line, never carry a whole stack trace; details go to a "Deta
 
 ### V1 — QR scan
 Artboard: `design/mobile-app-onboarding/01-qr-scan`
-Purpose: pair with a PC in one step, the moshi-style path (stack doc §Modo conectado).
+Purpose: pair with a PC in one step, the password-in-the-QR path (stack doc §Modo conectado).
 
 Elements: black camera viewport with a centered cut-out frame, torch toggle, "…" hint text
 `Apunta al QR de Gentle Shell`, secondary buttons `Escribir datos manualmente` → V2,

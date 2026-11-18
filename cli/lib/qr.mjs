@@ -9,7 +9,9 @@
  *
  * Deliberately boring ISO/IEC 18004 machinery (GF(256) arithmetic, RS blocks,
  * format/version BCH bits, the 8 masks) so the QR stays scannable. Output is
- * half-block terminal art with a 2-module quiet zone; on a TTY the field is
+ * half-block terminal art, shrunk (quiet zone 2 → 1 → 0) to the terminal width
+ * so a narrow terminal never wraps the code; a width too narrow for the bare
+ * matrix falls back to printing the payload as text. On a TTY the field is
  * painted white so black modules stay black on dark and light terminals.
  *
  * Pure: no I/O, no dependencies. `encodeQr` is exported so the contract test
@@ -459,30 +461,82 @@ export function isUtf8Locale(env = process.env) {
   return /utf-?8/i.test(chosen);
 }
 
+/** Width assumed when neither the TTY nor `COLUMNS` declares one. */
+export const FALLBACK_COLUMNS = 80;
+
 /**
- * Render a QR as terminal art (half blocks, 2-module quiet zone).
+ * How many columns the terminal gives us: the live TTY width, then `COLUMNS`.
  *
- * On a TTY the field is painted white (`30;47`) so black modules read as black
- * on both dark and light terminal themes. Off a TTY the same art is emitted
- * without escapes (files, tests, logs). Outside a UTF-8 locale the art would be
- * mojibake, so the payload is printed as plain text instead (`utf8: false`).
+ * `process.stdout.columns` is `undefined` for pipes and files (where `pair` is
+ * normally pasted from a script or CI), so `COLUMNS` is the only way to declare
+ * a width there. Neither one is trusted blindly: a non-positive or unparsable
+ * value falls through to the `FALLBACK_COLUMNS` default.
  */
-export function renderTerminalQr(
+export function terminalColumns({ stream = process.stdout, env = process.env } = {}) {
+  const live = stream?.columns;
+  if (Number.isInteger(live) && live > 0) return live;
+  const declared = Number.parseInt(String(env.COLUMNS ?? ''), 10);
+  if (Number.isInteger(declared) && declared > 0) return declared;
+  return FALLBACK_COLUMNS;
+}
+
+/**
+ * Render a QR as terminal art, shrunk to fit `columns`.
+ *
+ * One character is one module column, so the drawn code is exactly
+ * `size + 2 * quietModules` columns wide: a wrapped line is an unscannable
+ * code, never a wide one. The ladder is 2 quiet modules (the spec's margin,
+ * 4 modules, is halved because the terminal art uses one character per
+ * module), then 1, then 0. If even the bare matrix does not fit, no art is
+ * drawn at all and the payload is printed as text — the same honest fallback
+ * as a non-UTF-8 locale.
+ *
+ * Returns `{ art, note }`: `art` is what to print, `note` is a single line
+ * explaining a shrink (or `null` when the preferred layout fits).
+ */
+export function renderQrBlock(
   text,
-  { isTTY = Boolean(process.stdout.isTTY), quietModules = 2, utf8 = isUtf8Locale() } = {},
+  {
+    isTTY = Boolean(process.stdout.isTTY),
+    quietModules = 2,
+    utf8 = isUtf8Locale(),
+    columns = terminalColumns(),
+  } = {},
 ) {
   if (!utf8) {
-    return [
-      'QR art needs a UTF-8 locale (LC_ALL/LC_CTYPE/LANG) — printing the payload as text:',
-      text,
-    ].join('\n');
+    return {
+      art: [
+        'QR art needs a UTF-8 locale (LC_ALL/LC_CTYPE/LANG) — printing the payload as text:',
+        text,
+      ].join('\n'),
+      note: null,
+    };
   }
 
   const { size, modules } = encodeQr(text);
-  const total = size + quietModules * 2;
+
+  let quiet = null;
+  for (let candidate = quietModules; candidate >= 0; candidate--) {
+    if (size + candidate * 2 <= columns) {
+      quiet = candidate;
+      break;
+    }
+  }
+
+  if (quiet === null) {
+    return {
+      art: [
+        `Terminal too narrow for the QR: the ${size}-module code needs ${size} columns and this one has ${columns} — printing the payload as text instead:`,
+        text,
+      ].join('\n'),
+      note: null,
+    };
+  }
+
+  const total = size + quiet * 2;
   const isDark = (x, y) => {
-    const mx = x - quietModules;
-    const my = y - quietModules;
+    const mx = x - quiet;
+    const my = y - quiet;
     if (mx < 0 || my < 0 || mx >= size || my >= size) return false;
     return modules[my * size + mx] === 1;
   };
@@ -498,6 +552,27 @@ export function renderTerminalQr(
     lines.push(line);
   }
 
-  if (!isTTY) return lines.join('\n');
-  return lines.map((line) => `\x1b[30;47m${line}\x1b[0m`).join('\n');
+  const art = isTTY
+    ? lines.map((line) => `\x1b[30;47m${line}\x1b[0m`).join('\n')
+    : lines.join('\n');
+
+  const note =
+    quiet === quietModules
+      ? null
+      : `QR shrunk to fit ${columns} columns: quiet zone ${quietModules} → ${quiet}, art ${total} columns wide.`;
+
+  return { art, note };
+}
+
+/**
+ * Render a QR as terminal art (half blocks, quiet zone shrunk to fit).
+ *
+ * On a TTY the field is painted white (`30;47`) so black modules read as black
+ * on both dark and light terminal themes. Off a TTY the same art is emitted
+ * without escapes (files, tests, logs). Outside a UTF-8 locale the art would be
+ * mojibake, so the payload is printed as plain text instead (`utf8: false`).
+ * `renderQrBlock` is the same render plus the one-line shrink note.
+ */
+export function renderTerminalQr(text, options = {}) {
+  return renderQrBlock(text, options).art;
 }

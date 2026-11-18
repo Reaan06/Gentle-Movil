@@ -494,7 +494,11 @@ impl TransportSession for RusshSession {
                         }
                     }
                     ChannelMsg::ExitStatus { exit_status } => exit_code = Some(exit_status),
-                    ChannelMsg::Eof | ChannelMsg::Close => break,
+                    // OpenSSH sends EOF *before* ExitStatus, so EOF alone must not end the
+                    // loop: breaking here dropped the exit status and every remote step
+                    // reported "exec channel closed without reporting an exit status".
+                    ChannelMsg::Eof => {}
+                    ChannelMsg::Close => break,
                     _ => {}
                 }
             }

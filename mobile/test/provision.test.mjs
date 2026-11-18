@@ -49,7 +49,7 @@ const PAIR = {
   proto: '3',
 };
 
-const CREDENTIAL = { type: 'password', value: 'correcta' };
+const CREDENTIAL = { kind: 'password', value: 'correcta' };
 
 /** Device key the fake core hands out (32-byte ed25519 public key, hex). */
 const DEVICE_PUBKEY_HEX = 'ab'.repeat(32);
@@ -87,7 +87,9 @@ function fakeBridge(script = {}) {
         if (key !== 'ok') {
           return JSON.stringify({ ok: false, error: { kind: key, message: `falló ${key}` }, raw: null });
         }
-        return JSON.stringify({ ok: true, result: { key: { public_hex: DEVICE_PUBKEY_HEX, secret: {} } } });
+        // The real core answers {"ok":true,"key":{...}} with the key at the TOP level
+        // (cabi gc_device_key_generate); the fake mirrors that placement.
+        return JSON.stringify({ ok: true, key: { public_hex: DEVICE_PUBKEY_HEX, secret: {} } });
       }
       const behaviour = script[payload.step] ?? script[fn] ?? 'ok';
       if (behaviour === 'hang') {
@@ -151,6 +153,13 @@ test('the happy path runs the five steps in order and reports each one', async (
   assert.equal(result.sessionId, '7');
   // connect is the very first native call of the flow, then the composed steps.
   assert.equal(bridge.calls[0].fn, 'gc_ssh_connect');
+  // The core's SshConnectConfig expects an adjacently tagged credential
+  // ({"kind":"password","value":...}); a `type` field or a null credential is
+  // rejected on the device as "invalid type: null, expected ... SshCredential".
+  assert.deepEqual(bridge.calls[0].payload.credential, {
+    kind: 'password',
+    value: 'correcta',
+  });
   assert.deepEqual(
     bridge.calls.map((entry) => entry.payload.step ?? entry.fn),
     ['gc_ssh_connect', 'detect', 'gc_device_key_generate', 'register', 'tunnel'],
@@ -261,7 +270,7 @@ test('a tunnel without channel handles fails the step instead of reporting a tun
         return JSON.stringify({ ok: true, result: { sessionId: 7, fingerprint: PAIR.fp } });
       }
       if (fn === 'gc_device_key_generate') {
-        return JSON.stringify({ ok: true, result: { key: { public_hex: DEVICE_PUBKEY_HEX, secret: {} } } });
+        return JSON.stringify({ ok: true, key: { public_hex: DEVICE_PUBKEY_HEX, secret: {} } });
       }
       // The core answered ok but reported no opened channel.
       return JSON.stringify({ ok: true, result: payload.step === 'tunnel' ? { forwards: [] } : { step: payload.step } });

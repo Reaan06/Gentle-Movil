@@ -1248,26 +1248,37 @@ export async function provisionFlow(
   callbacks.onStepStart?.('register');
   let devicePubkeyHex = deps.devicePubkeyHex ?? '';
   if (devicePubkeyHex === '') {
-    let keyEnvelope: BridgeEnvelope;
+    let deviceKeyRaw: unknown;
     try {
       const keyResponse = await withTimeout(
         call(GC_FUNCTIONS.deviceKeyGenerate, '{}'),
         timeoutFor('register', timeouts),
       );
-      keyEnvelope = parseEnvelope(keyResponse);
+      deviceKeyRaw = JSON.parse(keyResponse);
     } catch (error) {
       return stop('register', toFailure(error), null);
     }
-    if (!keyEnvelope.ok) {
-      return stop('register', toFailure(keyEnvelope.error), keyEnvelope.raw ?? null);
+    // An explicit failure envelope keeps its kind (Crypto, Ssh, …) instead of
+    // degrading to BadResponse.
+    const failure = deviceKeyRaw as { ok?: unknown; error?: unknown } | null;
+    if (failure && failure.ok === false) {
+      return stop('register', toFailure(failure.error), deviceKeyRaw ?? null);
     }
-    const key = (keyEnvelope.result as { key?: { public_hex?: unknown } } | undefined)?.key;
+    // The core documents `gc_device_key_generate` as {"ok":true,"key":{...}} but some
+    // builds answer the bare {"key":{...}}; the key may also ride under `result`.
+    // Accept both placements so the step fails only when there is genuinely no key.
+    const container = (
+      deviceKeyRaw as { key?: unknown; result?: { key?: unknown } } | null
+    );
+    const key =
+      (container?.key as { public_hex?: unknown } | undefined) ??
+      (container?.result?.key as { public_hex?: undefined } | undefined);
     devicePubkeyHex = typeof key?.public_hex === 'string' ? key.public_hex : '';
     if (devicePubkeyHex === '') {
       return stop(
         'register',
         { kind: 'BadResponse', message: 'El núcleo no devolvió la clave pública ed25519 del teléfono.' },
-        keyEnvelope.result ?? null,
+        deviceKeyRaw ?? null,
       );
     }
   }

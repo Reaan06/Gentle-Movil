@@ -216,10 +216,10 @@ export default function PairingProgressScreen() {
       return null;
     }
     if (auth === 'password') {
-      return { type: 'password', value: secret };
+      return { kind: 'password', value: secret };
     }
     if (auth === 'key') {
-      return { type: 'key', path: secret, passphrase: passphrase === '' ? undefined : passphrase };
+      return { kind: 'key', path: secret, passphrase: passphrase === '' ? undefined : passphrase };
     }
     return null;
   }, [auth, passphrase, secret]);
