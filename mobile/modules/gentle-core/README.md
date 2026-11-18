@@ -57,7 +57,17 @@ The JNI wrapper must copy the `char*` into a `jstring` and free it with
 | `callGc('gc_pair_from_qr')` | `gc_pair_from_qr(json)` | `{"uri":"gc://pair?…"}`                                                |
 | `callGc('gc_ssh_connect')`  | `gc_ssh_connect(json)`  | `{"pair":{…},"credential":{…}}` (`credential` is `null` on the QR path)  |
 | `callGc('gc_provision_step')` | `gc_provision_step(json)` | `{"step":"fingerprint-confirm"…"rollback","pair":{…},"credential":{…},"attempt":1,"sessionId":"…"}` |
+| `callGc('gc_ssh_channel_write')` | `gc_ssh_channel_write(json)` | `{"sessionId":N,"channelId":M,"bytes":"<standard base64>"}` |
+| `callGc('gc_ssh_channel_read')` | `gc_ssh_channel_read(json)` | `{"sessionId":N,"channelId":M,"timeoutMs":K}` (`timeoutMs` optional; `0` is a non-blocking poll, absent uses the bounded default) |
+| `callGc('gc_ssh_channel_close')` | `gc_ssh_channel_close(json)` | `{"sessionId":N,"channelId":M}` |
 | `callGc('gc_device_key_generate')` | `gc_device_key_generate(json)` | `{}` |
+
+The three channel calls are the app's data path over the tunnel the `tunnel`
+provisioning step opened: `channelId` is the `channel_id` that step reported, and
+the handle stays valid across calls until `gc_ssh_channel_close`. They answer
+`{"ok":true,"result":{"written":N}}`, `{"ok":true,"result":{"bytes":"<base64>","eof":false}}`
+and `{"ok":true,"result":{"closed":true}}` respectively; an expired read window
+is an empty `bytes` with `eof:false`, never an error.
 
 Response envelope (both directions):
 
@@ -80,8 +90,26 @@ crate, or `#[no_mangle]` re-exports in `mobile-core`) must export exactly:
 | `GcNative.gcPairFromQr(String)` | `Java_com_gentlemovil_core_GcNative_gcPairFromQr`                |
 | `GcNative.gcSshConnect(String)` | `Java_com_gentlemovil_core_GcNative_gcSshConnect`                |
 | `GcNative.gcProvisionStep(String)` | `Java_com_gentlemovil_core_GcNative_gcProvisionStep`         |
+| `GcNative.gcSshChannelWrite(String)` | `Java_com_gentlemovil_core_GcNative_gcSshChannelWrite`     |
+| `GcNative.gcSshChannelRead(String)` | `Java_com_gentlemovil_core_GcNative_gcSshChannelRead`       |
+| `GcNative.gcSshChannelClose(String)` | `Java_com_gentlemovil_core_GcNative_gcSshChannelClose`     |
 | `GcNative.gcDeviceKeyGenerate(String)` | `Java_com_gentlemovil_core_GcNative_gcDeviceKeyGenerate` |
 | `GcNative.gcFree(long)`         | `Java_com_gentlemovil_core_GcNative_gcFree`                      |
+
+The three channel shims receive one document and split it themselves, exactly
+like `gcProvisionStep` splits `sessionId`: `sessionId` and `channelId` become the
+C ABI's two `u64` arguments and every other field (`bytes`, `timeoutMs`) is
+forwarded untouched. A document without a usable `sessionId` or `channelId`
+answers `{"ok":false,"error":{"kind":"input","message":"…"}}` instead of
+calling the core or crashing.
+
+The shims live in `mobile-core/src/jni_shim.rs` and are compiled only for
+`aarch64-linux-android` with `--features jni-shim`. `mobile-core/build-android.sh`
+passes that flag and refuses to install a library that exports no
+`Java_com_gentlemovil_core_GcNative_` symbol, so a feature-less build (which used to
+produce a `.so` with none of these symbols and made every call fail with
+`UnsatisfiedLinkError`) cannot ship again. The document splitter they call lives in
+`mobile_core::cabi::split_channel_document` so it is covered by the offline suite.
 
 Kotlin class/method names are the contract: change them **only** together with
 the wrapper. If the library loads but a symbol is missing, the module answers

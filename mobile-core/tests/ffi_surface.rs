@@ -4,6 +4,7 @@
 //! bindings can reach — and they never touch the network: the SSH paths they cover are the
 //! handle registry and the pure value types.
 
+use mobile_core::cabi::split_channel_document;
 use mobile_core::device_key;
 use mobile_core::ffi::{CoreErrorPayload, MobileCore};
 use mobile_core::qr::PairInfo;
@@ -159,4 +160,102 @@ fn pair_info_is_the_same_type_through_both_names() {
     let info: PairInfo = core().pair_from_qr(valid_uri()).expect("valid invitation");
     let json = serde_json::to_value(&info).expect("serializes");
     assert_eq!(json["fingerprint"], FP);
+}
+
+// ---------------------------------------------------------------------------
+// Channel documents (the JNI shims' only parsing step, exercised directly)
+//
+// `mobile-core/src/jni_shim.rs` cannot be compiled for the host (it is gated to
+// `target_os = "android"` plus the `jni-shim` feature), so the document splitter
+// every channel shim calls lives in `cabi` and is tested here, through the very
+// function the shims call — never through a copy of its logic.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn channel_write_document_splits_into_handles_and_the_write_payload() {
+    let call = split_channel_document(r#"{"sessionId":7,"channelId":3,"bytes":"aGk="}"#)
+        .expect("a well-formed write document");
+    assert_eq!(call.session_id, 7);
+    assert_eq!(call.channel_id, 3);
+    // Only the handles are removed: the base64 frame reaches the C ABI untouched.
+    assert_eq!(call.payload, r#"{"bytes":"aGk="}"#);
+}
+
+#[test]
+fn channel_read_document_keeps_an_explicit_timeout_window() {
+    let call = split_channel_document(r#"{"sessionId":7,"channelId":3,"timeoutMs":0}"#)
+        .expect("a well-formed read document");
+    assert_eq!(call.session_id, 7);
+    assert_eq!(call.channel_id, 3);
+    // `timeoutMs: 0` is the non-blocking poll, so it must survive the split.
+    assert_eq!(call.payload, r#"{"timeoutMs":0}"#);
+}
+
+#[test]
+fn channel_read_document_without_timeout_forwards_an_empty_payload() {
+    let call = split_channel_document(r#"{"sessionId":7,"channelId":3}"#).expect("valid document");
+    assert_eq!(call.session_id, 7);
+    assert_eq!(call.channel_id, 3);
+    // The C ABI applies its bounded default window when no timing is named.
+    assert_eq!(call.payload, "{}");
+}
+
+#[test]
+fn channel_close_document_needs_only_the_two_handles() {
+    let call = split_channel_document(r#"{"sessionId":7,"channelId":3}"#).expect("valid document");
+    assert_eq!(call.session_id, 7);
+    assert_eq!(call.channel_id, 3);
+    assert_eq!(call.payload, "{}");
+}
+
+#[test]
+fn channel_document_accepts_numeric_handles_sent_as_strings() {
+    let call = split_channel_document(r#"{"sessionId":"7","channelId":"3"}"#).expect("valid document");
+    assert_eq!(call.session_id, 7);
+    assert_eq!(call.channel_id, 3);
+}
+
+#[test]
+fn a_missing_session_id_is_refused_by_name() {
+    let error = split_channel_document(r#"{"channelId":3,"bytes":"aGk="}"#).expect_err("no sessionId");
+    assert_eq!(error.message, "the channel document needs a numeric sessionId");
+}
+
+#[test]
+fn a_blank_session_id_is_refused_by_name() {
+    let error = split_channel_document(r#"{"sessionId":"  ","channelId":3}"#).expect_err("blank sessionId");
+    assert_eq!(
+        error.message,
+        "the channel document needs a numeric sessionId, not \"  \""
+    );
+}
+
+#[test]
+fn a_null_session_id_is_refused_by_name() {
+    let error = split_channel_document(r#"{"sessionId":null,"channelId":3}"#).expect_err("null sessionId");
+    assert_eq!(
+        error.message,
+        "the channel document needs a numeric sessionId, not null"
+    );
+}
+
+#[test]
+fn a_missing_channel_id_is_refused_by_name() {
+    let error = split_channel_document(r#"{"sessionId":7,"bytes":"aGk="}"#).expect_err("no channelId");
+    assert_eq!(error.message, "the channel document needs a numeric channelId");
+}
+
+#[test]
+fn malformed_channel_documents_report_which_shape_was_wrong() {
+    let not_json = split_channel_document("not a document").expect_err("not JSON");
+    assert!(
+        not_json
+            .message
+            .starts_with("the channel document is not valid JSON: "),
+        "got: {}",
+        not_json.message
+    );
+
+    let not_an_object = split_channel_document("[1,2]").expect_err("not an object");
+    assert_eq!(not_an_object.message, "the channel document must be a JSON object");
 }
