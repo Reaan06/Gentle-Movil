@@ -17,7 +17,31 @@
  *   marker instead of a silent cut;
  * - the exit-code copy: `0` ok, non-zero danger with the code, `null` neutral;
  * - one honest state per outcome, mirroring `lib/git.ts`:
- *   `loading | empty | success | stale | offline | error`.
+ *   `loading | empty | success | stale | offline | error`;
+ * - the session transcript (T7n): ordered events derived ONLY from the real
+ *   history entries and their real `at` stamps, a `running | ended | idle`
+ *   state derived from that same evidence, and the agent header
+ *   (`pi · <model>`) which is only ever named from the payload.
+ *
+ * ## What the transcript may and may not say
+ *
+ * The bridge serves `GET /api/exec/history` and `POST /api/exec` (protocol
+ * §4.1) and **no agent-stream endpoint**: there is no frame, event or route
+ * that says "the agent is thinking", "the agent is waiting for you" or "the
+ * agent said this". Therefore:
+ *
+ * - `waiting` is not a state this module can produce. `TRANSCRIPT_STATES` is
+ *   `running | ended | idle` and nothing else: a `pending` history entry is
+ *   `running` (with its real elapsed time), a `sent`/`failed` newest entry is
+ *   `ended` (with its exit chip), no entry is `idle`;
+ * - every transcript carries `AGENT_NOTE` (`sin eventos del agente`) plus
+ *   `NO_AGENT_REASON`, the honest reason: the agent conversation belongs to
+ *   the sessions surface (V9), not to this one;
+ * - the header stays `shell` unless the payload carried a real model name, in
+ *   which case it reads `pi · <model>`.
+ *
+ * Everything else — a `waiting` card, thinking blocks, tool calls, approvals —
+ * needs data the PC does not publish today and is NOT invented here.
  *
  * ## The endpoint this module expects (protocol §4)
  *
@@ -36,7 +60,9 @@
  *
  * `status` is `pending | sent | failed`; `exitCode` is `null` or an integer;
  * `output` is `null` or the raw stream the command produced (escapes and all);
- * `at` is ISO-8601 or epoch milliseconds.
+ * `at` is ISO-8601 or epoch milliseconds. An optional top-level `model`
+ * (string) would name the agent model: §4.1 does not publish it today, so it is
+ * read leniently and the pane header stays `shell` when it is absent.
  *
  * ## What the PC does NOT serve yet
  *
@@ -364,12 +390,316 @@ export function exitChip(exitCode: number | null): ExitChip {
 }
 
 /* ------------------------------------------------------------------ *
+ * Agent header
+ * ------------------------------------------------------------------ */
+
+/** The only agent the bridge can name (§9: the Pi extension). */
+export const AGENT_NAME = 'pi';
+
+/** Header shown when the payload named no model: the plain shell. */
+export const SHELL_HEADER = 'shell';
+
+/** Who is on the other side of the tunnel: `pi · <model>`, or the shell. */
+export interface AgentHeader {
+  agent: string;
+  /** The real model name the payload carried; `null` when it carried none. */
+  model: string | null;
+  /** `pi · opus-4.5` with a payload model, `shell` without one. */
+  label: string;
+}
+
+/**
+ * Header of the transcript pane. §4.1 publishes no model field today, so the
+ * header stays `shell`; a real model name in the payload is the only thing that
+ * turns it into `pi · <model>`. An empty/blank or mistyped value is absent, not
+ * a made-up agent.
+ */
+export function agentHeader(model: unknown = null): AgentHeader {
+  const name = typeof model === 'string' && model.trim() !== '' ? model.trim() : null;
+  return {
+    agent: AGENT_NAME,
+    model: name,
+    label: name === null ? SHELL_HEADER : `${AGENT_NAME} · ${name}`,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Transcript — derived from the real history only (T7n)
+ * ------------------------------------------------------------------ */
+
+/** The states the evidence supports. There is no `waiting`: nothing serves it. */
+export type TranscriptKind = 'running' | 'ended' | 'idle';
+
+/** Closed set of transcript states (artboard chips, minus the fabricated one). */
+export const TRANSCRIPT_STATES: readonly TranscriptKind[] = ['running', 'ended', 'idle'];
+
+/** Chip copy of a `pending` newest entry: the command has not come back yet. */
+export const RUNNING_LABEL = 'en curso';
+
+/** Chip copy when the newest entry finished (`sent`/`failed`). */
+export const ENDED_LABEL = 'terminado';
+
+/** Chip copy when the history has no entry at all. */
+export const IDLE_LABEL = 'sin actividad';
+
+/** Honest note over the transcript: the bridge serves no agent stream. */
+export const AGENT_NOTE = 'sin eventos del agente';
+
+/** Why there are no agent events: this is command history, V9 owns the agent. */
+export const NO_AGENT_REASON =
+  'El puente no expone el stream del agente: /api/exec/history solo trae los comandos que corrió. La conversación del agente llega con la superficie de sesiones (V9).';
+
+/** Ceiling of the duration copy: past a day the exact span stops being useful. */
+export const DURATION_CAP_MS = 24 * 3_600_000;
+
+/** What a span over the ceiling reads as (capped, never a fake precision). */
+export const DURATION_CAP_COPY = 'más de 24 horas';
+
+/** `1 segundo` / `45 segundos`: the number plus its singular or plural noun. */
+function plural(value: number, one: string, many: string): string {
+  return `${value} ${value === 1 ? one : many}`;
+}
+
+/**
+ * Duration copy with singular/plural and a capped ceiling: `0 segundos`,
+ * `1 segundo`, `1 minuto 30 segundos`, `2 horas 5 minutos`, `más de 24 horas`.
+ * A negative or unusable number reads `0 segundos` instead of a nonsense span.
+ */
+export function durationCopy(ms: number): string {
+  const seconds = typeof ms === 'number' && Number.isFinite(ms) ? Math.max(0, Math.floor(ms / 1000)) : 0;
+  if (seconds * 1000 >= DURATION_CAP_MS) {
+    return DURATION_CAP_COPY;
+  }
+  if (seconds < 60) {
+    return plural(seconds, 'segundo', 'segundos');
+  }
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  if (minutes < 60) {
+    const head = plural(minutes, 'minuto', 'minutos');
+    return rest === 0 ? head : `${head} ${plural(rest, 'segundo', 'segundos')}`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const tail = minutes % 60;
+  const head = plural(hours, 'hora', 'horas');
+  return tail === 0 ? head : `${head} ${plural(tail, 'minuto', 'minutos')}`;
+}
+
+/** Tones the transcript state chip can paint. */
+export type TranscriptTone = 'running' | 'ok' | 'danger' | 'neutral' | 'muted';
+
+/** The derived transcript state: evidence in, one chip out. */
+export interface TranscriptStatus {
+  kind: TranscriptKind;
+  /** `en curso` / `terminado` / `sin actividad`. */
+  label: string;
+  tone: TranscriptTone;
+  /** `hace` (elapsed of the pending entry) / `duró` (real span) / `null`. */
+  timeLabel: string | null;
+  /** `12 segundos` / `4 minutos` / `null` when nothing was measured. */
+  time: string | null;
+  /** Exit chip of the newest finished entry (`ended` only). */
+  exit: ExitChip | null;
+  /** The command the state is about, `null` when the history is empty. */
+  command: string | null;
+  /** `sin eventos del agente`: always, see `NO_AGENT_REASON`. */
+  agentNote: string;
+  /** Why there are no agent events (not this surface's data). */
+  agentReason: string;
+  /** `pi · <model>` only when the payload named one, `shell` otherwise. */
+  agent: AgentHeader;
+  /** Real entries the state was derived from (0 = nothing was claimed). */
+  from: number;
+}
+
+/** Injectable clock + the model the payload named (both optional). */
+export interface TranscriptOptions {
+  /** Epoch ms used for the elapsed copy; defaults to `Date.now()`. */
+  now?: number;
+  /** Model name the payload carried, `null`/absent when it carried none. */
+  model?: string | null;
+}
+
+/** Entries sorted by their real `at`, stable for equal stamps (no mutation). */
+function byAt(entries: readonly CommandEntry[]): CommandEntry[] {
+  return entries
+    .map((entry, index) => ({ entry, index }))
+    .sort((a, b) => a.entry.at - b.entry.at || a.index - b.index)
+    .map(({ entry }) => entry);
+}
+
+/**
+ * The transcript state, derived from real history entries only:
+ *
+ * - no entry → `idle`;
+ * - newest entry `pending` → `running`, elapsed since its real `at`;
+ * - newest entry `sent`/`failed` → `ended`, with that entry's exit chip and the
+ *   real span between the oldest and newest stamps (no span with one entry).
+ *
+ * There is no `waiting`: the bridge cannot say the agent is waiting for you.
+ */
+export function transcriptState(
+  entries: readonly CommandEntry[],
+  options: TranscriptOptions = {},
+): TranscriptStatus {
+  const now = typeof options.now === 'number' ? options.now : Date.now();
+  const base = {
+    agentNote: AGENT_NOTE,
+    agentReason: NO_AGENT_REASON,
+    agent: agentHeader(options.model ?? null),
+  };
+  const ordered = byAt(entries);
+
+  if (ordered.length === 0) {
+    return {
+      ...base,
+      kind: 'idle',
+      label: IDLE_LABEL,
+      tone: 'muted',
+      timeLabel: null,
+      time: null,
+      exit: null,
+      command: null,
+      from: 0,
+    };
+  }
+
+  const newest = ordered[ordered.length - 1];
+  const oldest = ordered[0];
+
+  if (newest.status === 'pending') {
+    return {
+      ...base,
+      kind: 'running',
+      label: RUNNING_LABEL,
+      tone: 'running',
+      timeLabel: 'hace',
+      time: durationCopy(now - newest.at),
+      exit: null,
+      command: newest.command,
+      from: ordered.length,
+    };
+  }
+
+  const chip = exitChip(newest.exitCode);
+  const span = newest.at - oldest.at;
+  const measured = ordered.length > 1 && span >= 0 ? span : null;
+  return {
+    ...base,
+    kind: 'ended',
+    label: ENDED_LABEL,
+    tone: chip.tone,
+    timeLabel: measured === null ? null : 'duró',
+    time: measured === null ? null : durationCopy(measured),
+    exit: chip,
+    command: newest.command,
+    from: ordered.length,
+  };
+}
+
+/** Kinds of streamed line the transcript renders. */
+export type TranscriptEventKind = 'command' | 'output' | 'status';
+
+/** Kind glyphs (artboard `.log__who` / `.tool__head` columns). */
+export const EVENT_GLYPHS: Record<TranscriptEventKind, string> = {
+  command: '$',
+  output: '│',
+  status: '·',
+};
+
+/** One ordered transcript line, derived from one real history entry. */
+export interface TranscriptEvent {
+  /** Stable, unique key: `${entry.id}:${kind}`. */
+  id: string;
+  /** The history entry this line came from. */
+  entryId: string;
+  /** Real epoch ms of the entry — the only stamp the bridge gives. */
+  at: number;
+  /** `14:32` local time of that stamp. */
+  atLabel: string;
+  kind: TranscriptEventKind;
+  /** `$` / `│` / `·`. */
+  glyph: string;
+  /** Display text: the command, the ANSI-stripped output or the status copy. */
+  text: string;
+  /** Status copy on a `status` line (`enviado` / `falló` / `en cola`), else null. */
+  statusLabel: string | null;
+  /** Exit chip on a `status` line, null on the other kinds. */
+  exit: ExitChip | null;
+  /** The output was cut by the display cap (the marker names how much). */
+  truncated: boolean;
+  /** Characters hidden behind the marker (0 when nothing was cut). */
+  hidden: number;
+  /** The command this line belongs to. */
+  command: string;
+}
+
+/**
+ * The streamed transcript: one `command` line per entry, its `output` lines
+ * (ANSI-stripped and truncated by the existing rule) and its `status` line,
+ * ordered by the real `at` ascending. Equal stamps keep the natural order of
+ * one command — command, then output, then status — never an invented clock.
+ */
+export function transcriptEvents(
+  entries: readonly CommandEntry[],
+  cap: number = OUTPUT_DISPLAY_CAP,
+): TranscriptEvent[] {
+  const events: TranscriptEvent[] = [];
+  for (const entry of byAt(entries)) {
+    const shared = {
+      entryId: entry.id,
+      at: entry.at,
+      atLabel: timeLabel(entry.at),
+      command: entry.command,
+    };
+    events.push({
+      ...shared,
+      id: `${entry.id}:command`,
+      kind: 'command',
+      glyph: EVENT_GLYPHS.command,
+      text: entry.command,
+      statusLabel: null,
+      exit: null,
+      truncated: false,
+      hidden: 0,
+    });
+    const output = renderOutput(entry.output, cap);
+    if (output !== null) {
+      events.push({
+        ...shared,
+        id: `${entry.id}:output`,
+        kind: 'output',
+        glyph: EVENT_GLYPHS.output,
+        text: output.text,
+        statusLabel: null,
+        exit: null,
+        truncated: output.truncated,
+        hidden: output.hidden,
+      });
+    }
+    events.push({
+      ...shared,
+      id: `${entry.id}:status`,
+      kind: 'status',
+      glyph: EVENT_GLYPHS.status,
+      text: STATUS_LABELS[entry.status],
+      statusLabel: STATUS_LABELS[entry.status],
+      exit: exitChip(entry.exitCode),
+      truncated: false,
+      hidden: 0,
+    });
+  }
+  return events;
+}
+
+/* ------------------------------------------------------------------ *
  * Payload validation
  * ------------------------------------------------------------------ */
 
-/** Parse outcome: the real entries, or why the body is not usable. */
+/** Parse outcome: the real entries (plus any model the payload named), or why
+ * the body is not usable. */
 export type ParseResult =
-  | { ok: true; entries: CommandEntry[] }
+  | { ok: true; entries: CommandEntry[]; model: string | null }
   | { ok: false; message: string; raw: string | null };
 
 /** Raw evidence of any value, truncated for the log and the error card. */
@@ -459,7 +789,21 @@ export function parseHistory(body: unknown): ParseResult {
     }
     entries.push(parsed);
   }
-  return { ok: true, entries };
+  return { ok: true, entries, model: parseModel(record.model) };
+}
+
+/**
+ * Optional model name of the body. §4.1 does not publish it, so it is read
+ * leniently: only a non-empty string names the agent, anything else is absent
+ * (the header then stays `shell`). A field the bridge does not serve can never
+ * turn the screen into an error.
+ */
+function parseModel(value: unknown): string | null {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed === '' ? null : trimmed;
 }
 
 /* ------------------------------------------------------------------ *
@@ -470,9 +814,14 @@ export function parseHistory(body: unknown): ParseResult {
 export type HistoryState =
   | { kind: 'loading' }
   | { kind: 'empty' }
-  | { kind: 'success'; entries: CommandEntry[] }
-  | { kind: 'stale'; minutes: number; entries: CommandEntry[] }
-  | { kind: 'offline'; entries: CommandEntry[] | null; minutes: number | null }
+  | { kind: 'success'; entries: CommandEntry[]; model?: string | null }
+  | { kind: 'stale'; minutes: number; entries: CommandEntry[]; model?: string | null }
+  | {
+      kind: 'offline';
+      entries: CommandEntry[] | null;
+      minutes: number | null;
+      model?: string | null;
+    }
   | { kind: 'error'; message: string; raw: string | null };
 
 /**
@@ -482,6 +831,7 @@ export type HistoryState =
  */
 export class HistoryCache {
   private entries: CommandEntry[] | null = null;
+  private model: string | null = null;
   private at = 0;
   private readonly now: () => number;
 
@@ -489,24 +839,26 @@ export class HistoryCache {
     this.now = now;
   }
 
-  /** Marks "the PC answered this history, now". */
-  mark(entries: readonly CommandEntry[]): void {
+  /** Marks "the PC answered this history, now" (with the model it named). */
+  mark(entries: readonly CommandEntry[], model: string | null = null): void {
     this.entries = entries.map((entry) => ({ ...entry }));
+    this.model = model;
     this.at = this.now();
   }
 
   /** Cached entries + minutes since they arrived, or null when never answered. */
-  snapshot(): { entries: CommandEntry[]; minutes: number } | null {
+  snapshot(): { entries: CommandEntry[]; minutes: number; model: string | null } | null {
     if (this.at === 0 || this.entries === null) {
       return null;
     }
     const minutes = Math.max(1, Math.floor((this.now() - this.at) / 60_000));
-    return { entries: this.entries, minutes };
+    return { entries: this.entries, minutes, model: this.model };
   }
 
   /** Drops the cache: an empty history is truth, not something to fall back to. */
   clear(): void {
     this.entries = null;
+    this.model = null;
     this.at = 0;
   }
 }
@@ -553,11 +905,12 @@ export function stateFromFailure(
         kind: 'offline',
         entries: cached?.entries ?? null,
         minutes: cached?.minutes ?? null,
+        model: cached?.model ?? null,
       };
     case 'timeout':
       return cached === null
-        ? { kind: 'offline', entries: null, minutes: null }
-        : { kind: 'stale', minutes: cached.minutes, entries: cached.entries };
+        ? { kind: 'offline', entries: null, minutes: null, model: null }
+        : { kind: 'stale', minutes: cached.minutes, entries: cached.entries, model: cached.model };
     default:
       return { kind: 'error', message: failure.message, raw: failure.raw };
   }
@@ -621,8 +974,8 @@ export async function loadHistory(
     return { kind: 'empty' };
   }
 
-  cache?.mark(parsed.entries);
-  return { kind: 'success', entries: parsed.entries };
+  cache?.mark(parsed.entries, parsed.model);
+  return { kind: 'success', entries: parsed.entries, model: parsed.model };
 }
 
 /* ------------------------------------------------------------------ *
@@ -681,6 +1034,12 @@ export interface TerminalViewModel {
   loading: boolean;
   /** Input enabled: sending needs the PC (offline/error are read-only). */
   canSend: boolean;
+  /** The derived transcript chip: `running | ended | idle`, never `waiting`. */
+  transcript: TranscriptStatus;
+  /** Ordered transcript lines (real `at` ascending) from the PC history. */
+  events: TranscriptEvent[];
+  /** The transcript section has evidence to show (or a real empty history). */
+  transcriptVisible: boolean;
 }
 
 /** `14:32` for an epoch stamp (local time, `--:--` when unusable). */
@@ -739,14 +1098,30 @@ function paneOf(rows: readonly HistoryRow[]): PaneView | null {
  * Build the render model from a §V7 state plus the commands typed here that
  * never ran. Those are appended as `no enviado` rows in every state (they are
  * local truth, not PC truth) and never merged into the PC history.
+ *
+ * The transcript (T7n) is derived from the same PC entries: real `at` stamps,
+ * no fabricated agent events and no `waiting` state. `now` makes the elapsed
+ * copy injectable.
  */
 export function buildTerminalView(
   state: HistoryState,
   local: readonly CommandEntry[] = [],
+  now: number = Date.now(),
 ): TerminalViewModel {
   const notSent = local
     .filter((entry) => entry.status === 'pending')
     .map((entry) => notSentRow(entry));
+
+  const transcriptEntries: CommandEntry[] =
+    state.kind === 'success' || state.kind === 'stale'
+      ? state.entries
+      : state.kind === 'offline' && state.entries !== null
+        ? state.entries
+        : [];
+  const model =
+    state.kind === 'success' || state.kind === 'stale' || state.kind === 'offline'
+      ? (state.model ?? null)
+      : null;
 
   const base: Omit<TerminalViewModel, 'state'> = {
     rows: [],
@@ -761,6 +1136,9 @@ export function buildTerminalView(
     frozen: false,
     loading: false,
     canSend: false,
+    transcript: transcriptState(transcriptEntries, { now, model }),
+    events: transcriptEvents(transcriptEntries),
+    transcriptVisible: state.kind === 'empty' || transcriptEntries.length > 0,
   };
 
   /** Shared projection of a history that may be live or cached. */

@@ -30,6 +30,9 @@ import {
   type HistoryRow,
   type HistoryState,
   type TerminalViewModel,
+  type TranscriptEvent,
+  type TranscriptStatus,
+  AGENT_NOTE,
   CLEAR_LABEL,
   CLEAR_NOTE,
   OUTPUT_DISPLAY_CAP,
@@ -64,6 +67,14 @@ import { colors, elevation, radius, spacing, typography } from '../lib/theme';
  * tapping send records it as `no enviado` with the reason and logs
  * `route pending`. Nothing is echoed and nothing pretends to have run.
  *
+ * The transcript section (T7n) is derived from the same real history: its chip
+ * is only ever `en curso` (newest entry `pending`, with the real elapsed time),
+ * `terminado` (newest entry `sent`/`failed`, with its exit chip) or
+ * `sin actividad` (no entry). There is no agent-stream endpoint, so the section
+ * always carries the honest `sin eventos del agente` note with its reason
+ * instead of a fabricated `waiting` state, and the pane header reads
+ * `pi · <model>` only when the payload named a model (`shell` otherwise).
+ *
  * No `fontFamily` is set anywhere: this app bundles no font, so the platform
  * default is used with the token type scale (see `lib/theme.ts`).
  */
@@ -79,6 +90,38 @@ const EXIT_TONES: Record<ExitTone, { background: string; border: string; text: s
   danger: { background: colors.dangerSoft, border: colors.danger, text: colors.danger },
   neutral: { background: colors.bgSunken, border: colors.border, text: colors.muted },
 };
+
+/** Transcript state chip tones (`en curso` accent, exit tone, `sin actividad`). */
+const TRANSCRIPT_TONES: Record<
+  TranscriptStatus['tone'],
+  { background: string; border: string; text: string }
+> = {
+  running: { background: colors.accentSoft, border: colors.accent, text: colors.accentText },
+  ok: EXIT_TONES.ok,
+  danger: EXIT_TONES.danger,
+  neutral: EXIT_TONES.neutral,
+  muted: { background: colors.bgSunken, border: colors.border, text: colors.faint },
+};
+
+/** `en curso · hace 12 segundos` / `terminado · duró 4 minutos` / `sin actividad`. */
+function transcriptChipLabel(transcript: TranscriptStatus): string {
+  if (transcript.time === null || transcript.timeLabel === null) {
+    return transcript.label;
+  }
+  return `${transcript.label} · ${transcript.timeLabel} ${transcript.time}`;
+}
+
+/** One small chip with a given tone (exit code / transcript state). */
+function Chip({ label, tone }: { label: string; tone: TranscriptStatus['tone'] }) {
+  const palette = TRANSCRIPT_TONES[tone];
+  return (
+    <View
+      style={[styles.chip, { backgroundColor: palette.background, borderColor: palette.border }]}
+      accessibilityLabel={label}>
+      <Text style={[styles.chipText, { color: palette.text }]}>{label}</Text>
+    </View>
+  );
+}
 
 /** Pane / header state label of a §V7 state. */
 function stateLabel(vm: TerminalViewModel): string {
@@ -186,7 +229,9 @@ function OutputPane({ vm, pane }: { vm: TerminalViewModel; pane: TerminalViewMod
   return (
     <View style={styles.terminal} accessibilityLabel="Salida del terminal">
       <View style={styles.terminalBar}>
-        <Text style={styles.terminalTitle}>{'shell'}</Text>
+        <Text style={styles.terminalTitle} numberOfLines={1}>
+          {vm.transcript.agent.label}
+        </Text>
         <Text style={styles.terminalState} numberOfLines={1}>
           {stateLabel(vm)}
         </Text>
@@ -212,6 +257,85 @@ function OutputPane({ vm, pane }: { vm: TerminalViewModel; pane: TerminalViewMod
           </>
         )}
       </View>
+    </View>
+  );
+}
+
+/** One transcript line: real time, kind glyph, and the streamed text. */
+function TranscriptEventRow({ event }: { event: TranscriptEvent }) {
+  return (
+    <View
+      style={styles.eventRow}
+      accessibilityLabel={`${event.atLabel} ${event.kind}: ${event.text}`}>
+      <Text style={styles.eventTime}>{event.atLabel}</Text>
+      <Text
+        style={[
+          styles.eventGlyph,
+          event.kind === 'command' && styles.eventGlyphCommand,
+          event.kind === 'status' && styles.eventGlyphStatus,
+        ]}>
+        {event.glyph}
+      </Text>
+      <View style={styles.eventBody}>
+        {event.kind === 'output' ? (
+          <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+            <Text style={styles.eventOutput} selectable>
+              {event.text === '' ? ' ' : event.text}
+            </Text>
+          </ScrollView>
+        ) : (
+          <Text
+            style={event.kind === 'command' ? styles.eventCommand : styles.eventStatus}
+            numberOfLines={event.kind === 'command' ? 1 : undefined}>
+            {event.text}
+          </Text>
+        )}
+        {event.truncated && (
+          <Text style={styles.eventNote}>{`Salida recortada (${event.hidden} ocultos).`}</Text>
+        )}
+        {event.kind === 'status' && event.exit !== null && (
+          <View style={styles.eventChips}>
+            <Chip label={event.exit.label} tone={event.exit.tone} />
+          </View>
+        )}
+      </View>
+    </View>
+  );
+}
+
+/**
+ * The session transcript (T7n): derived state chip, the streamed lines from the
+ * real history, and the honest note that the bridge serves no agent stream.
+ * There is deliberately no `waiting` card here: nothing publishes that data.
+ */
+function TranscriptSection({ vm }: { vm: TerminalViewModel }) {
+  const transcript = vm.transcript;
+  return (
+    <View style={styles.section} testID="terminal-transcript">
+      <View style={styles.sectionHead}>
+        <Text style={styles.legend}>{'Transcripción'}</Text>
+        <View style={styles.eventChips}>
+          <Chip label={transcriptChipLabel(transcript)} tone={transcript.tone} />
+          {transcript.exit !== null && (
+            <Chip label={transcript.exit.label} tone={transcript.exit.tone} />
+          )}
+        </View>
+      </View>
+
+      <View style={styles.agentNote} accessibilityRole="status">
+        <Text style={styles.agentNoteTitle}>{AGENT_NOTE}</Text>
+        <Text style={styles.agentNoteReason}>{transcript.agentReason}</Text>
+      </View>
+
+      {vm.events.length === 0 ? (
+        <Text style={styles.eventEmpty}>{'Sin comandos registrados para mostrar.'}</Text>
+      ) : (
+        <View style={styles.eventList}>
+          {vm.events.map((event) => (
+            <TranscriptEventRow key={event.id} event={event} />
+          ))}
+        </View>
+      )}
     </View>
   );
 }
@@ -445,6 +569,8 @@ export default function TerminalControlScreen() {
         ) : vm.state === 'error' ? null : (
           <OutputPane vm={vm} pane={pane} />
         )}
+
+        {!vm.loading && vm.transcriptVisible && <TranscriptSection vm={vm} />}
 
         {note !== null && (
           <View style={styles.noteCard} accessibilityRole="status">
@@ -704,6 +830,85 @@ const styles = StyleSheet.create({
   paneNote: {
     ...typography.fine,
     color: colors.warning,
+  },
+  eventList: {
+    gap: 2,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.codeBg,
+  },
+  eventRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: spacing.sm,
+    paddingVertical: 3,
+  },
+  eventTime: {
+    ...typography.fine,
+    color: colors.faint,
+    minWidth: 34,
+  },
+  eventGlyph: {
+    ...typography.fine,
+    color: colors.muted,
+    minWidth: 10,
+    textAlign: 'center',
+  },
+  eventGlyphCommand: {
+    color: colors.accentText,
+    fontWeight: '700',
+  },
+  eventGlyphStatus: {
+    color: colors.deepPink,
+  },
+  eventBody: {
+    flex: 1,
+    gap: 2,
+  },
+  eventCommand: {
+    ...typography.body,
+    fontWeight: '700',
+    color: colors.text,
+  },
+  eventStatus: {
+    ...typography.fine,
+    color: colors.muted,
+  },
+  eventOutput: {
+    ...typography.body,
+    color: colors.text,
+  },
+  eventNote: {
+    ...typography.fine,
+    color: colors.warning,
+  },
+  eventChips: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  eventEmpty: {
+    ...typography.body,
+    color: colors.faint,
+  },
+  agentNote: {
+    gap: 2,
+    padding: spacing.md,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.borderStrong,
+    backgroundColor: colors.bgSunken,
+  },
+  agentNoteTitle: {
+    ...typography.label,
+    color: colors.muted,
+  },
+  agentNoteReason: {
+    ...typography.fine,
+    color: colors.faint,
   },
   skeletonTerminal: {
     opacity: 0.5,

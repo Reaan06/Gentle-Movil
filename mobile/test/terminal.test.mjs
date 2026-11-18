@@ -24,23 +24,34 @@ import { test } from 'node:test';
 
 import { utf8Encode } from '../lib/core.ts';
 import {
+  AGENT_NOTE,
   CommandHistory,
+  DURATION_CAP_COPY,
   EMPTY_COMMAND_COPY,
   EMPTY_COPY,
+  ENDED_LABEL,
   EXEC_HISTORY_PATH,
   EXEC_PATH,
+  IDLE_LABEL,
   INCOMPLETE_HISTORY_COPY,
   MISSING_ENDPOINT_COPY,
+  NO_AGENT_REASON,
   NOT_SENT_REASON,
   OFFLINE_COPY,
+  RUNNING_LABEL,
   SEND_PENDING_NOTE,
+  TRANSCRIPT_STATES,
+  agentHeader,
   appendOutput,
   buildTerminalView,
+  durationCopy,
   exitChip,
   loadHistory,
   renderOutput,
   sendIntent,
   stripAnsi,
+  transcriptEvents,
+  transcriptState,
   truncationMarker,
 } from '../lib/terminal.ts';
 
@@ -512,6 +523,288 @@ test('loading renders skeletons, not an empty history', () => {
   assert.equal(vm.pane, null);
   assert.equal(vm.paneEmpty, null);
   assert.equal(vm.canSend, false);
+});
+
+/* ------------------------------------------------------------------ *
+ * T7n — transcript derived from the real history only
+ * ------------------------------------------------------------------ */
+
+/** One real history entry (the shape `GET /api/exec/history` serves). */
+const realEntry = (extra = {}) => ({
+  id: 'cmd-1',
+  command: 'bun test',
+  at: Date.parse('2026-11-18T14:32:00.000Z'),
+  status: 'sent',
+  exitCode: 0,
+  output: null,
+  ...extra,
+});
+
+const T0 = Date.parse('2026-11-18T14:32:00.000Z');
+
+test('(a) transcript: a pending newest entry is running with the real elapsed time', () => {
+  const entries = [
+    realEntry({ id: 'c1', command: 'ls', at: T0, status: 'sent', exitCode: 0 }),
+    realEntry({ id: 'c2', command: 'bun test', at: T0 + 30_000, status: 'pending', exitCode: null }),
+  ];
+  const state = transcriptState(entries, { now: T0 + 42_000 });
+
+  assert.equal(state.kind, 'running');
+  assert.equal(state.label, RUNNING_LABEL);
+  assert.equal(state.label, 'en curso');
+  assert.equal(state.tone, 'running');
+  // Elapsed is measured from the pending entry's real stamp, not invented.
+  assert.equal(state.timeLabel, 'hace');
+  assert.equal(state.time, '12 segundos');
+  assert.equal(state.exit, null);
+  assert.equal(state.command, 'bun test');
+  assert.equal(state.from, 2);
+
+  // A clock that went backwards never reads a negative elapsed time.
+  assert.equal(transcriptState(entries, { now: T0 }).time, '0 segundos');
+});
+
+test('(a) transcript: an older pending entry does not keep a finished session running', () => {
+  const entries = [
+    realEntry({ id: 'c1', command: 'git status', at: T0, status: 'pending', exitCode: null }),
+    realEntry({ id: 'c2', command: 'ls', at: T0 + 1_000, status: 'sent', exitCode: 0 }),
+  ];
+  assert.equal(transcriptState(entries, { now: T0 + 60_000 }).kind, 'ended');
+});
+
+test('(b) transcript: a sent exit 0 entry is ended with the ok chip', () => {
+  const entries = [
+    realEntry({ id: 'c1', command: 'ls', at: T0 }),
+    realEntry({ id: 'c2', command: 'pwd', at: T0 + 60_000 }),
+  ];
+  const state = transcriptState(entries, { now: T0 + 600_000 });
+
+  assert.equal(state.kind, 'ended');
+  assert.equal(state.label, ENDED_LABEL);
+  assert.equal(state.label, 'terminado');
+  assert.equal(state.tone, 'ok');
+  assert.deepEqual(state.exit, { label: 'exit 0', tone: 'ok' });
+  // The span between the first and the last real stamp, never a guess.
+  assert.equal(state.timeLabel, 'duró');
+  assert.equal(state.time, '1 minuto');
+  assert.equal(state.command, 'pwd');
+
+  // One single entry has no span: no duration is invented.
+  const single = transcriptState([realEntry({ id: 'c9' })], { now: T0 + 60_000 });
+  assert.equal(single.kind, 'ended');
+  assert.equal(single.time, null);
+  assert.equal(single.timeLabel, null);
+});
+
+test('(c) transcript: a failed entry is ended with the danger chip', () => {
+  const failed = transcriptState(
+    [realEntry({ id: 'c1', command: 'bun test', status: 'failed', exitCode: 2 })],
+    { now: T0 + 5_000 },
+  );
+  assert.equal(failed.kind, 'ended');
+  assert.equal(failed.tone, 'danger');
+  assert.deepEqual(failed.exit, { label: 'exit 2', tone: 'danger' });
+
+  // A failed command without a code keeps the neutral chip, not an invented 1.
+  const noCode = transcriptState(
+    [realEntry({ id: 'c1', status: 'failed', exitCode: null })],
+    { now: T0 },
+  );
+  assert.equal(noCode.kind, 'ended');
+  assert.equal(noCode.tone, 'neutral');
+  assert.deepEqual(noCode.exit, { label: 'sin código', tone: 'neutral' });
+});
+
+test('(d) transcript: empty history is idle, never running', () => {
+  const state = transcriptState([], { now: T0 });
+  assert.equal(state.kind, 'idle');
+  assert.equal(state.label, IDLE_LABEL);
+  assert.equal(state.kind === 'running', false);
+  assert.equal(state.time, null);
+  assert.equal(state.timeLabel, null);
+  assert.equal(state.exit, null);
+  assert.equal(state.command, null);
+  assert.equal(state.from, 0);
+
+  // The same evidence through the view model: an empty history is idle.
+  assert.equal(buildTerminalView({ kind: 'empty' }).transcript.kind, 'idle');
+});
+
+test('(e) no agent data: the honest reason, and no fabricated waiting state', () => {
+  assert.equal(AGENT_NOTE, 'sin eventos del agente');
+  assert.deepEqual([...TRANSCRIPT_STATES], ['running', 'ended', 'idle']);
+  assert.equal(TRANSCRIPT_STATES.includes('waiting'), false);
+  // The reason names the real gap: command history, no agent stream, V9 owns it.
+  assert.match(NO_AGENT_REASON, /no expone/);
+  assert.match(NO_AGENT_REASON, /V9/);
+  assert.match(NO_AGENT_REASON, /\/api\/exec\/history/);
+  assert.equal(/esperando al agente/i.test(NO_AGENT_REASON), false);
+
+  const samples = [
+    [],
+    [realEntry({ id: 'p1', status: 'pending', exitCode: null })],
+    [realEntry({ id: 's1', status: 'sent', exitCode: 0 })],
+    [realEntry({ id: 'f1', status: 'failed', exitCode: 1 })],
+  ];
+  for (const entries of samples) {
+    const state = transcriptState(entries, { now: T0 + 1_000 });
+    assert.equal(state.agentNote, AGENT_NOTE);
+    assert.equal(state.agentReason, NO_AGENT_REASON);
+    // Only evidence-backed states, and the state carries no waiting kind at all.
+    assert.ok(TRANSCRIPT_STATES.includes(state.kind));
+    assert.equal('waiting' in state, false);
+  }
+
+  const vm = buildTerminalView({ kind: 'success', entries: [realEntry()] });
+  assert.equal(vm.transcript.agentNote, AGENT_NOTE);
+  assert.equal(vm.transcript.agentReason, NO_AGENT_REASON);
+  assert.equal(vm.transcript.kind, 'ended');
+});
+
+test('(f) agent header: pi · <model> only when the payload carries a real model', async () => {
+  // The served history has no model field: the header stays `shell`.
+  const plain = await loadHistory(okChannel(PAYLOAD), { logger: collectingLogger() });
+  const shell = buildTerminalView(plain).transcript.agent;
+  assert.equal(shell.agent, 'pi');
+  assert.equal(shell.model, null);
+  assert.equal(shell.label, 'shell');
+
+  // A real model in the payload is the only thing that names the agent.
+  const carried = await loadHistory(okChannel({ model: 'opus-4.5', commands: PAYLOAD.commands }), {
+    logger: collectingLogger(),
+  });
+  const named = buildTerminalView(carried).transcript.agent;
+  assert.equal(named.agent, 'pi');
+  assert.equal(named.model, 'opus-4.5');
+  assert.equal(named.label, 'pi · opus-4.5');
+
+  // Anything that is not a usable model name never becomes a header.
+  for (const bad of [null, undefined, '', '   ', 42, {}, []]) {
+    assert.equal(agentHeader(bad).label, 'shell');
+    assert.equal(agentHeader(bad).model, null);
+  }
+  assert.equal(agentHeader(' opus-4.5 ').label, 'pi · opus-4.5');
+});
+
+test('(g) transcript events follow the real `at` ascending, whatever the array order', () => {
+  const entries = [
+    realEntry({ id: 'c3', command: 'git status', at: T0 + 120_000 }),
+    realEntry({
+      id: 'c1',
+      command: 'ls',
+      at: T0,
+      output: `${ESC}[32mok${ESC}[0m\n`,
+    }),
+    realEntry({
+      id: 'c2',
+      command: 'bun test',
+      at: T0 + 60_000,
+      status: 'failed',
+      exitCode: 1,
+      output: 'boom\n',
+    }),
+  ];
+  const events = transcriptEvents(entries);
+
+  const times = events.map((event) => event.at);
+  assert.deepEqual(times, [...times].sort((a, b) => a - b));
+  assert.deepEqual(
+    events.filter((event) => event.kind === 'command').map((event) => event.command),
+    ['ls', 'bun test', 'git status'],
+  );
+  // One command event per entry, plus its output (only when it produced one)
+  // and its status line, in that order for the same real stamp.
+  assert.deepEqual(
+    events.map((event) => event.kind),
+    ['command', 'output', 'status', 'command', 'output', 'status', 'command', 'status'],
+  );
+  // Output is display-ready: escapes stripped, newlines kept, real glyphs.
+  assert.equal(events[0].text, 'ls');
+  assert.equal(events[0].glyph, '$');
+  assert.equal(events[1].text, 'ok\n');
+  assert.match(events[1].atLabel, /^\d{2}:\d{2}$/);
+  assert.equal(events[4].text, 'boom\n');
+  assert.deepEqual(events[5].exit, { label: 'exit 1', tone: 'danger' });
+  assert.equal(events[5].statusLabel, 'falló');
+  assert.deepEqual(events[7].exit, { label: 'exit 0', tone: 'ok' });
+  // Keys are unique and stable, and the caller's array is left untouched.
+  assert.equal(new Set(events.map((event) => event.id)).size, events.length);
+  assert.deepEqual(
+    entries.map((entry) => entry.id),
+    ['c3', 'c1', 'c2'],
+  );
+
+  // A long output is truncated with the existing marker, never silently cut.
+  const long = transcriptEvents([realEntry({ id: 'long', output: 'x'.repeat(25) })], 10);
+  const output = long.find((event) => event.kind === 'output');
+  assert.equal(output.truncated, true);
+  assert.equal(output.hidden, 15);
+  assert.match(output.text, /truncado: 15 caracteres ocultos/);
+
+  // No entries, no events: nothing is invented between entries.
+  assert.deepEqual(transcriptEvents([]), []);
+});
+
+test('(h) duration copy: singular/plural, and a capped ceiling', () => {
+  assert.equal(durationCopy(0), '0 segundos');
+  assert.equal(durationCopy(1_000), '1 segundo');
+  assert.equal(durationCopy(45_000), '45 segundos');
+  assert.equal(durationCopy(60_000), '1 minuto');
+  assert.equal(durationCopy(120_000), '2 minutos');
+  assert.equal(durationCopy(90_000), '1 minuto 30 segundos');
+  assert.equal(durationCopy(3_600_000), '1 hora');
+  assert.equal(durationCopy(2 * 3_600_000 + 5 * 60_000), '2 horas 5 minutos');
+  // Capped: an absurd span reads as a ceiling, never as an invented precision.
+  assert.equal(durationCopy(24 * 3_600_000), 'más de 24 horas');
+  assert.equal(durationCopy(72 * 3_600_000), DURATION_CAP_COPY);
+  // A clock that went backwards or a broken number never reads negative/NaN.
+  assert.equal(durationCopy(-5_000), '0 segundos');
+  assert.equal(durationCopy(Number.NaN), '0 segundos');
+});
+
+test('PRESERVE: the model the PC named survives the cache on a stale read', async () => {
+  const { HistoryCache } = await import('../lib/terminal.ts');
+  const time = clock();
+  const cache = new HistoryCache(time.now);
+  const logger = collectingLogger();
+
+  await loadHistory(okChannel({ model: 'opus-4.5', commands: PAYLOAD.commands }), { cache, logger });
+  time.advance(2 * 60_000);
+  const state = await loadHistory(silentChannel(), { cache, logger, timeoutMs: 20 });
+  assert.equal(state.kind, 'stale');
+
+  const vm = buildTerminalView(state, [], Date.parse('2026-11-18T14:32:00.000Z') + 120_000);
+  assert.deepEqual(
+    vm.rows.map((row) => [row.command, row.exit.label]),
+    [
+      ['ls -la', 'exit 0'],
+      ['bun test', 'exit 1'],
+      ['git status', 'sin código'],
+    ],
+  );
+  assert.equal(vm.pane.command, 'bun test');
+  assert.equal(vm.staleChip, 'Datos de hace 2 min');
+  // The shared PAYLOAD ends in a `pending` entry: the transcript is running.
+  assert.equal(vm.transcript.kind, 'running');
+  assert.equal(vm.transcript.time, '2 minutos');
+  assert.equal(vm.transcript.agent.label, 'pi · opus-4.5');
+});
+
+test('PRESERVE: non-sent local commands never enter the transcript events', async () => {
+  const state = await loadHistory(okChannel(PAYLOAD), { logger: collectingLogger() });
+  const history = new CommandHistory(5, clock().now);
+  history.append({ command: 'rm -rf dist' });
+
+  const vm = buildTerminalView(state, history.entries());
+  assert.equal(vm.notSent.length, 1);
+  assert.deepEqual(
+    [...new Set(vm.events.filter((event) => event.kind === 'command').map((event) => event.command))],
+    ['ls -la', 'bun test', 'git status'],
+  );
+  assert.equal(
+    vm.events.some((event) => event.text.includes('rm -rf dist')),
+    false,
+  );
 });
 
 test('notSent rows stay visible in every state, and are never faked as sent', () => {
