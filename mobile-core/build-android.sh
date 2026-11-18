@@ -12,6 +12,10 @@ set -euo pipefail
 API="${2:-26}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/mobile/android/app/src/main/jniLibs/arm64-v8a/libmobile_core.so"
+# The module copy is the one that survives `expo prebuild --clean`: autolinking
+# re-injects a module's jniLibs into the regenerated android/ tree, while the
+# app-level src/main/jniLibs directory is deleted with the rest of android/.
+MODULE_OUT="$ROOT/mobile/modules/gentle-core/android/src/main/jniLibs/arm64-v8a"
 
 find_ndk() {
   if [ -n "${ANDROID_NDK_HOME:-}" ]; then echo "$ANDROID_NDK_HOME"; return; fi
@@ -58,7 +62,9 @@ if [ -z "$JNI_SYMBOLS" ]; then
   exit 1
 fi
 
-mkdir -p "$(dirname "$OUT")"
+mkdir -p "$(dirname "$OUT")" "$MODULE_OUT"
 cp "$ROOT/mobile-core/target/aarch64-linux-android/release/libmobile_core.so" "$OUT"
+cp "$ROOT/mobile-core/target/aarch64-linux-android/release/libmobile_core.so" "$MODULE_OUT/"
 echo "installed: $OUT ($(stat -c%s "$OUT") bytes)"
+echo "installed: $MODULE_OUT/libmobile_core.so (survives expo prebuild --clean)"
 echo "jni symbols: $(printf '%s\n' "$JNI_SYMBOLS" | wc -l)"

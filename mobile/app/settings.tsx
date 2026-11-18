@@ -18,6 +18,16 @@ import {
 } from '../lib/connection';
 import { logger } from '../lib/logger';
 import {
+  type OnboardingStorage,
+  REPAIR_ACTION_LABEL,
+  REPAIR_DETAIL,
+  REPAIR_FAILED_NOTE,
+  REPAIR_LABEL,
+  REPAIR_PENDING_NOTE,
+  REPAIR_SECTION_TITLE,
+  rePair,
+} from '../lib/onboarding';
+import {
   type AppInfo,
   type PhoneInfo,
   type SettingsAction,
@@ -65,7 +75,12 @@ import { bridgeChannel, getActiveTunnel } from '../lib/tunnel-store';
  *   rejects — never a fake fingerprint;
  * - the two toggles really persist in AsyncStorage (`TOGGLE_STORAGE_KEYS`) and
  *   each row keeps its honest note because the behavior behind it is not
- *   wired yet.
+ *   wired yet;
+ * - the `Volver a emparejar` row is real (task T7p): it clears the
+ *   `gentle-movil:onboarded` flag through `rePair` and pushes the QR scan, so
+ *   an owner who wants to pair again is never trapped inside the app. When the
+ *   store refuses the write, the row says so and the entry still goes back to
+ *   the QR scan.
  *
  * Every action whose destination is not built yet is `pending: true` in the
  * model, so tapping it logs `route pending` and the row keeps the honest note —
@@ -234,6 +249,8 @@ export default function SettingsScreen() {
   const [toggleFailure, setToggleFailure] = useState<string | null>(null);
   const [check, setCheck] = useState<ConnectionCheck | null>(null);
   const [busy, setBusy] = useState(false);
+  const [repairing, setRepairing] = useState(false);
+  const [repairFailure, setRepairFailure] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoadFailure(null);
@@ -332,6 +349,32 @@ export default function SettingsScreen() {
     void runCheck('retry');
   }, [runCheck]);
 
+  /**
+   * Real re-pair action: erase the onboarding flag, then walk the person back to
+   * the QR scan. A store that refuses the write is reported in place and the
+   * navigation still happens (`rePair` returns both facts).
+   */
+  const onRePair = useCallback(() => {
+    if (repairing) {
+      return;
+    }
+    log.info('volver a emparejar');
+    setRepairFailure(null);
+    setRepairing(true);
+    void (async () => {
+      const result = await rePair(AsyncStorage as unknown as OnboardingStorage, log);
+      setRepairing(false);
+      if (!result.cleared) {
+        setRepairFailure(REPAIR_FAILED_NOTE);
+      }
+      try {
+        router.push(result.route);
+      } catch (error) {
+        log.failure('navigate', error, { target: result.route });
+      }
+    })();
+  }, [log, repairing, router]);
+
   const goBack = useCallback(() => {
     if (router.canGoBack()) {
       router.back();
@@ -419,6 +462,38 @@ export default function SettingsScreen() {
               onToggle={onToggle}
             />
           ))}
+
+        {vm !== null && (
+          <View style={styles.section} testID="settings-repair">
+            <Text style={styles.legend}>{REPAIR_SECTION_TITLE}</Text>
+            <View style={styles.card}>
+              <View style={styles.row}>
+                <View style={styles.rowMain}>
+                  <Text style={styles.rowTitle}>{REPAIR_LABEL}</Text>
+                  <Text style={styles.rowSub}>{REPAIR_DETAIL}</Text>
+                  {repairing && <Text style={styles.rowNote}>{REPAIR_PENDING_NOTE}</Text>}
+                  {repairFailure !== null && (
+                    <Text style={styles.rowNote} accessibilityRole="alert">
+                      {repairFailure}
+                    </Text>
+                  )}
+                </View>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={REPAIR_ACTION_LABEL}
+                  accessibilityState={{ busy: repairing, disabled: repairing }}
+                  disabled={repairing}
+                  onPress={onRePair}
+                  style={({ pressed }) => [
+                    styles.linkButton,
+                    pressed && !repairing && styles.linkButtonPressed,
+                  ]}>
+                  <Text style={styles.linkLabel}>{REPAIR_ACTION_LABEL}</Text>
+                </Pressable>
+              </View>
+            </View>
+          </View>
+        )}
 
         {vm !== null && (
           <View style={styles.exportCard}>

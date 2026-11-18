@@ -11,3 +11,7 @@ dist/
 
 # Gentle-Desing (design canvas, not versioned)
 design/
+
+# Native core artefacts: rebuilt by scripts/build-apk.sh (Rust first), never committed
+mobile/android/app/src/main/jniLibs/
+mobile/modules/gentle-core/android/src/main/jniLibs/

@@ -7,91 +7,94 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { GhostButton } from '../components/GhostButton';
 import { PrimaryButton } from '../components/PrimaryButton';
 import { logger } from '../lib/logger';
+import { finishSuiteStep } from '../lib/onboarding';
 import {
+  ALREADY_INSTALLED_NOTE,
   DEFAULT_SELECTION,
-  EMPTY_SUITE_RECORD,
+  PROBE_NOTE,
+  REPROBE_LABEL,
   SUITE_COMPONENTS,
   type AppMode,
   type SuiteComponent,
-  type SuiteInstaller,
-  type SuiteRecord,
   type SuiteSelection,
   type SuiteState,
   type SuiteStorage,
-  installLabel,
+  primaryAction,
   readMode,
-  retryLabel,
-  routeAfterSuite,
-  runSuiteInstall,
+  recordProbe,
+  rowLabel,
+  rowNote,
+  rowSelectable,
+  runSuiteProbe,
   selectedComponents,
-  selectedCount,
   toggleComponent,
 } from '../lib/suite';
 import { colors, elevation, radius, spacing, typography } from '../lib/theme';
 
 /**
- * V21 — suite installer (artboard
+ * V21 — suite capability probe (artboard
  * `design/mobile-app-onboarding/05-suite-install.html`, `docs/mobile-views-plan.md`
- * §V21, owner amendment L10).
+ * §V21, task T7p).
  *
- * Reached from V4 whenever the chosen mode includes local (`ambos` | `local`) and
- * leaves towards the QR scan (V1) — or stays put for `local`, whose root entry is
- * still a stub and is logged as `local route pending`.
+ * Reached from V4 whenever the chosen mode includes local (`ambos` | `local`)
+ * and continues into the app at `/overview` (V5) once the person goes on.
  *
  * This file is only the rendering shell: the selection reducer (with the
- * `gentle-shell` ↔ `engram` dependency), the install runner, the honest
- * `{component, ok, raw}` log and the `gentle-movil:suite` record all live in
- * `mobile/lib/suite.ts` and are covered by `mobile/test/suite-install.test.mjs`.
+ * `gentle-shell` ↔ `engram` dependency), the capability probe, the honest
+ * per-answer log and the `gentle-movil:suite` record all live in
+ * `mobile/lib/suite.ts` and are pinned by `mobile/test/suite-install.test.mjs`.
  *
- * The installer below is a **simulation**: no `fs_*`/FFI primitive of the local
- * mode exists yet, so each component just takes 600–900 ms and reports `ok`. The
- * log says so (`raw: 'simulado · …'`) instead of pretending the suite landed on
- * the device; wiring the real sandbox install is a later slice (T9).
+ * ## What this screen really does
+ *
+ * It **probes**, it does not install. Each row settles on one of the three real
+ * answers `rowLabel` knows — `instalado` / `no instalado` / `no disponible` —
+ * with `rowNote` carrying the real reason. The progress bar exists only while a
+ * probe for that row is really in flight (`state === 'probing'`), so it never
+ * fakes work that is not happening.
+ *
+ * The primary CTA comes from `primaryAction` with `canInstall: false`, because
+ * that is the truth today: the Rust core exposes no local installation, so the
+ * button is the honest `Continuar igual →` (or `Continuar →` when everything
+ * selected is really installed). It is never an «instalar» promise.
  */
 
-/** Visible state of a row in the picker. */
-type RowState = 'picked' | 'idle' | SuiteState;
+/** This build has no local installer: the CTA must never promise one. */
+const CAN_INSTALL = false as const;
 
-const IDLE_STATES: Record<SuiteComponent, SuiteState> = {
+/** Visible state of a row (`'idle'` until its probe runs). */
+type RowState = SuiteState;
+
+const IDLE_STATES: Record<SuiteComponent, RowState> = {
   'gentle-shell': 'idle',
   engram: 'idle',
   'gentle-ai': 'idle',
 };
 
-/** Duration of the simulated install of one component (ms). */
-const SIMULATED_MS = { min: 600, max: 900 } as const;
+const NO_REASONS: Record<SuiteComponent, string | null> = {
+  'gentle-shell': null,
+  engram: null,
+  'gentle-ai': null,
+};
 
-/** Duration of the row progress bar (ms); matches the simulated install. */
-const PROGRESS_MS = 750;
+const EYEBROW_PREFIX = 'revisando tu teléfono · elegiste:';
 
-const EYEBROW_PREFIX = 'preparando tu teléfono · elegiste:';
+const TITLE = 'Qué hay en tu móvil';
 
-const TITLE = 'Instalar Gentle en tu móvil';
-
-const LEDE = 'Elegí qué querés adentro del teléfono para el modo local. Todo queda en el sandbox de la app.';
-
-const NOTE =
-  'Podés instalar todo o solo una parte; lo que desmarques queda para después, desde Ajustes. ' +
-  'gentle-shell necesita engram para recordar.';
-
-/** Simulated installer: honest about being a placeholder until the local FFI lands. */
-function simulatedInstaller(): SuiteInstaller {
-  return async (component) => {
-    const span = SIMULATED_MS.max - SIMULATED_MS.min;
-    const delay = SIMULATED_MS.min + Math.round(Math.random() * span);
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, delay);
-    });
-    return { ok: true, raw: `simulado · ${component} en el sandbox (instalación real: T9)` };
-  };
-}
+const LEDE =
+  'Revisamos el teléfono y te decimos qué componentes ya están. Lo que ya está no se vuelve a instalar.';
 
 /** Tiny icon shapes drawn with Views — no extra SVG dependency in this slice. */
 function SuiteIcon({ state }: { state: RowState }) {
   const tint =
-    state === 'ok' ? colors.ok : state === 'fail' ? colors.danger : state === 'installing' ? colors.accentInk : colors.accentText;
+    state === 'installed'
+      ? colors.ok
+      : state === 'missing'
+        ? colors.warning
+        : state === 'probing'
+          ? colors.accentInk
+          : colors.accentText;
 
-  if (state === 'installing') {
+  if (state === 'probing') {
     return (
       <View style={[styles.icon, styles.iconBusy]}>
         <View style={[styles.promptChevron, { borderColor: colors.accentInk }]} />
@@ -101,7 +104,12 @@ function SuiteIcon({ state }: { state: RowState }) {
   }
 
   return (
-    <View style={[styles.icon, state === 'ok' && styles.iconOk, state === 'fail' && styles.iconFail]}>
+    <View
+      style={[
+        styles.icon,
+        state === 'installed' && styles.iconInstalled,
+        state === 'missing' && styles.iconMissing,
+      ]}>
       <View style={[styles.promptChevron, { borderColor: tint }]} />
       <View style={[styles.promptLine, { backgroundColor: tint }]} />
       <View style={[styles.iconPips, { backgroundColor: tint }]} />
@@ -114,84 +122,103 @@ interface SuiteRowProps {
   name: string;
   description: string;
   state: RowState;
+  reason: string | null;
   checked: boolean;
   locked: boolean;
   onToggle: (component: SuiteComponent) => void;
 }
 
-/** One selectable component row (artboard `.comp`). */
-function SuiteRow({ component, name, description, state, checked, locked, onToggle }: SuiteRowProps) {
+/** One component row (artboard `.comp`): pick it, and see what the probe found. */
+function SuiteRow({
+  component,
+  name,
+  description,
+  state,
+  reason,
+  checked,
+  locked,
+  onToggle,
+}: SuiteRowProps) {
   const progress = useRef(new Animated.Value(0)).current;
-  const installing = state === 'installing';
-  const picked = state === 'picked';
+  const probing = state === 'probing';
 
   useEffect(() => {
-    if (installing) {
+    if (!probing) {
       progress.setValue(0);
-      const animation = Animated.timing(progress, {
-        toValue: 1,
-        duration: PROGRESS_MS,
-        useNativeDriver: false,
-      });
-      animation.start();
-      return () => {
-        animation.stop();
-      };
+      return undefined;
     }
-    progress.setValue(state === 'ok' ? 1 : 0);
-    return undefined;
-  }, [installing, progress, state]);
+    // Indeterminate fill: the probe is a real read that settles in milliseconds,
+    // so the bar only exists while that read is in flight.
+    const animation = Animated.loop(
+      Animated.sequence([
+        Animated.timing(progress, { toValue: 1, duration: 420, useNativeDriver: false }),
+        Animated.timing(progress, { toValue: 0, duration: 0, useNativeDriver: false }),
+      ]),
+    );
+    animation.start();
+    return () => {
+      animation.stop();
+    };
+  }, [probing, progress]);
 
-  const stateLabel =
-    state === 'ok' ? 'instalado' : state === 'fail' ? 'falló' : installing ? 'instalando' : '';
-  const showBar = installing || state === 'ok' || state === 'fail';
+  const label = rowLabel(state);
+  /** `rowLabel` answers '' while idle/probing; the probing row says so. */
+  const displayLabel = label === '' && probing ? 'revisando' : label;
+  const note = rowNote(state, reason);
+  const installed = state === 'installed';
 
   return (
     <Pressable
       accessibilityRole="checkbox"
-      accessibilityState={{ checked: state === 'ok' ? true : checked, disabled: locked }}
+      accessibilityState={{ checked: installed ? true : checked, disabled: locked }}
       accessibilityLabel={`${name}, ${description}`}
-      accessibilityHint={picked || state === 'idle' ? 'Toca para incluir o quitar del grupo' : stateLabel}
+      accessibilityHint={
+        installed
+          ? 'Ya está instalado: no se vuelve a instalar'
+          : locked
+            ? 'Esperá a que termine la revisión'
+            : 'Toca para incluir o quitar del grupo'
+      }
       disabled={locked}
       onPress={() => onToggle(component)}
       style={({ pressed }) => [
         styles.row,
-        picked && styles.rowPicked,
-        installing && styles.rowInstalling,
-        state === 'ok' && styles.rowOk,
-        state === 'fail' && styles.rowFail,
+        checked && !installed && styles.rowPicked,
+        probing && styles.rowProbing,
+        installed && styles.rowInstalled,
+        state === 'missing' && styles.rowMissing,
         pressed && !locked && styles.rowPressed,
-      ]}
-    >
+      ]}>
       <SuiteIcon state={state} />
       <View style={styles.rowText}>
         <Text style={styles.rowName}>{name}</Text>
         <Text style={styles.rowDesc}>{description}</Text>
+        {note !== null && (
+          <Text style={[styles.rowNote, state === 'missing' && styles.rowNoteMissing]}>{note}</Text>
+        )}
       </View>
-      {stateLabel === '' ? (
-        <View style={[styles.marker, picked && styles.markerChecked]}>
-          <Text style={[styles.markerGlyph, picked && styles.markerGlyphChecked]}>✓</Text>
+      {displayLabel === '' ? (
+        <View style={[styles.marker, checked && styles.markerChecked]}>
+          <Text style={[styles.markerGlyph, checked && styles.markerGlyphChecked]}>✓</Text>
         </View>
       ) : (
         <Text
           style={[
             styles.stateLabel,
-            state === 'ok' && styles.stateOk,
-            state === 'fail' && styles.stateFail,
-            installing && styles.stateInstalling,
-          ]}
-        >
-          {stateLabel}
+            installed && styles.stateInstalled,
+            state === 'missing' && styles.stateMissing,
+            probing && styles.stateProbing,
+          ]}>
+          {displayLabel}
         </Text>
       )}
-      {showBar ? (
+      {probing ? (
         <View style={styles.progressTrack}>
           <Animated.View
             style={[
               styles.progressFill,
-              state === 'fail' && styles.progressFail,
               {
-                width: progress.interpolate({ inputRange: [0, 1], outputRange: ['0%', '100%'] }),
+                width: progress.interpolate({ inputRange: [0, 1], outputRange: ['12%', '100%'] }),
               },
             ]}
           />
@@ -206,15 +233,12 @@ export default function SuiteInstallScreen() {
   const insets = useSafeAreaInsets();
   const storage = AsyncStorage as unknown as SuiteStorage;
   const log = useMemo(() => logger.tag('suite-install'), []);
-  const install = useMemo(() => simulatedInstaller(), []);
 
   const [mode, setMode] = useState<AppMode>('ambos');
   const [selection, setSelection] = useState<SuiteSelection>(DEFAULT_SELECTION);
-  const [states, setStates] = useState<Record<SuiteComponent, SuiteState>>(IDLE_STATES);
-  const [record, setRecord] = useState<SuiteRecord>(EMPTY_SUITE_RECORD);
-  const [failed, setFailed] = useState<SuiteComponent[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [settled, setSettled] = useState(false);
+  const [states, setStates] = useState<Record<SuiteComponent, RowState>>(IDLE_STATES);
+  const [reasons, setReasons] = useState<Record<SuiteComponent, string | null>>(NO_REASONS);
+  const [probing, setProbing] = useState(false);
   const inFlight = useRef(false);
 
   useEffect(() => {
@@ -229,111 +253,97 @@ export default function SuiteInstallScreen() {
     };
   }, [log, storage]);
 
-  /** Leaves V21: QR scan for `ambos`, honest stay for `local`. */
-  const finish = useCallback(() => {
-    const target = routeAfterSuite(mode);
-    if (target === null) {
-      log.warn('local route pending', { mode });
+  /**
+   * Runs the real probe over every component. Each row goes `probing` while its
+   * own answer is being read and settles on what the probe really answered; the
+   * runner persists `gentle-movil:suite` after each one and logs every answer.
+   */
+  const probeAll = useCallback(async () => {
+    if (inFlight.current) {
       return;
     }
+    inFlight.current = true;
+    setProbing(true);
+    setReasons(NO_REASONS);
+
+    const result = await runSuiteProbe({
+      components: SUITE_COMPONENTS.map((row) => row.component),
+      // A fresh probe per run: a later real install is never hidden by a cache.
+      probe: recordProbe(storage, log),
+      storage,
+      log,
+      onState: (component, state) => {
+        setStates((previous) => ({ ...previous, [component]: state }));
+      },
+    });
+
+    setReasons((previous) => {
+      const next = { ...previous };
+      for (const outcome of result.outcomes) {
+        next[outcome.component] = outcome.reason;
+      }
+      return next;
+    });
+    setProbing(false);
+    inFlight.current = false;
+    log.info('revisión terminada', {
+      installed: result.installed,
+      missing: result.missing,
+      unsupported: result.unsupported,
+    });
+  }, [log, storage]);
+
+  useEffect(() => {
+    void probeAll();
+  }, [probeAll]);
+
+  /** Leaves V21: the onboarding is done, so the app opens at `/overview` (V5). */
+  const finish = useCallback(async () => {
+    const target = await finishSuiteStep(storage, log);
+    log.info('siguiente paso', { mode, target });
     try {
       router.push(target);
     } catch (error) {
       log.failure('navigate', error, { mode, target });
     }
-  }, [log, mode, router]);
-
-  const start = useCallback(
-    async (components: readonly SuiteComponent[]) => {
-      if (inFlight.current || components.length === 0) {
-        return;
-      }
-      inFlight.current = true;
-      setBusy(true);
-      setSettled(false);
-      setFailed([]);
-      // Only the components of this run go back to idle: a retry keeps the rows
-      // that already installed showing `ok`.
-      setStates((previous) => {
-        const next = { ...previous };
-        for (const component of components) {
-          next[component] = 'idle';
-        }
-        return next;
-      });
-
-      const result = await runSuiteInstall({
-        components,
-        install,
-        storage,
-        log,
-        onState: (component, state) => {
-          setStates((previous) => ({ ...previous, [component]: state }));
-        },
-      });
-
-      setRecord(result.record);
-      setFailed(result.failed);
-      setSettled(true);
-      setBusy(false);
-      inFlight.current = false;
-
-      if (result.failed.length === 0) {
-        finish();
-      }
-    },
-    [finish, install, log, storage],
-  );
+  }, [log, mode, router, storage]);
 
   const toggle = useCallback(
     (component: SuiteComponent) => {
-      if (busy || settled) {
+      if (probing || !rowSelectable(states[component])) {
         return;
       }
       setSelection((previous) => {
         const next = toggleComponent(previous, component);
-        log.info(`selección: ${component}`, { component, checked: next[component], engram: next.engram });
+        log.info(`selección: ${component}`, {
+          component,
+          checked: next[component],
+          engram: next.engram,
+        });
         return next;
       });
     },
-    [busy, log, settled],
+    [log, probing, states],
   );
 
-  const count = selectedCount(selection);
-  const retrying = settled && failed.length > 0;
-  const primaryLabel = retrying ? retryLabel(failed) : installLabel(count);
+  const action = primaryAction(selection, { canInstall: CAN_INSTALL, states });
 
   const onPrimary = useCallback(() => {
-    if (busy) {
+    if (probing || !action.enabled) {
       return;
     }
-    if (retrying) {
-      void start(failed);
+    if (action.kind === 'install') {
+      // Unreachable while `CAN_INSTALL` is false; if it ever becomes reachable
+      // the wiring has to land with the real installer, never a fake one.
+      log.warn('instalación pedida sin instalador', { targets: action.targets });
       return;
     }
-    void start(selectedComponents(selection));
-  }, [busy, failed, retrying, selection, start]);
+    log.info('continuar', { label: action.label, honestContinue: action.honestContinue });
+    void finish();
+  }, [action, finish, log, probing]);
 
-  const onSecondary = useCallback(() => {
-    if (busy) {
-      return;
-    }
-    if (retrying) {
-      log.warn('continuar de todos modos', { failed, record });
-      finish();
-      return;
-    }
-    setSelection(DEFAULT_SELECTION);
-    void start(SUITE_COMPONENTS.map((row) => row.component));
-  }, [busy, failed, finish, log, record, retrying, start]);
-
-  const rowState = (component: SuiteComponent): RowState => {
-    const state = states[component];
-    if (state !== 'idle' || settled) {
-      return state === 'idle' ? 'idle' : state;
-    }
-    return selection[component] ? 'picked' : 'idle';
-  };
+  const allSelectedInstalled =
+    action.honestContinue === false && action.targets.length === 0 && action.enabled;
 
   return (
     <View style={styles.screen}>
@@ -349,11 +359,14 @@ export default function SuiteInstallScreen() {
           </Text>
         </View>
         <View style={styles.chip}>
-          <Text style={styles.chipText}>suite en el móvil</Text>
+          <Text style={styles.chipText}>revisión del teléfono</Text>
         </View>
       </View>
 
-      <ScrollView style={styles.flex} contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+      <ScrollView
+        style={styles.flex}
+        contentContainerStyle={styles.content}
+        showsVerticalScrollIndicator={false}>
         <Text style={styles.eyebrow}>{`${EYEBROW_PREFIX} ${mode}`}</Text>
         <Text style={styles.h1} accessibilityRole="header">
           {TITLE}
@@ -367,9 +380,10 @@ export default function SuiteInstallScreen() {
               component={row.component}
               name={row.name}
               description={row.description}
-              state={rowState(row.component)}
+              state={states[row.component]}
+              reason={reasons[row.component]}
               checked={selection[row.component]}
-              locked={busy || settled}
+              locked={probing || !rowSelectable(states[row.component])}
               onToggle={toggle}
             />
           ))}
@@ -379,31 +393,37 @@ export default function SuiteInstallScreen() {
           <View style={styles.noteBullet}>
             <Text style={styles.noteGlyph}>i</Text>
           </View>
-          <Text style={styles.noteText}>{NOTE}</Text>
+          <Text style={styles.noteText}>
+            {PROBE_NOTE}
+            {allSelectedInstalled ? ` ${ALREADY_INSTALLED_NOTE}` : ''}
+          </Text>
         </View>
       </ScrollView>
 
       <View style={[styles.dock, { paddingBottom: insets.bottom + spacing.xxl }]}>
         <PrimaryButton
-          label={primaryLabel}
+          label={action.label}
           onPress={onPrimary}
-          disabled={busy || (!retrying && count === 0)}
+          disabled={!action.enabled || probing}
+          loading={probing}
           accessibilityHint={
-            retrying
-              ? 'Vuelve a intentar solo los componentes que fallaron'
-              : 'Instala los componentes marcados en el sandbox de la app'
+            action.honestContinue
+              ? 'Sigue con lo que el teléfono ya tiene; acá no se instala nada'
+              : 'Continúa al panel de tu móvil'
           }
         />
         <GhostButton
-          label={retrying ? 'Continuar de todos modos →' : 'Instalar todo'}
-          onPress={onSecondary}
-          disabled={busy}
-          accessibilityHint={
-            retrying
-              ? 'Sigue con lo que sí se instaló; el resto queda para Ajustes'
-              : 'Marca los tres componentes e instálalos'
-          }
+          label={REPROBE_LABEL}
+          onPress={() => {
+            void probeAll();
+          }}
+          disabled={probing}
+          accessibilityHint="Vuelve a revisar el teléfono con el registro actual"
         />
+        <Text style={styles.fine}>
+          Seleccionados: {selectedComponents(selection).length} · nada se instala ni se borra en este
+          paso.
+        </Text>
       </View>
     </View>
   );
@@ -510,16 +530,16 @@ const styles = StyleSheet.create({
     backgroundColor: colors.accentSoft,
     ...elevation.glow,
   },
-  rowInstalling: {
+  rowProbing: {
     borderColor: colors.borderStrong,
     backgroundColor: colors.accentSoft,
   },
-  rowOk: {
+  rowInstalled: {
     borderColor: colors.ok,
   },
-  rowFail: {
-    borderColor: colors.danger,
-    backgroundColor: colors.dangerSoft,
+  rowMissing: {
+    borderColor: colors.warning,
+    backgroundColor: colors.warningSoft,
   },
   rowPressed: {
     borderColor: colors.borderStrong,
@@ -539,11 +559,11 @@ const styles = StyleSheet.create({
     borderColor: colors.accent,
     backgroundColor: colors.accent,
   },
-  iconOk: {
+  iconInstalled: {
     borderColor: colors.ok,
   },
-  iconFail: {
-    borderColor: colors.danger,
+  iconMissing: {
+    borderColor: colors.warning,
   },
   promptChevron: {
     width: 8,
@@ -579,6 +599,14 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     color: colors.faint,
   },
+  rowNote: {
+    fontSize: 11,
+    lineHeight: 17,
+    color: colors.muted,
+  },
+  rowNoteMissing: {
+    color: colors.warning,
+  },
   marker: {
     width: 24,
     height: 24,
@@ -607,13 +635,13 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     color: colors.faint,
   },
-  stateOk: {
+  stateInstalled: {
     color: colors.ok,
   },
-  stateFail: {
-    color: colors.danger,
+  stateMissing: {
+    color: colors.warning,
   },
-  stateInstalling: {
+  stateProbing: {
     color: colors.accentText,
   },
   progressTrack: {
@@ -627,9 +655,6 @@ const styles = StyleSheet.create({
     height: '100%',
     borderRadius: radius.pill,
     backgroundColor: colors.accent,
-  },
-  progressFail: {
-    backgroundColor: colors.danger,
   },
   note: {
     flexDirection: 'row',
@@ -671,5 +696,11 @@ const styles = StyleSheet.create({
     borderTopWidth: 1,
     borderTopColor: colors.border,
     backgroundColor: colors.bg,
+  },
+  fine: {
+    textAlign: 'center',
+    fontSize: 11,
+    lineHeight: 18,
+    color: colors.faint,
   },
 });

@@ -5,7 +5,8 @@ import { useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { logger } from '../lib/logger';
-import { MODE_STORAGE_KEY, routeForMode, type AppMode } from '../lib/suite';
+import { type OnboardingStorage, finishModeChoice } from '../lib/onboarding';
+import { MODE_STORAGE_KEY, type AppMode } from '../lib/suite';
 import { colors, elevation, radius, spacing, typography } from '../lib/theme';
 
 /**
@@ -14,14 +15,18 @@ import { colors, elevation, radius, spacing, typography } from '../lib/theme';
  * §V4).
  *
  * Three radio cards (`Ambos` preselected) and one CTA that persists the choice
- * in `AsyncStorage` under `gentle-movil:mode` before routing. The route depends
- * on whether local is included (`routeForMode` in `mobile/lib/suite.ts`):
+ * in `AsyncStorage` under `gentle-movil:mode` before routing. Where it goes is
+ * `finishModeChoice` in `mobile/lib/onboarding.ts` (task T7p):
  *
- * - `conectado` → V1 (`/scan-qr`), the PC side of the flow;
- * - `ambos` → V21 suite installer (`/suite-install`), which continues to V1;
- * - `local` → V21 suite installer too; the local root is still a stub, so V21
- *   logs `local route pending` instead of pretending a route exists (never
- *   silently swallowed).
+ * - `conectado` → the onboarding is done here (that mode has no phone-side
+ *   install): the `gentle-movil:onboarded` flag is written and the app opens at
+ *   `/overview` (V5);
+ * - `ambos` → V21 capability probe (`/suite-install`), which finishes the
+ *   onboarding and continues to `/overview`;
+ * - `local` → V21 too (same phone-side step), then `/overview`.
+ *
+ * The flag is what makes the next cold start skip the QR scan; Ajustes can
+ * always send the owner back to it (`Volver a emparejar`).
  */
 
 /** AsyncStorage key of the persisted mode (also read by V21). */
@@ -111,14 +116,18 @@ export default function ModeChoiceScreen() {
       // remembered — say so instead of pretending it was saved.
       log.failure('persist-mode', error, null);
     }
-    // `ambos` and `local` both install the phone-side suite first (V21, owner
-    // amendment L10); only `conectado` goes straight to the QR scan.
-    const target = routeForMode(mode);
-    log.info('siguiente paso', { mode, target });
+    // `conectado` finishes the onboarding right here; `ambos` and `local` still
+    // have the phone-side suite step (V21), which writes the flag itself.
+    const exit = await finishModeChoice(
+      AsyncStorage as unknown as OnboardingStorage,
+      mode,
+      log,
+    );
+    log.info('siguiente paso', { mode, target: exit.route, onboardedNow: exit.onboardedNow });
     try {
-      router.push(target);
+      router.push(exit.route);
     } catch (error) {
-      log.failure('navigate', error, { mode, target });
+      log.failure('navigate', error, { mode, target: exit.route });
     } finally {
       setSaving(false);
     }
