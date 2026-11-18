@@ -17,7 +17,7 @@
 //! |---|---|---|
 //! | [`gc_abi_version`] | – | `u32` ([`ABI_VERSION`]) |
 //! | [`gc_pair_from_qr`] | URI | `{"ok":true,"pair":{...}}` |
-//! | [`gc_ssh_connect`] | connect config JSON | `{"ok":true,"sessionId":N}` |
+//! | [`gc_ssh_connect`] | connect config JSON | `{"ok":true,"sessionId":N,"result":{"sessionId":N,"fingerprint":"…"}}` |
 //! | [`gc_provision_step`] | session id + step JSON | `{"ok":true,"step":"…","result":{…}}` |
 //! | [`gc_device_key_generate`] | – | `{"ok":true,"key":{"public_hex":"…","secret":{"secret_seed":[..]}}}` |
 //! | [`gc_free`] | pointer from any `gc_*` | – |
@@ -56,8 +56,8 @@ use crate::error::CoreError;
 use crate::ffi::{CoreErrorPayload, MobileCore, SessionId};
 use crate::fingerprint;
 use crate::provision::{
-    detect_host, register_device, rollback, start_daemon, upload_daemon, verify_manifest,
-    ReleaseManifest,
+    detect_host, register_device, rollback, run_step_command, start_daemon, upload_daemon,
+    verify_manifest, OpenForward, ReleaseManifest, TunnelForward, TunnelResult,
 };
 use crate::ssh::Transport;
 use crate::ssh::{SshCredential, DAEMON_PORT};
@@ -147,7 +147,13 @@ pub extern "C" fn gc_pair_from_qr(uri: *const c_char) -> *mut c_char {
 /// (`{"kind":"password","value":"…"}` or
 /// `{"kind":"key","value":{"private":[..],"passphrase":null}}`).
 ///
-/// Output: `{"ok":true,"sessionId":N}`.
+/// Output: `{"ok":true,"sessionId":N,"result":{"sessionId":N,"fingerprint":"<64 hex>"}}`.
+///
+/// `result.fingerprint` is the SHA-256 of the host key the handshake actually saw, in
+/// lowercase compact hex — exactly what `mobile/lib/provision.ts` normalizes and compares
+/// with the QR's `fp` (TOFU, §1/§8). It is **omitted** when the transport reported no key,
+/// so the app fails honestly instead of reading an invented value. The top-level
+/// `sessionId` stays for the frozen v1 readers; new readers use the `result` record.
 #[no_mangle]
 pub extern "C" fn gc_ssh_connect(cfg_json: *const c_char) -> *mut c_char {
     json_call(|| {
@@ -159,7 +165,25 @@ pub extern "C" fn gc_ssh_connect(cfg_json: *const c_char) -> *mut c_char {
         let session_id =
             block_on(core.ssh_connect(config.host, config.port, config.user, config.credential))?
                 .map_err(AbiError::from)?;
-        Ok(json!({ "ok": true, "sessionId": session_id }))
+        let host_fingerprint = fingerprint::normalize(
+            &core
+                .session_fingerprint_compact(session_id)
+                .map_err(AbiError::from)?,
+        );
+        let answer = match host_fingerprint {
+            Some(host_fingerprint) => json!({
+                "ok": true,
+                "sessionId": session_id,
+                "result": { "sessionId": session_id, "fingerprint": host_fingerprint },
+            }),
+            // No key was reported: the field is absent, never a placeholder value.
+            None => json!({
+                "ok": true,
+                "sessionId": session_id,
+                "result": { "sessionId": session_id },
+            }),
+        };
+        Ok(answer)
     })
 }
 
@@ -169,12 +193,21 @@ pub extern "C" fn gc_ssh_connect(cfg_json: *const c_char) -> *mut c_char {
 ///
 /// | `step` | accepted fields | `result` record |
 /// |---|---|---|
-/// | `detect` | – | `HostInfo` (`os`, `arch`, `family`) |
+/// | `detect` | `command` (optional) | `CommandResult` (`exit_code`, `stdout`, `stderr`), or `HostInfo` (`os`, `arch`, `family`) without `command` |
 /// | `upload` | `remotePath`, `dataHex` | `UploadResult` (`remote_path`, `bytes_written`) |
 /// | `verify` | `releasePubkeyHex`, `dataHex`, `manifest` | `VerifyReport` (`sha256`, `verified`) |
 /// | `start` | `remotePath`, `port` (default 43722) | `StartResult` (`pid`, `port`) |
-/// | `register` | `devicePubkeyHex`, `inviteToken`, `deviceName` | `Registration` (`device_id`, `daemon_version`) |
+/// | `register` | `command`/`script` (pivot), else `devicePubkeyHex`, `inviteToken`, `deviceName` | `CommandResult`, or `Registration` (`device_id`, `daemon_version`) |
 /// | `rollback` | `remotePath` | `RollbackResult` (`remote_path`, `restored_from`) |
+/// | `tunnel` | `forwards` (`[{host, port}]`) | `TunnelResult` (`forwards: [{host, port, channel_id}]`) |
+///
+/// `detect` with a `command` (the loopback probe of the pivot, S4/S5), `register` with a
+/// `command` (or `script`: the idempotent `authorized_keys` install) run that script through
+/// the `exec` primitive under `sh -c`; a non-zero exit is an `ssh` error naming the code and
+/// output, so the flow never falls through to the next step. `tunnel` opens one
+/// `direct-tcpip` channel per forward with the existing tunnel primitive and reports the
+/// channel handle, which is how the app reaches the extension's loopback ports (the core
+/// binds no local port). Every pre-pivot step keeps its exact behaviour.
 ///
 /// `manifest` is the signed release manifest `{"sha256":"<64 hex>","signature":"<hex>"}`,
 /// whose signature covers the `sha256` string (§3.2).
@@ -266,8 +299,12 @@ fn default_ssh_port() -> u16 {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "step", rename_all = "snake_case")]
 enum ProvisionStep {
-    /// `uname -s -m` detection (§3.1).
-    Detect,
+    /// `uname -s -m` detection (§3.1); with `command`, the pivot's loopback probe (S4).
+    Detect {
+        /// Shell script the TS flow composed; absent for the legacy host detection.
+        #[serde(default)]
+        command: Option<String>,
+    },
     /// SFTP upload plus `chmod +x` (§3.2, §3.3).
     Upload {
         /// Remote path of the daemon binary.
@@ -297,23 +334,32 @@ enum ProvisionStep {
         #[serde(default = "default_daemon_port")]
         port: u16,
     },
-    /// Device registration through the tunnel (§2).
+    /// Device registration through the tunnel (§2), or the pivot's `authorized_keys`
+    /// install when the step carries `command`/`script` instead (S4).
     Register {
         /// Device ed25519 public key, as hex.
-        #[serde(rename = "devicePubkeyHex")]
-        device_pubkey_hex: String,
+        #[serde(default, rename = "devicePubkeyHex")]
+        device_pubkey_hex: Option<String>,
         /// Single-use invite token from the QR.
-        #[serde(rename = "inviteToken")]
-        invite_token: String,
+        #[serde(default, rename = "inviteToken")]
+        invite_token: Option<String>,
         /// Name the host shows for this phone.
-        #[serde(rename = "deviceName")]
-        device_name: String,
+        #[serde(default, rename = "deviceName")]
+        device_name: Option<String>,
+        /// Shell script to run instead of the daemon claim (`script` is an accepted alias).
+        #[serde(default, alias = "script")]
+        command: Option<String>,
     },
     /// Restore `<remotePath>.prev` after a failed start (§5).
     Rollback {
         /// Remote path of the daemon binary.
         #[serde(rename = "remotePath")]
         remote_path: String,
+    },
+    /// Open the app's forwards to the extension's loopback ports (§4, S4).
+    Tunnel {
+        /// Forwards to open, in order.
+        forwards: Vec<TunnelForward>,
     },
 }
 
@@ -330,10 +376,19 @@ async fn run_step(
 ) -> Result<Value, AbiError> {
     let session = core.session(session_id).map_err(AbiError::from)?;
     match step {
-        ProvisionStep::Detect => {
-            let info = detect_host(&session).await.map_err(AbiError::from)?;
-            step_result("detect", &info)
-        }
+        ProvisionStep::Detect { command } => match command {
+            // Pivot (S4): the app composes the loopback probe, the core runs it.
+            Some(command) => {
+                let result = run_step_command(&session, "detect", &command)
+                    .await
+                    .map_err(AbiError::from)?;
+                step_result("detect", &result)
+            }
+            None => {
+                let info = detect_host(&session).await.map_err(AbiError::from)?;
+                step_result("detect", &info)
+            }
+        },
         ProvisionStep::Upload {
             remote_path,
             data_hex,
@@ -364,7 +419,22 @@ async fn run_step(
             device_pubkey_hex,
             invite_token,
             device_name,
+            command,
         } => {
+            // Pivot (S4): the app composed the `authorized_keys` install, so run it.
+            if let Some(command) = command.filter(|command| !command.trim().is_empty()) {
+                let result = run_step_command(&session, "register", &command)
+                    .await
+                    .map_err(AbiError::from)?;
+                return step_result("register", &result);
+            }
+            let (Some(device_pubkey_hex), Some(invite_token), Some(device_name)) =
+                (device_pubkey_hex, invite_token, device_name)
+            else {
+                return Err(AbiError::input(
+                    "the register step needs a command (or script) to run, or devicePubkeyHex, inviteToken and deviceName for the daemon claim",
+                ));
+            };
             let result = register_device(&session, &device_pubkey_hex, &invite_token, &device_name)
                 .await
                 .map_err(AbiError::from)?;
@@ -375,6 +445,30 @@ async fn run_step(
                 .await
                 .map_err(AbiError::from)?;
             step_result("rollback", &result)
+        }
+        ProvisionStep::Tunnel { forwards } => {
+            if forwards.is_empty() {
+                return Err(AbiError::input(
+                    "the tunnel step needs at least one forward ({host, port})",
+                ));
+            }
+            let mut opened = Vec::with_capacity(forwards.len());
+            for forward in forwards {
+                forward.validate().map_err(AbiError::from)?;
+                // Existing tunnel primitive (and its channel registry), one channel per
+                // forward: the app reads and writes each through its channel id.
+                let host = forward.host.trim().to_string();
+                let channel_id = core
+                    .ssh_direct_tcp(session_id, host.clone(), forward.port)
+                    .await
+                    .map_err(AbiError::from)?;
+                opened.push(OpenForward {
+                    host,
+                    port: forward.port,
+                    channel_id,
+                });
+            }
+            step_result("tunnel", &TunnelResult { forwards: opened })
         }
     }
 }

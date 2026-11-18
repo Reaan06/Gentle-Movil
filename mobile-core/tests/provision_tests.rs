@@ -54,9 +54,12 @@ struct Shared {
     tcp: Mutex<VecDeque<TcpReply>>,
     sftp: Mutex<VecDeque<ChannelEvent>>,
     tcp_writes: Mutex<Vec<Vec<u8>>>,
+    tcp_targets: Mutex<Vec<(String, u16)>>,
     sftp_writes: Mutex<Vec<Vec<u8>>>,
     /// Commands whose `execOnce` never completes (a host stalled mid-command).
     stalled_exec: Mutex<Vec<String>>,
+    /// Host key fingerprint the scripted handshake reports (`""` = it saw no key).
+    fingerprint: Mutex<String>,
 }
 
 impl Shared {
@@ -106,6 +109,11 @@ impl Shared {
         self.tcp_writes.lock().expect("writes").clone()
     }
 
+    /// `(host, port)` of every direct-tcpip open the core requested.
+    fn tcp_targets(&self) -> Vec<(String, u16)> {
+        self.tcp_targets.lock().expect("targets").clone()
+    }
+
     fn written_sftp(&self) -> Vec<Vec<u8>> {
         self.sftp_writes.lock().expect("writes").clone()
     }
@@ -133,7 +141,11 @@ struct ScriptedSession {
 
 impl TransportSession for ScriptedSession {
     fn host_key_fingerprint(&self) -> String {
-        FP.to_string()
+        self.shared
+            .fingerprint
+            .lock()
+            .expect("fingerprint")
+            .clone()
     }
 
     fn exec_once<'a>(
@@ -156,9 +168,14 @@ impl TransportSession for ScriptedSession {
 
     fn direct_tcpip<'a>(
         &'a self,
-        _target_host: &'a str,
-        _target_port: u16,
+        target_host: &'a str,
+        target_port: u16,
     ) -> BoxFuture<'a, Result<Box<dyn TransportChannel>, mobile_core::CoreError>> {
+        self.shared
+            .tcp_targets
+            .lock()
+            .expect("targets")
+            .push((target_host.to_string(), target_port));
         let reply = self.shared.pop_tcp();
         match reply {
             TcpReply::Failure(reason) => {
@@ -259,7 +276,10 @@ impl TransportChannel for SftpChannel {
 // --------------------------------------------------------------------------------------
 
 fn shared() -> Arc<Shared> {
-    Arc::new(Shared::default())
+    Arc::new(Shared {
+        fingerprint: Mutex::new(FP.to_string()),
+        ..Shared::default()
+    })
 }
 
 async fn mock_session(shared: &Arc<Shared>) -> SshSession {
@@ -1420,4 +1440,363 @@ fn c_abi_reports_a_bad_verify_as_a_crypto_error() {
         .as_str()
         .expect("message")
         .contains("checksum mismatch"));
+}
+
+// --------------------------------------------------------------------------------------
+// The pivot flow (S4/S5/S7): connect reports the host key, detect/register run the
+// commands the TS flow composes, and tunnel opens the forwards it asks for.
+// --------------------------------------------------------------------------------------
+
+/// Loopback probe shaped like `loopbackProbeScript` in `mobile/lib/provision.ts`: POSIX
+/// constructs plus a single-quoted format, so the core must run it through `sh -c`.
+const PROBE_SCRIPT: &str =
+    "_found=\"\"\nfor _port in 43721 43722; do\n  printf '%s\\n' \"$_port\"\ndone";
+
+/// `authorized_keys` line the phone installs, exactly as `mobile/lib/provision.ts` composes it.
+const AUTHORIZED_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIABQ gentle-movil";
+
+/// `authorized_keys` install shaped like `authorizedKeysScript` in `mobile/lib/provision.ts`.
+const REGISTER_SCRIPT: &str = "umask 077\nmkdir -p \"$HOME/.ssh\"\ntouch \"$HOME/.ssh/authorized_keys\"\ngrep -qxF 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIABQ gentle-movil' \"$HOME/.ssh/authorized_keys\" || printf '%s\\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIABQ gentle-movil' >> \"$HOME/.ssh/authorized_keys\"";
+
+/// Install the scripted transport in the process-wide facade and open one session.
+fn abi_connect_answer(script: &Arc<Shared>) -> serde_json::Value {
+    cabi::install_test_transport(Arc::new(ScriptedTransport {
+        shared: Arc::clone(script),
+    }));
+    let config = CString::new(
+        r#"{"host":"host","port":22,"user":"reaan","credential":{"kind":"password","value":"pw"}}"#,
+    )
+    .expect("no NUL");
+    call_json(cabi::gc_ssh_connect(config.as_ptr()))
+}
+
+/// Same as [`abi_connect_answer`], reduced to the session id the next steps need.
+fn abi_connect(script: &Arc<Shared>) -> u64 {
+    let answer = abi_connect_answer(script);
+    assert_eq!(answer["ok"], true, "{answer}");
+    answer["sessionId"].as_u64().expect("session id")
+}
+
+/// One `gc_provision_step` call from a JSON payload, releasing the answer.
+fn provision_step(session_id: u64, payload: serde_json::Value) -> serde_json::Value {
+    let step = CString::new(payload.to_string()).expect("no NUL");
+    call_json(cabi::gc_provision_step(session_id, step.as_ptr()))
+}
+
+#[test]
+fn connect_reports_the_host_fingerprint_the_handshake_saw() {
+    let _guard = abi_guard();
+    let script = shared();
+    let connected = abi_connect_answer(&script);
+
+    assert_eq!(connected["ok"], true, "{connected}");
+    // The pivot flow reads the session and the fingerprint from the `result` record.
+    assert_eq!(connected["sessionId"], connected["result"]["sessionId"]);
+    assert_eq!(connected["result"]["sessionId"], 1);
+    assert_eq!(connected["result"]["fingerprint"], FP);
+    let fingerprint = connected["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+    assert_eq!(fingerprint.len(), 64);
+    assert!(
+        fingerprint
+            .chars()
+            .all(|character| character.is_ascii_digit() || ('a'..='f').contains(&character)),
+        "the fingerprint must be lowercase hex: {fingerprint}"
+    );
+}
+
+#[test]
+fn connect_normalizes_the_reported_fingerprint_to_lowercase_hex() {
+    let _guard = abi_guard();
+    let script = shared();
+    *script.fingerprint.lock().expect("fingerprint") =
+        mobile_core::fingerprint::with_colons(&FP.to_ascii_uppercase());
+
+    // Same shape `provision.ts` normalizes: no `SHA256:` prefix, no separators, lowercase.
+    let connected = abi_connect_answer(&script);
+    assert_eq!(connected["result"]["fingerprint"], FP);
+}
+
+#[test]
+fn connect_omits_the_fingerprint_when_the_handshake_reported_none() {
+    let _guard = abi_guard();
+    let script = shared();
+    script.fingerprint.lock().expect("fingerprint").clear();
+
+    let connected = abi_connect_answer(&script);
+    assert_eq!(connected["ok"], true, "{connected}");
+    assert_eq!(connected["result"]["sessionId"], 1);
+    assert!(
+        connected["result"].get("fingerprint").is_none(),
+        "no key was reported, so no value may be invented: {connected}"
+    );
+}
+
+#[test]
+fn detect_step_without_a_command_still_detects_the_host() {
+    // PRESERVE: the pre-pivot `detect` (no `command`) keeps answering HostInfo unchanged.
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_exec(exec_ok("Linux aarch64\n"));
+
+    let answer = provision_step(
+        session_id,
+        serde_json::json!({ "sessionId": session_id, "step": "detect" }),
+    );
+
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["result"]["os"], "linux");
+    assert_eq!(answer["result"]["arch"], "aarch64");
+    assert_eq!(answer["result"]["family"], "unix");
+    assert_eq!(script.commands(), vec!["uname -s -m".to_string()]);
+}
+
+#[test]
+fn detect_step_runs_the_probe_command_the_flow_sent() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_exec(exec_ok(" 43721 43722\n"));
+
+    let answer = provision_step(
+        session_id,
+        serde_json::json!({
+            "sessionId": session_id,
+            "step": "detect",
+            "ports": [43721, 43722],
+            "command": PROBE_SCRIPT,
+        }),
+    );
+
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["step"], "detect");
+    assert_eq!(answer["result"]["exit_code"], 0);
+    assert_eq!(answer["result"]["stdout"], " 43721 43722\n");
+    assert_eq!(answer["result"]["stderr"], "");
+    assert_eq!(script.commands(), vec![posix_command(PROBE_SCRIPT)]);
+}
+
+#[test]
+fn detect_step_fails_honestly_when_the_probe_exits_nonzero() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_exec(ExecOutput {
+        exit_code: 1,
+        stdout: b" 43721\n".to_vec(),
+        stderr: b"43722 refused\n".to_vec(),
+    });
+
+    let answer = provision_step(
+        session_id,
+        serde_json::json!({
+            "sessionId": session_id,
+            "step": "detect",
+            "ports": [43721, 43722],
+            "command": PROBE_SCRIPT,
+        }),
+    );
+
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["kind"], "ssh");
+    let message = answer["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("detect failed with exit code 1"),
+        "the exit code must reach the log: {message}"
+    );
+    assert!(
+        message.contains("43722 refused"),
+        "the command output must reach the log: {message}"
+    );
+    // Only the probe ran: register/tunnel must not follow a failed detect.
+    assert_eq!(script.commands(), vec![posix_command(PROBE_SCRIPT)]);
+    assert!(script.tcp_targets().is_empty());
+}
+
+#[test]
+fn register_step_runs_the_authorized_keys_script_the_flow_sent() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_exec(exec_ok(""));
+
+    let answer = provision_step(
+        session_id,
+        serde_json::json!({
+            "sessionId": session_id,
+            "step": "register",
+            "devicePubkeyHex": DEVICE_PUBKEY,
+            "authorizedKey": AUTHORIZED_KEY,
+            "deviceName": "Gentle Movil",
+            "command": REGISTER_SCRIPT,
+        }),
+    );
+
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["step"], "register");
+    assert_eq!(answer["result"]["exit_code"], 0);
+    assert_eq!(script.commands(), vec![posix_command(REGISTER_SCRIPT)]);
+}
+
+#[test]
+fn register_step_accepts_the_script_field_as_the_command() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_exec(exec_ok(""));
+
+    let answer = provision_step(
+        session_id,
+        serde_json::json!({
+            "sessionId": session_id,
+            "step": "register",
+            "devicePubkeyHex": DEVICE_PUBKEY,
+            "deviceName": "Gentle Movil",
+            "script": REGISTER_SCRIPT,
+        }),
+    );
+
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(script.commands(), vec![posix_command(REGISTER_SCRIPT)]);
+}
+
+#[test]
+fn register_step_without_a_command_or_daemon_fields_is_rejected() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+
+    let answer = provision_step(
+        session_id,
+        serde_json::json!({
+            "sessionId": session_id,
+            "step": "register",
+            "devicePubkeyHex": DEVICE_PUBKEY,
+            "authorizedKey": AUTHORIZED_KEY,
+            "deviceName": "Gentle Movil",
+        }),
+    );
+
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["kind"], "input");
+    let message = answer["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("command") && message.contains("inviteToken"),
+        "the rejection must name both accepted shapes: {message}"
+    );
+    assert!(script.commands().is_empty(), "nothing may run for a refused step");
+}
+
+#[test]
+fn tunnel_step_opens_every_forward_and_reports_the_channels() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_tcp(TcpReply::Events(vec![]));
+    script.push_tcp(TcpReply::Events(vec![]));
+
+    let answer = provision_step(
+        session_id,
+        serde_json::json!({
+            "sessionId": session_id,
+            "step": "tunnel",
+            "forwards": [
+                { "host": "127.0.0.1", "port": 43721 },
+                { "host": "127.0.0.1", "port": 43722 },
+            ],
+        }),
+    );
+
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["step"], "tunnel");
+    let forwards = answer["result"]["forwards"].as_array().expect("forwards");
+    assert_eq!(forwards.len(), 2, "{forwards:?}");
+    assert_eq!(forwards[0]["host"], "127.0.0.1");
+    assert_eq!(forwards[0]["port"], 43721);
+    assert_eq!(forwards[1]["host"], "127.0.0.1");
+    assert_eq!(forwards[1]["port"], 43722);
+    let first = forwards[0]["channel_id"].as_u64().expect("channel id");
+    let second = forwards[1]["channel_id"].as_u64().expect("channel id");
+    assert!(first > 0 && second > first, "{forwards:?}");
+    // The forwards really were opened on the requested loopback ports, in order.
+    assert_eq!(
+        script.tcp_targets(),
+        vec![
+            ("127.0.0.1".to_string(), 43721),
+            ("127.0.0.1".to_string(), 43722),
+        ]
+    );
+}
+
+#[test]
+fn tunnel_step_reports_a_forward_that_cannot_open() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_tcp(TcpReply::Failure("administratively prohibited".to_string()));
+
+    let answer = provision_step(
+        session_id,
+        serde_json::json!({
+            "sessionId": session_id,
+            "step": "tunnel",
+            "forwards": [{ "host": "127.0.0.1", "port": 43721 }],
+        }),
+    );
+
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["kind"], "ssh");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("administratively prohibited"),
+        "{answer}"
+    );
+    assert_eq!(script.tcp_targets().len(), 1);
+}
+
+#[test]
+fn tunnel_step_rejects_a_payload_with_no_usable_forward() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+
+    let empty = provision_step(
+        session_id,
+        serde_json::json!({ "sessionId": session_id, "step": "tunnel", "forwards": [] }),
+    );
+    assert_eq!(empty["ok"], false, "{empty}");
+    assert_eq!(empty["error"]["kind"], "input");
+    assert!(
+        empty["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("at least one forward"),
+        "{empty}"
+    );
+
+    let zero = provision_step(
+        session_id,
+        serde_json::json!({
+            "sessionId": session_id,
+            "step": "tunnel",
+            "forwards": [{ "host": "127.0.0.1", "port": 0 }],
+        }),
+    );
+    assert_eq!(zero["ok"], false, "{zero}");
+    assert_eq!(zero["error"]["kind"], "ssh");
+    assert!(
+        zero["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("1..=65535"),
+        "{zero}"
+    );
+    assert!(
+        script.tcp_targets().is_empty(),
+        "a refused tunnel must not open a channel"
+    );
 }

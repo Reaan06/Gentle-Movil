@@ -8,6 +8,15 @@
 //! `provision()`: the Kotlin/TS layer drives the sequence, can retry a single step, and
 //! `gc_provision_step` maps one call to one visible progress line.
 //!
+//! ## Pivot steps: the app composes, the core runs (S4/S5)
+//!
+//! The daemon-less pairing flow (`mobile/lib/provision.ts`) sends three steps through the
+//! same dispatcher: `detect` with a `command` (the loopback probe of the extension ports),
+//! `register` with a `command`/`script` (the idempotent `authorized_keys` install) and
+//! `tunnel` with `forwards`. The command steps go through [`run_step_command`]; `tunnel`
+//! opens one `direct-tcpip` channel per forward (the existing tunnel primitive) and returns
+//! the channel handle, because the core binds no local listening port.
+//!
 //! ## Offline testability
 //!
 //! Every step goes through the mockable [`crate::ssh::TransportSession`] boundary:
@@ -263,6 +272,121 @@ pub async fn detect_host(session: &SshSession) -> Result<HostInfo, CoreError> {
         arch: arch.to_string(),
         family: family.to_string(),
     })
+}
+
+/// Loopback host the extension serves on (`docs/mobile-protocol-spec.md` §4).
+///
+/// The pivot's `tunnel` step forwards to this host, so it is the value a forward falls
+/// back to when the app omits `host`.
+pub const FORWARD_LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// Result of running an app-composed step command (`detect`/`register` of the pivot).
+///
+/// The pivot deleted the daemon upload (S5), so those two steps are shell scripts the TS
+/// flow composes (`loopbackProbeScript`, `authorizedKeysScript`) and this record reports
+/// what the host answered. `stdout`/`stderr` are lossy UTF-8 because they are UI log text,
+/// not binary payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandResult {
+    /// Exit code the host reported; a non-zero code is an error, never this record.
+    pub exit_code: u32,
+    /// Standard output of the command.
+    pub stdout: String,
+    /// Standard error of the command.
+    pub stderr: String,
+}
+
+/// Run one app-composed step script through the existing `exec` primitive (S4/S5).
+///
+/// `step` only names the failing step in the error message. The script comes from the TS
+/// flow, which composes the loopback probe (`detect`) and the idempotent `authorized_keys`
+/// install (`register`); it runs under `sh -c` like every other compound command of this
+/// module, so a host whose login shell is fish or csh still runs the POSIX constructs those
+/// scripts use.
+///
+/// A non-zero exit is returned as an `ssh` error naming the code and stderr (S7): the flow
+/// must stop at the failing step instead of running the next one against a host that was
+/// never verified.
+pub async fn run_step_command(
+    session: &SshSession,
+    step: &str,
+    command: &str,
+) -> Result<CommandResult, CoreError> {
+    if command.trim().is_empty() {
+        return Err(CoreError::ssh(format!(
+            "the {step} step needs a non-empty command to run"
+        )));
+    }
+    let output = session.exec_once(&posix(command)).await?;
+    if output.exit_code != 0 {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(CoreError::ssh(format!(
+            "{step} failed with exit code {}: {stderr}",
+            output.exit_code
+        )));
+    }
+    Ok(CommandResult {
+        exit_code: output.exit_code,
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+/// One forward requested by the pivot's `tunnel` step (`docs/mobile-protocol-spec.md` §4):
+/// a loopback port of the extension the app must be able to reach over SSH.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelForward {
+    /// Host the extension serves on; defaults to [`FORWARD_LOOPBACK_HOST`].
+    #[serde(default = "default_forward_host")]
+    pub host: String,
+    /// Port the extension serves (1..=65535).
+    pub port: u16,
+}
+
+impl TunnelForward {
+    /// Reject a forward this core cannot open, naming what is wrong (§4, S7).
+    pub fn validate(&self) -> Result<(), CoreError> {
+        let host = self.host.trim();
+        if host.is_empty() {
+            return Err(CoreError::ssh(
+                "the tunnel step needs a non-empty forward host",
+            ));
+        }
+        if self.port == 0 {
+            return Err(CoreError::ssh(format!(
+                "the tunnel forward port for {host} must be 1..=65535"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One forward the core actually opened: the channel the app reads and writes through.
+///
+/// The core's tunnel primitive is an SSH `direct-tcpip` channel, so the phone never binds a
+/// local listening port: `channel_id` is the handle
+/// [`crate::ffi::MobileCore::channel_read`] and [`crate::ffi::MobileCore::channel_write`]
+/// address, and it is what the app's tunnel client uses instead of a local port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenForward {
+    /// Host the forward targets, as requested.
+    pub host: String,
+    /// Port the forward targets, as requested.
+    pub port: u16,
+    /// Channel handle of the opened `direct-tcpip` channel.
+    pub channel_id: crate::ffi::ChannelId,
+}
+
+/// Result of a `tunnel` step: one opened channel per requested forward.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TunnelResult {
+    /// The forwards that were opened, in the order they were requested.
+    pub forwards: Vec<OpenForward>,
+}
+
+/// Host a forward targets when the step omits it: the extension binds loopback only.
+fn default_forward_host() -> String {
+    FORWARD_LOOPBACK_HOST.to_string()
 }
 
 /// Upload the daemon binary over SFTP and make it executable (§3.2, §3.3).
