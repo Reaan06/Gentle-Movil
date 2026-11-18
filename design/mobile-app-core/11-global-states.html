@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=430, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Gentle Movil · Estados globales</title>
+<style>
+  :root{
+    --bg:#060407; --bg-sunken:#0a060c; --surface:#100A0F;
+    --border:#563040; --border-strong:#7a4558;
+    --text:#F6EFF3; --accent:#F095C8; --accent-hover:#FFB1DD; --accent-ink:#28121E;
+    --accent-text:#FFB1DD; --deep-pink:#C96AA2;
+    --warning:#F2B86D; --ok:#4fc58c; --danger:#FF718F;
+    --code-bg:#0f0c12;
+    --accent-soft:rgb(240 149 200 / 0.12); --glow:0 10px 30px #f095c84d;
+    --radius-sm:8px; --radius-md:12px; --radius-lg:16px; --radius-bento:20px; --radius-pill:999px;
+    --shadow:0 1px 0 rgb(255 255 255 / 0.03) inset, 0 18px 40px -18px rgb(0 0 0 / 0.6);
+    --mono:"IosevkaTerm NF","Iosevka Term","JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,"DejaVu Sans Mono",monospace;
+    --muted:color-mix(in srgb, var(--text) 64%, transparent);
+    --faint:color-mix(in srgb, var(--text) 52%, transparent);
+  }
+  *,*::before,*::after{box-sizing:border-box}
+  body{
+    margin:0;width:430px;height:932px;overflow:hidden;
+    display:flex;flex-direction:column;
+    color:var(--text);font:400 .9rem/1.5 var(--mono);letter-spacing:.01em;
+    background:var(--bg);
+    -webkit-font-smoothing:antialiased;
+  }
+  h1,h2,h3,p,figure,ul,ol{margin:0}
+  ul,ol{padding:0;list-style:none}
+  button{background:none;border:0;padding:0;cursor:pointer;font:inherit;color:inherit;letter-spacing:inherit}
+  a{color:inherit;text-decoration:none}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--radius-sm)}
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+  .meta{font-size:.7rem;color:var(--faint);line-height:1.45}
+  .eyebrow{font-size:.7rem;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
+  .ico{width:15px;height:15px;flex:none}
+  .screen{flex:1;min-height:0;display:flex;flex-direction:column}
+  .appbar{flex:none;display:flex;align-items:center;gap:12px;padding:16px 20px 10px}
+  .screen-title{font-size:1.05rem;font-weight:600;letter-spacing:-.01em}
+  .main{flex:1;min-height:0;overflow-y:auto;padding:0 20px 20px;scrollbar-width:none}
+  .main::-webkit-scrollbar{width:0;height:0}
+  .gallery{display:flex;flex-direction:column;gap:20px}
+  .case{display:flex;flex-direction:column;gap:8px}
+  .demo{border-radius:var(--radius-lg);border:1px dashed var(--border-strong);background:var(--bg-sunken);padding:12px;display:flex;flex-direction:column;gap:10px}
+  /* shared pieces */
+  .banner{display:flex;align-items:center;gap:10px;padding:11px 14px;border-radius:var(--radius-md);font-size:.75rem}
+  .banner--offline{border:1px solid color-mix(in srgb, var(--warning) 42%, var(--border));background:rgb(242 184 109 / 0.14);color:var(--warning)}
+  .banner--danger{border:1px solid color-mix(in srgb, var(--danger) 42%, var(--border));background:rgb(255 113 143 / 0.12);color:var(--danger)}
+  .spinner{width:15px;height:15px;flex:none;border-radius:50%;border:2px solid color-mix(in srgb, currentColor 30%, transparent);border-top-color:currentColor;animation:spin 1s linear infinite}
+  @keyframes spin{to{transform:rotate(1turn)}}
+  .card{border-radius:var(--radius-bento);border:1px solid var(--border);background:var(--surface);box-shadow:var(--shadow);padding:16px}
+  .card__title{font-size:.85rem;font-weight:600}
+  .card__sub{font-size:.7rem;color:var(--faint);margin-top:4px;line-height:1.5}
+  .btnrow{display:flex;gap:8px;margin-top:12px}
+  .btn{flex:1;display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;border-radius:var(--radius-pill);font-size:.75rem;font-weight:600;border:1px solid transparent;transition:background-color .15s ease, color .15s ease, box-shadow .15s ease}
+  .btn--primary{background:var(--accent);color:var(--accent-ink)}
+  .btn--primary:hover{background:var(--accent-hover);box-shadow:var(--glow)}
+  .btn--ghost{background:var(--bg-sunken);border-color:var(--border-strong);color:var(--text)}
+  .btn--ghost:hover{border-color:var(--deep-pink)}
+  .empty{display:flex;flex-direction:column;align-items:center;gap:10px;padding:26px 18px;text-align:center}
+  .empty__glyph{width:52px;height:52px;display:grid;place-items:center;border-radius:var(--radius-lg);border:1px solid var(--border);background:var(--accent-soft);color:var(--accent)}
+  .empty__glyph .ico{width:24px;height:24px}
+  .empty__title{font-size:.85rem;font-weight:600}
+  .empty .btn{min-width:200px;flex:none}
+  .primetitle{font-size:.85rem;font-weight:600}
+  @media (prefers-reduced-motion: reduce){
+    *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important;scroll-behavior:auto !important}
+  }
+</style>
+</head>
+<body>
+<div class="screen">
+  <header class="appbar">
+    <div class="appbar__title">
+      <h1 class="screen-title">Estados globales</h1>
+      <p class="meta">galería de referencia · V19–V20</p>
+    </div>
+  </header>
+
+  <main class="main" id="main">
+    <div class="gallery">
+
+      <section class="case" aria-labelledby="c1">
+        <h2 class="eyebrow" id="c1">Túnel reconectando (banner)</h2>
+        <div class="demo">
+          <p class="banner banner--offline" role="status">
+            <span class="spinner" aria-hidden="true"></span>
+            Túnel SSH reconectando a tu-pc · reintento 3 de 5
+          </p>
+        </div>
+      </section>
+
+      <section class="case" aria-labelledby="c2">
+        <h2 class="eyebrow" id="c2">Offline sin reintento posible</h2>
+        <div class="demo">
+          <p class="banner banner--danger" role="alert">
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 4l16 16"/><path d="M6.5 9a9 9 0 0 1 11 0M9.3 12.4a5 5 0 0 1 5.4 0"/><circle cx="12" cy="16.6" r="1" fill="currentColor" stroke="none"/></svg>
+            Sin conexión con tu-pc · verificá que la PC esté encendida
+          </p>
+        </div>
+      </section>
+
+      <section class="case" aria-labelledby="c3">
+        <h2 class="eyebrow" id="c3">Daemon desactualizado (426)</h2>
+        <div class="demo">
+          <div class="card">
+            <p class="card__title">El daemon de tu-pc está desactualizado</p>
+            <p class="card__sub">Versión instalada 0.5.9 · disponible 0.6.0. La actualización es firmada y revierte sola si falla.</p>
+            <div class="btnrow">
+              <button class="btn btn--primary" type="button">Actualizar ahora</button>
+              <button class="btn btn--ghost" type="button">Recordar</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="case" aria-labelledby="c4">
+        <h2 class="eyebrow" id="c4">Permisos de notificaciones (priming)</h2>
+        <div class="demo">
+          <div class="card">
+            <p class="primetitle">Entérate cuando Gentle Shell te espere</p>
+            <p class="card__sub">Con notificaciones activadas te avisamos cuando una sesión necesite tu aprobación — aunque la app esté en segundo plano.</p>
+            <div class="btnrow">
+              <button class="btn btn--primary" type="button">Activar</button>
+              <button class="btn btn--ghost" type="button">Ahora no</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="case" aria-labelledby="c5">
+        <h2 class="eyebrow" id="c5">Vacío · sesiones</h2>
+        <div class="demo">
+          <div class="card">
+            <div class="empty">
+              <span class="empty__glyph" aria-hidden="true">
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="14" rx="2.5"/><path d="m8 10 2 2-2 2M13 14h3"/></svg>
+              </span>
+              <p class="empty__title">Nada compartido todavía</p>
+              <p class="card__sub">Corré <b>/companion</b> en una sesión de Gentle Shell para compartirla con este dispositivo.</p>
+              <button class="btn btn--primary" type="button">Nueva sesión</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="case" aria-labelledby="c6">
+        <h2 class="eyebrow" id="c6">Vacío · automatizaciones</h2>
+        <div class="demo">
+          <div class="card">
+            <div class="empty">
+              <span class="empty__glyph" aria-hidden="true">
+                <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.4-5.7"/><path d="M20 4.5V9h-4.5"/></svg>
+              </span>
+              <p class="empty__title">Sin automatizaciones</p>
+              <p class="card__sub">Programá tareas recurrentes: briefings, revisión de PRs, sincronización diaria.</p>
+              <button class="btn btn--primary" type="button">Nueva automatización</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+  <div class="home-bar" aria-hidden="true"><span></span></div>
+</div>
+</body>
+</html>

@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "chosen": "03-pairing-progress.html",
+  "handoffs": {
+    "01-qr-scan.html": {
+      "status": "implemented",
+      "queued": false,
+      "sentAt": "2026-11-18T01:13:23.377Z",
+      "startedAt": "2026-11-18T01:13:52.718Z",
+      "implementedAt": "2026-11-18T01:22:07.081Z",
+      "feature": "odd/tasks/mobile-app.md",
+      "previewUrl": "https://127.0.0.1:43723/pair/qr"
+    },
+    "02-manual-ssh.html": {
+      "status": "in_progress",
+      "queued": true,
+      "sentAt": "2026-11-18T01:12:54.500Z",
+      "startedAt": "2026-11-18T01:23:54.042Z",
+      "implementedAt": null,
+      "feature": "odd/tasks/mobile-app.md"
+    },
+    "03-pairing-progress.html": {
+      "status": "in_progress",
+      "queued": false,
+      "sentAt": "2026-11-18T03:42:10.774Z",
+      "startedAt": "2026-11-18T03:42:44.223Z",
+      "implementedAt": null,
+      "feature": "odd/tasks/mobile-app.md"
+    },
+    "04-mode-choice.html": {
+      "status": "in_progress",
+      "queued": true,
+      "sentAt": "2026-11-18T03:41:52.161Z",
+      "startedAt": "2026-11-18T03:43:17.558Z",
+      "implementedAt": null,
+      "feature": "odd/tasks/mobile-app.md"
+    }
+  }
+}
