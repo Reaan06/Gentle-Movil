@@ -26,7 +26,11 @@ export const BRIDGE_HTTP_PORT = 43721;
 export interface TunnelChannel {
   write(payload: Uint8Array): Promise<number>;
   read(timeoutMs?: number): Promise<{ bytes: Uint8Array; eof: boolean }>;
-  close(): Promise<void>;
+  /**
+   * Optional: the `tunnel` provision step owns the channel lifetime, so a
+   * request never closes it. A caller that opened its own channel may.
+   */
+  close?(): Promise<void>;
 }
 
 /** Why a bridge call failed; the UI renders this, never a made-up payload. */
@@ -185,7 +189,7 @@ export async function bridgeRequest<T>(
       failure: failure('bad-response', 'La PC devolvió una respuesta rota.', null, error),
     };
   }
-  void channel.close().catch(() => {});
+  void channel.close?.().catch(() => {});
   const parsed = splitResponse(raw);
   if (parsed === null) {
     return {

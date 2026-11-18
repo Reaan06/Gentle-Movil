@@ -12,6 +12,7 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { GhostButton } from '../components/GhostButton';
+import { httpChannelOf, setActiveTunnel } from '../lib/tunnel-store';
 import { PrimaryButton } from '../components/PrimaryButton';
 import type { PairInfo, SshCredential } from '../lib/core';
 import { logger } from '../lib/logger';
@@ -265,6 +266,18 @@ export default function PairingProgressScreen() {
     );
 
     if (result.ok) {
+      // Keep the handles the tunnel step left open: every connected screen
+      // (Overview first) speaks HTTP through them. They are native state, so
+      // a restart honestly reports "no tunnel" instead of faking one.
+      const httpChannel = httpChannelOf(result.tunnel);
+      if (httpChannel === null) {
+        log.warn('tunnel has no HTTP channel', {
+          ports: result.tunnel.channels.map((channel) => channel.port),
+        });
+      } else {
+        setActiveTunnel({ sessionId: result.tunnel.sessionId, httpChannel, host: pair.host });
+        log.info('tunnel stored', { host: pair.host, port: httpChannel.port });
+      }
       setStatus('ok');
       setSubLine('Túnel listo');
     } else {

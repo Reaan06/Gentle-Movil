@@ -12,9 +12,13 @@ import {
   type OverviewViewModel,
   type OverviewTile,
   buildOverview,
-  defaultLoadOverview,
   formatTokens,
 } from '../lib/overview';
+import {
+  bridgeOverviewProvider,
+  stateFromSignal,
+} from '../lib/overview-provider';
+import { bridgeChannel } from '../lib/tunnel-store';
 import { colors, elevation, radius, spacing, typography } from '../lib/theme';
 
 /**
@@ -29,15 +33,16 @@ import { colors, elevation, radius, spacing, typography } from '../lib/theme';
  * and es-AR copies live in `mobile/lib/overview.ts` and are pinned by
  * `mobile/test/overview.test.mjs`.
  *
- * The data provider is the artboard demo dataset (`defaultLoadOverview`); the
- * bridge (`/api/sessions` + usage) is not wired into the app yet, so every
- * quick action and dock tab whose screen does not exist logs `route pending`
- * instead of navigating or failing silently. Wiring the real provider is part
- * of T8 (connected mode UI).
+ * Data comes from the PC over the SSH tunnel (`GET /api/sessions` +
+ * `/api/health`, see `lib/overview-provider.ts`). There is no demo dataset: with
+ * no tunnel the screen says `Reconectando…`, and a PC that times out after a
+ * good answer shows `Datos de hace N min` with the cached numbers. Every
+ * quick action and dock tab whose screen does not exist yet logs
+ * `route pending` instead of navigating or failing silently.
  */
 
-/** Swappable provider seam for the later T8 wiring. */
-let provider: LoadOverview = defaultLoadOverview();
+/** Swappable provider seam (tests inject a fake; the app uses the tunnel). */
+let provider: LoadOverview = bridgeOverviewProvider(() => bridgeChannel());
 
 /** Replace the data source (tests / later slices); returns the previous one. */
 export function setOverviewProvider(next: LoadOverview): LoadOverview {
@@ -134,12 +139,11 @@ export default function OverviewScreen() {
     }
     try {
       const data = await provider();
-      // The demo provider has no real clock yet, so success is the honest
-      // default; a real provider maps its failures to stale/offline (T8).
       setState({ kind: 'success', data });
     } catch (error) {
-      log.failure('load-overview', error, null);
-      setState({ kind: 'offline', data: null });
+      // The provider signals the §V5 state (offline / stale / empty); anything
+      // else is an honest log plus offline, never a fake payload.
+      setState(stateFromSignal(error));
     } finally {
       setRefreshing(false);
     }
