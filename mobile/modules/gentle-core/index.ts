@@ -26,7 +26,10 @@ export type GcFunction =
   | 'gc_pair_from_qr'
   | 'gc_ssh_connect'
   | 'gc_provision_step'
-  | 'gc_device_key_generate';
+  | 'gc_device_key_generate'
+  | 'gc_ssh_channel_write'
+  | 'gc_ssh_channel_read'
+  | 'gc_ssh_channel_close';
 
 /** Shape of the Kotlin module (`modules/gentle-core/android/.../GcCoreModule.kt`). */
 export interface GentleCoreNativeModule {
@@ -42,6 +45,10 @@ export interface GentleCoreNativeModule {
   sshConnect(payloadJson: string): Promise<string>;
   provisionStep(payloadJson: string): Promise<string>;
   deviceKeyGenerate(payloadJson: string): Promise<string>;
+  /** Tunnel channel I/O (`gc_ssh_channel_*`); both handles ride inside the document. */
+  sshChannelWrite(payloadJson: string): Promise<string>;
+  sshChannelRead(payloadJson: string): Promise<string>;
+  sshChannelClose(payloadJson: string): Promise<string>;
 }
 
 let nativeModule: GentleCoreNativeModule | null = null;
@@ -115,4 +122,30 @@ export async function pairFromQr(uri: string): Promise<string> {
 /** `gc_device_key_generate` — phone ed25519 identity (kept in the Keystore). */
 export async function deviceKeyGenerate(payloadJson = '{}'): Promise<string> {
   return callGc('gc_device_key_generate', payloadJson);
+}
+
+/* ------------------------------------------------------------------ *
+ * Tunnel channel I/O (S4)
+ *
+ * The `tunnel` step reports one `channel_id` per loopback port; the app reaches
+ * the extension through those handles with the three calls below. Every
+ * document carries both handles (`sessionId`, `channelId`) so one native entry
+ * point stays enough — the JNI shim splits them out like it does for
+ * `provisionStep`. `lib/provision.ts` (`channelWrite`/`channelRead`/
+ * `channelClose`, `httpOverTunnel`, `closeTunnel`) is the typed layer over them.
+ * ------------------------------------------------------------------ */
+
+/** `gc_ssh_channel_write` — `{sessionId, channelId, bytes: "<base64>"}`. */
+export async function sshChannelWrite(payloadJson: string): Promise<string> {
+  return callGc('gc_ssh_channel_write', payloadJson);
+}
+
+/** `gc_ssh_channel_read` — `{sessionId, channelId, timeoutMs?}`. */
+export async function sshChannelRead(payloadJson: string): Promise<string> {
+  return callGc('gc_ssh_channel_read', payloadJson);
+}
+
+/** `gc_ssh_channel_close` — `{sessionId, channelId}`. */
+export async function sshChannelClose(payloadJson: string): Promise<string> {
+  return callGc('gc_ssh_channel_close', payloadJson);
 }

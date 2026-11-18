@@ -54,6 +54,15 @@ const CREDENTIAL = { type: 'password', value: 'correcta' };
 /** Device key the fake core hands out (32-byte ed25519 public key, hex). */
 const DEVICE_PUBKEY_HEX = 'ab'.repeat(32);
 
+/**
+ * Channels the fake core reports after `tunnel` (`TunnelResult.forwards`), one per
+ * loopback port: this is the handle the app speaks HTTP/WS through (S4).
+ */
+const OPENED_FORWARDS = [
+  { host: '127.0.0.1', port: EXTENSION_HTTP_PORT, channel_id: 11 },
+  { host: '127.0.0.1', port: EXTENSION_WS_PORT, channel_id: 12 },
+];
+
 /** Fake bridge: resolves/records every call, scripted by step name. */
 function fakeBridge(script = {}) {
   const calls = [];
@@ -86,6 +95,9 @@ function fakeBridge(script = {}) {
       }
       if (behaviour !== 'ok') {
         return JSON.stringify({ ok: false, error: { kind: behaviour, message: `falló ${behaviour}` }, raw: '{"exit":1}' });
+      }
+      if (payload.step === 'tunnel') {
+        return JSON.stringify({ ok: true, step: 'tunnel', result: { forwards: OPENED_FORWARDS } });
       }
       return JSON.stringify({ ok: true, result: { step: payload.step } });
     },
@@ -166,6 +178,14 @@ test('the happy path runs the five steps in order and reports each one', async (
   );
   assert.equal(logger.failures.length, 0);
   assert.equal(result.registration.authorizedKey, sshEd25519AuthorizedKey(DEVICE_PUBKEY_HEX));
+  // The tunnel handles are kept, not discarded: they are how the app speaks HTTP/WS.
+  assert.deepEqual(result.tunnel, {
+    sessionId: '7',
+    channels: [
+      { host: '127.0.0.1', port: EXTENSION_HTTP_PORT, channelId: 11 },
+      { host: '127.0.0.1', port: EXTENSION_WS_PORT, channelId: 12 },
+    ],
+  });
 });
 
 test('no upload, verify or start step survives the pivot (S5)', () => {
@@ -227,6 +247,32 @@ test('a tunnel failure stops at tunnel after every earlier step succeeded', asyn
       ['start', 'tunnel'], ['error', 'tunnel'],
     ],
   );
+});
+
+test('a tunnel without channel handles fails the step instead of reporting a tunnel', async () => {
+  const logger = fakeLogger();
+  const cb = recordedCallbacks();
+
+  const result = await provisionFlow(PAIR, CREDENTIAL, cb, {
+    logger,
+    call: async (fn, payloadJson) => {
+      const payload = JSON.parse(payloadJson);
+      if (fn === 'gc_ssh_connect') {
+        return JSON.stringify({ ok: true, result: { sessionId: 7, fingerprint: PAIR.fp } });
+      }
+      if (fn === 'gc_device_key_generate') {
+        return JSON.stringify({ ok: true, result: { key: { public_hex: DEVICE_PUBKEY_HEX, secret: {} } } });
+      }
+      // The core answered ok but reported no opened channel.
+      return JSON.stringify({ ok: true, result: payload.step === 'tunnel' ? { forwards: [] } : { step: payload.step } });
+    },
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failedStep, 'tunnel');
+  assert.equal(result.error.kind, 'BadResponse');
+  assert.deepEqual(logger.failures.map((entry) => entry.step), ['tunnel']);
+  assert.deepEqual(cb.events.at(-1), ['error', 'tunnel', 'BadResponse', { forwards: [] }]);
 });
 
 test('a detect failure stops before register and names the step', async () => {

@@ -49,6 +49,21 @@ class GcCoreModule : Module() {
     AsyncFunction("sshConnect") { payloadJson: String -> dispatch("gc_ssh_connect", payloadJson) }
     AsyncFunction("provisionStep") { payloadJson: String -> dispatch("gc_provision_step", payloadJson) }
     AsyncFunction("deviceKeyGenerate") { payloadJson: String -> dispatch("gc_device_key_generate", payloadJson) }
+
+    /**
+     * Tunnel channel I/O (S4): the app speaks HTTP/WS through the channels the
+     * `tunnel` step opened. Documents carry both handles, so the JNI shim splits
+     * `sessionId`/`channelId` out exactly like it does for `provisionStep`.
+     */
+    AsyncFunction("sshChannelWrite") { payloadJson: String ->
+      dispatch("gc_ssh_channel_write", payloadJson)
+    }
+    AsyncFunction("sshChannelRead") { payloadJson: String ->
+      dispatch("gc_ssh_channel_read", payloadJson)
+    }
+    AsyncFunction("sshChannelClose") { payloadJson: String ->
+      dispatch("gc_ssh_channel_close", payloadJson)
+    }
   }
 
   /** Called on the module queue; every failure path returns an envelope. */
@@ -64,6 +79,9 @@ class GcCoreModule : Module() {
         "gc_ssh_connect" -> GcNative.gcSshConnect(payload)
         "gc_provision_step" -> GcNative.gcProvisionStep(payload)
         "gc_device_key_generate" -> GcNative.gcDeviceKeyGenerate(payload)
+        "gc_ssh_channel_write" -> GcNative.gcSshChannelWrite(payload)
+        "gc_ssh_channel_read" -> GcNative.gcSshChannelRead(payload)
+        "gc_ssh_channel_close" -> GcNative.gcSshChannelClose(payload)
         else -> return failureEnvelope("UnknownFunction", "El núcleo no expone «$fn».")
       }
       if (response.isNullOrBlank()) {

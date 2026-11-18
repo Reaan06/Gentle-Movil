@@ -51,6 +51,34 @@ internal object GcNative {
   external fun gcDeviceKeyGenerate(json: String): String?
 
   /**
+   * `char* gc_ssh_channel_write(const char* json)` — send bytes on a tunnel channel.
+   *
+   * Document: `{"sessionId":N,"channelId":M,"bytes":"<standard base64>"}`. The two
+   * handles ride inside the JSON exactly like `gcProvisionStep`'s `sessionId`, so the
+   * JNI shim splits them out and calls the C ABI's separate `u64` arguments (rule 2 of
+   * `GcCoreModule`: strings only). Answers the usual envelope with
+   * `result.written` on success.
+   */
+  external fun gcSshChannelWrite(json: String): String?
+
+  /**
+   * `char* gc_ssh_channel_read(const char* json)` — read one frame from a tunnel channel.
+   *
+   * Document: `{"sessionId":N,"channelId":M,"timeoutMs":K}` (`timeoutMs` optional,
+   * `0` is a non-blocking poll). Answers `{"ok":true,"result":{"bytes":"<base64>","eof":bool}}`;
+   * an expired window is an empty `bytes` with `eof:false`, never an error.
+   */
+  external fun gcSshChannelRead(json: String): String?
+
+  /**
+   * `char* gc_ssh_channel_close(const char* json)` — close a tunnel channel.
+   *
+   * Document: `{"sessionId":N,"channelId":M}`. Answers
+   * `{"ok":true,"result":{"closed":true}}`; the id is stale afterwards.
+   */
+  external fun gcSshChannelClose(json: String): String?
+
+  /**
    * `void gc_free(char* pointer)` — releases a `char*` allocated by the core.
    *
    * Not called from Kotlin: JSON documents cross JNI as copies (the wrapper

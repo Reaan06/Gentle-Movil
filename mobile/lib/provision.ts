@@ -17,6 +17,9 @@
  *                    later connection is key-only.
  * 5. `tunnel`      — the SSH local forward to the extension's loopback ports,
  *                    which is the channel the app talks to the agent through.
+ *                    The step's result is **kept**: one `channel_id` per port,
+ *                    which `httpOverTunnel`/`channelWrite`/`channelRead`/
+ *                    `closeTunnel` below speak HTTP/WS through (S4).
  *
  * There is **no** binary upload, no release checksum, no daemon start and no
  * rollback in this flow (S5): those were the SFTP provisioning of the rejected
@@ -24,9 +27,8 @@
  *
  * ## Composition instead of new ABI
  *
- * The C ABI stays frozen (`mobile/lib/core.ts` untouched): steps 3–5 are
- * expressed as `gc_provision_step` payloads. `detect` and `register` carry the
- * `sh` command they need composed here (`loopbackProbeScript`,
+ * The five steps are expressed as `gc_provision_step` payloads. `detect` and
+ * `register` carry the `sh` command they need composed here (`loopbackProbeScript`,
  * `authorizedKeysScript`), which the core runs with its `exec`-over-SSH
  * primitive; `tunnel` carries the `forwards` list the core turns into
  * `direct-tcpip` channels. Nothing here invents a value: a step the core does
@@ -72,6 +74,27 @@ export const DEVICE_NAME = 'Gentle Movil';
 
 /** Comment of the line `register` writes into `authorized_keys`. */
 export const AUTHORIZED_KEY_COMMENT = 'gentle-movil';
+
+/** Ceiling of one channel call that carries no read window (write/close), in ms. */
+export const CHANNEL_CALL_TIMEOUT_MS = 30_000;
+
+/** Extra window the TS guard allows on top of the read window the core honours, in ms. */
+export const CHANNEL_GUARD_MARGIN_MS = 10_000;
+
+/** Read window the HTTP helper hands to the core for one frame, in ms. */
+export const CHANNEL_READ_TIMEOUT_MS = 5_000;
+
+/** Budget of one whole request/response exchange, in ms. */
+export const HTTP_EXCHANGE_TIMEOUT_MS = 30_000;
+
+/** Largest response the helper assembles before refusing it, in bytes. */
+export const HTTP_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+/** Largest head it scans before calling the frame malformed, in bytes. */
+export const HTTP_MAX_HEAD_BYTES = 64 * 1024;
+
+/** Read frames one exchange may consume before refusing (a chatty peer must not spin forever). */
+export const HTTP_MAX_FRAMES = 512;
 
 /**
  * Per-step timeout in milliseconds. `connect` covers the whole SSH handshake
@@ -125,7 +148,7 @@ export interface DeviceRegistration {
 
 /** Outcome of `provisionFlow`. */
 export type ProvisionResult =
-  | { ok: true; sessionId: string; registration?: DeviceRegistration }
+  | { ok: true; sessionId: string; registration?: DeviceRegistration; tunnel: TunnelHandles }
   | { ok: false; failedStep: ProvisionStep; error: ProvisionFailure };
 
 /** Callbacks the screen uses to render the step list. */
@@ -148,10 +171,63 @@ export interface ProvisionDeps {
   call?: (fn: string, payloadJson: string) => Promise<string>;
   /** Per-step timeout overrides (tests). */
   timeouts?: Partial<Record<ProvisionStep, number>>;
+  /** Ceiling of one write/close channel call, in ms (default `CHANNEL_CALL_TIMEOUT_MS`). */
+  channelCallTimeoutMs?: number;
+  /** Extra window the TS guard adds on top of a read's `timeoutMs` (default `CHANNEL_GUARD_MARGIN_MS`). */
+  channelGuardMarginMs?: number;
   /** Failure sink; defaults to the app logger. */
   logger?: ProvisionLogger;
   /** Phone ed25519 public key (hex) when the app already holds it. */
   devicePubkeyHex?: string;
+}
+
+/** One tunnel channel: a loopback port of the extension, reached over SSH (S4). */
+export interface TunnelChannel {
+  /** Host the channel targets (the extension's loopback). */
+  host: string;
+  /** Port of the extension that this channel reaches. */
+  port: number;
+  /** Channel handle `gc_ssh_channel_read`/`write`/`close` address. */
+  channelId: number;
+}
+
+/**
+ * What the `tunnel` step really left behind: the session plus one open channel
+ * per extension port. This is the object the rest of the app speaks HTTP/WS
+ * through; before the pivot it was discarded.
+ */
+export interface TunnelHandles {
+  /** Session id the channels belong to. */
+  sessionId: string;
+  /** Opened channels, in the order the forwards were requested. */
+  channels: TunnelChannel[];
+}
+
+/** One channel call that succeeded. */
+export interface ChannelWriteResult {
+  ok: true;
+  /** Bytes handed to the transport. */
+  written: number;
+}
+
+/** One read frame (`gc_ssh_channel_read`). */
+export interface ChannelReadResult {
+  ok: true;
+  /** Bytes that arrived; empty on a timeout and when the peer closed. */
+  bytes: Uint8Array;
+  /** True when the host closed the channel; later reads can only fail. */
+  eof: boolean;
+}
+
+/** One channel call that closed the channel. */
+export interface ChannelCloseResult {
+  ok: true;
+}
+
+/** Honest failure of a channel call (the core reason, verbatim). */
+export interface ChannelFailure {
+  ok: false;
+  error: ProvisionFailure;
 }
 
 /** Bridge function names (frozen by the native module, see its README). */
@@ -161,6 +237,9 @@ export const GC_FUNCTIONS = {
   sshConnect: 'gc_ssh_connect',
   provisionStep: 'gc_provision_step',
   deviceKeyGenerate: 'gc_device_key_generate',
+  channelWrite: 'gc_ssh_channel_write',
+  channelRead: 'gc_ssh_channel_read',
+  channelClose: 'gc_ssh_channel_close',
 } as const;
 
 /** Visible rows of the progress list: exactly one per step (the pivot has no sub-steps). */
@@ -520,6 +599,542 @@ export async function connectPair(
 }
 
 /* ------------------------------------------------------------------ *
+ * Tunnel channels (step 5 hands the app its HTTP/WS surface, S4)
+ *
+ * The `tunnel` step opens one SSH `direct-tcpip` channel per loopback port and
+ * reports each handle as `channel_id`; those handles — not local ports — are how
+ * the app reaches the extension. Everything below works on that handle and
+ * carries the session/channel ids inside the JSON document (the native shim
+ * splits them out, exactly like `gc_provision_step` does with `sessionId`).
+ *
+ * Failure contract (S7): every helper resolves a result union; nothing throws
+ * and nothing waits forever. A read window that expires is an empty frame with
+ * `eof:false` (the core's own outcome, **not** an error); a closed/unknown
+ * channel, a malformed frame or a bridge that never answers becomes a
+ * `ProvisionFailure` the caller can show, and is also logged as
+ * `logger.failure('channel', error, {port, channelId, raw})`.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Parses the `tunnel` step result into the handles the app keeps.
+ *
+ * Accepts `{forwards:[{host, port, channel_id}]}` (the core's `TunnelResult`),
+ * and throws a typed `BadResponse` failure when the core reports no channel: an
+ * empty tunnel must never look like a working one.
+ */
+export function parseTunnelChannels(result: unknown): TunnelChannel[] {
+  const forwards = (result as { forwards?: unknown } | null | undefined)?.forwards;
+  if (!Array.isArray(forwards) || forwards.length === 0) {
+    throw { kind: 'BadResponse', message: 'El túnel no devolvió ningún canal abierto.' };
+  }
+  return forwards.map((entry) => {
+    const record = (entry ?? {}) as { host?: unknown; port?: unknown; channel_id?: unknown; channelId?: unknown };
+    const host = typeof record.host === 'string' && record.host.trim() !== '' ? record.host.trim() : EXTENSION_LOOPBACK_HOST;
+    const port = Number(record.port);
+    const rawChannel = record.channel_id ?? record.channelId;
+    const channelId = Number(rawChannel);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw { kind: 'BadResponse', message: `El túnel devolvió un puerto inválido: ${String(record.port)}` };
+    }
+    if (!Number.isInteger(channelId) || channelId < 0) {
+      throw { kind: 'BadResponse', message: `El túnel devolvió un canal inválido: ${String(rawChannel)}` };
+    }
+    return { host, port, channelId };
+  });
+}
+
+/** The handle serving `port`, or `null` when the tunnel never opened that port. */
+export function tunnelChannelFor(tunnel: TunnelHandles, port: number): TunnelChannel | null {
+  return tunnel.channels.find((channel) => channel.port === port) ?? null;
+}
+
+/** UTF-8 bytes of a request string (no `TextEncoder`: Hermes does not guarantee it). */
+function utf8Bytes(text: string): Uint8Array {
+  const out: number[] = [];
+  for (let index = 0; index < text.length; index += 1) {
+    let code = text.codePointAt(index) as number;
+    if (code > 0xffff) {
+      index += 1;
+    } else if (code >= 0xd800 && code <= 0xdfff) {
+      code = 0xfffd;
+    }
+    if (code < 0x80) {
+      out.push(code);
+    } else if (code < 0x800) {
+      out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
+    } else if (code < 0x10000) {
+      out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
+    } else {
+      out.push(
+        0xf0 | (code >> 18),
+        0x80 | ((code >> 12) & 0x3f),
+        0x80 | ((code >> 6) & 0x3f),
+        0x80 | (code & 0x3f),
+      );
+    }
+  }
+  return Uint8Array.from(out);
+}
+
+/**
+ * Normalizes a channel failure, keeping the `kind` a typed error carries (a
+ * malformed base64 frame is `Frame`, not the error class name).
+ */
+function toChannelFailure(error: unknown): ProvisionFailure {
+  if (typeof error === 'object' && error !== null && typeof (error as { kind?: unknown }).kind === 'string') {
+    const value = error as { kind: string; message?: unknown };
+    return {
+      kind: value.kind,
+      message: typeof value.message === 'string' ? value.message : String(error),
+    };
+  }
+  return toFailure(error);
+}
+
+/** Sends the failure to `logger.failure` with the `{step, error, raw}` shape. */
+async function logChannelFailure(
+  deps: ProvisionDeps,
+  channel: TunnelChannel,
+  error: ProvisionFailure,
+  raw: unknown,
+): Promise<void> {
+  try {
+    const log = await resolveLogger(deps.logger);
+    log.failure('channel', error, { port: channel.port, channelId: channel.channelId, raw: raw ?? null });
+  } catch {
+    // A logger that cannot be loaded must never break the data path (S7).
+  }
+}
+
+/** Channel ids ride in the document; the native shim splits them like `gc_provision_step`'s. */
+function channelPayload(sessionId: string, channel: TunnelChannel, extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({ sessionId: Number(sessionId) || 0, channelId: channel.channelId, ...extra });
+}
+
+/** One channel call through the bridge, bounded, with the envelope unpacked. */
+async function callChannel(
+  fn: string,
+  payload: string,
+  boundMs: number,
+  deps: ProvisionDeps,
+): Promise<{ ok: true; result: unknown } | { ok: false; error: ProvisionFailure; raw: unknown }> {
+  const call = deps.call ?? defaultCall;
+  try {
+    const envelope = parseEnvelope(await withTimeout(call(fn, payload), boundMs));
+    if (!envelope.ok) {
+      return { ok: false, error: toChannelFailure(envelope.error), raw: envelope.raw ?? null };
+    }
+    return { ok: true, result: envelope.result };
+  } catch (error) {
+    return { ok: false, error: toChannelFailure(error), raw: null };
+  }
+}
+
+/** Ceiling of one write/close call. */
+function channelCeiling(deps: ProvisionDeps): number {
+  return deps.channelCallTimeoutMs ?? CHANNEL_CALL_TIMEOUT_MS;
+}
+
+/**
+ * Ceiling of one read: the window the core honours plus the TS guard, so a
+ * native call that never returns cannot hang the caller.
+ */
+function readCeiling(timeoutMs: number, deps: ProvisionDeps): number {
+  return timeoutMs + (deps.channelGuardMarginMs ?? CHANNEL_GUARD_MARGIN_MS);
+}
+
+/**
+ * `gc_ssh_channel_write` — writes `bytes` on a tunnel channel (S4).
+ *
+ * An empty payload is refused here (`Input`) because the core rejects it too,
+ * and a closed/unknown channel answers the core's `ssh` failure verbatim.
+ */
+export async function channelWrite(
+  sessionId: string,
+  channel: TunnelChannel,
+  bytes: Uint8Array,
+  deps: ProvisionDeps = {},
+): Promise<ChannelWriteResult | ChannelFailure> {
+  if (bytes.length === 0) {
+    return { ok: false, error: { kind: 'Input', message: 'El canal no puede escribir un payload vacío.' } };
+  }
+  const payload = channelPayload(sessionId, channel, { bytes: base64Encode(bytes) });
+  const outcome = await callChannel(GC_FUNCTIONS.channelWrite, payload, channelCeiling(deps), deps);
+  if (!outcome.ok) {
+    await logChannelFailure(deps, channel, outcome.error, outcome.raw);
+    return { ok: false, error: outcome.error };
+  }
+  const written = Number((outcome.result as { written?: unknown } | undefined)?.written);
+  return { ok: true, written: Number.isFinite(written) ? written : bytes.length };
+}
+
+/**
+ * `gc_ssh_channel_read` — reads one frame from a tunnel channel (S4).
+ *
+ * `timeoutMs: 0` is a non-blocking poll and an expired window is the honest
+ * `{bytes: empty, eof: false}` outcome, not an error (S7). A frame that is not
+ * standard base64, or one without a `bytes` field, is a `Frame`/`BadResponse`
+ * failure instead of being read as empty.
+ */
+export async function channelRead(
+  sessionId: string,
+  channel: TunnelChannel,
+  timeoutMs: number = CHANNEL_READ_TIMEOUT_MS,
+  deps: ProvisionDeps = {},
+): Promise<ChannelReadResult | ChannelFailure> {
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 0) {
+    return { ok: false, error: { kind: 'Input', message: `Ventana de lectura inválida: ${String(timeoutMs)}` } };
+  }
+  const payload = channelPayload(sessionId, channel, { timeoutMs });
+  const outcome = await callChannel(GC_FUNCTIONS.channelRead, payload, readCeiling(timeoutMs, deps), deps);
+  if (!outcome.ok) {
+    await logChannelFailure(deps, channel, outcome.error, outcome.raw);
+    return { ok: false, error: outcome.error };
+  }
+  const result = outcome.result as { bytes?: unknown; eof?: unknown } | undefined;
+  if (typeof result?.bytes !== 'string') {
+    const error: ProvisionFailure = {
+      kind: 'BadResponse',
+      message: 'El núcleo devolvió una lectura sin bytes.',
+    };
+    await logChannelFailure(deps, channel, error, result ?? null);
+    return { ok: false, error };
+  }
+  let bytes: Uint8Array;
+  try {
+    bytes = base64DecodeBytes(result.bytes);
+  } catch (error) {
+    const failure = toChannelFailure(error);
+    await logChannelFailure(deps, channel, failure, result.bytes);
+    return { ok: false, error: failure };
+  }
+  return { ok: true, bytes, eof: result.eof === true };
+}
+
+/** `gc_ssh_channel_close` — closes a tunnel channel and frees its id (S4). */
+export async function channelClose(
+  sessionId: string,
+  channel: TunnelChannel,
+  deps: ProvisionDeps = {},
+): Promise<ChannelCloseResult | ChannelFailure> {
+  const payload = channelPayload(sessionId, channel);
+  const outcome = await callChannel(GC_FUNCTIONS.channelClose, payload, channelCeiling(deps), deps);
+  if (!outcome.ok) {
+    await logChannelFailure(deps, channel, outcome.error, outcome.raw);
+    return { ok: false, error: outcome.error };
+  }
+  return { ok: true };
+}
+
+/**
+ * Standard base64 decode of a frame (the same rules as `core.base64Decode`,
+ * duplicated here because this module cannot import `core.ts` at runtime: the
+ * `node --test` runner resolves `.ts` specifiers only with an extension, which
+ * `tsc` rejects. `mobile/test/tunnel.test.mjs` pins that both agree).
+ */
+function base64DecodeBytes(text: string): Uint8Array {
+  const compact = text.replace(/\s/g, '');
+  if (compact.length === 0) {
+    return new Uint8Array(0);
+  }
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(compact)) {
+    throw { kind: 'Frame', message: 'El payload no es base64 estándar.' };
+  }
+  const body = compact.replace(/=+$/, '');
+  if (body.length % 4 === 1) {
+    throw { kind: 'Frame', message: 'El payload base64 tiene un largo imposible.' };
+  }
+  const pads = compact.length - body.length;
+  if (pads > 0 && (compact.length % 4 !== 0 || pads !== (4 - (body.length % 4)) % 4)) {
+    throw { kind: 'Frame', message: 'El padding del payload base64 no es válido.' };
+  }
+  const out: number[] = [];
+  let buffer = 0;
+  let bits = 0;
+  for (const char of body) {
+    const value = BASE64_ALPHABET.indexOf(char);
+    if (value < 0) {
+      throw { kind: 'Frame', message: 'El payload no es base64 estándar.' };
+    }
+    buffer = (buffer << 6) | value;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push((buffer >> bits) & 0xff);
+      buffer &= (1 << bits) - 1;
+    }
+  }
+  return Uint8Array.from(out);
+}
+
+/** Head of the response read so far, and whether more bytes are needed. */
+export interface HttpResponseHead {
+  /** Status code of the response line, or `null` while no complete head was read. */
+  status: number | null;
+  /** Index just past the blank line ending the headers (`-1` until they end). */
+  headEnd: number;
+  /** True when nothing else is needed: the response is complete. */
+  complete: boolean;
+}
+
+/** Statuses whose response has no body, so its head is the whole response. */
+const BODYLESS_STATUSES: readonly number[] = [204, 304];
+
+/** ASCII/latin1 text of some bytes (heads are ASCII; no decode of the body). */
+function latin1Text(bytes: Uint8Array, limit: number = bytes.length): string {
+  let out = '';
+  for (let index = 0; index < Math.min(limit, bytes.length); index += 1) {
+    out += String.fromCharCode(bytes[index] as number);
+  }
+  return out;
+}
+
+/** True when `bytes` ends with the ASCII `suffix`. */
+function endsWithAscii(bytes: Uint8Array, suffix: string): boolean {
+  if (bytes.length < suffix.length) {
+    return false;
+  }
+  const start = bytes.length - suffix.length;
+  for (let index = 0; index < suffix.length; index += 1) {
+    if (bytes[start + index] !== suffix.charCodeAt(index)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Case-insensitive value of header `name` inside an already decoded head. */
+function headerValue(head: string, name: string): string | null {
+  const wanted = name.toLowerCase();
+  for (const line of head.split('\r\n').slice(1)) {
+    const colon = line.indexOf(':');
+    if (colon <= 0) {
+      continue;
+    }
+    if (line.slice(0, colon).trim().toLowerCase() === wanted) {
+      return line.slice(colon + 1).trim();
+    }
+  }
+  return null;
+}
+
+/**
+ * Tells whether the bytes read so far are a complete HTTP response.
+ *
+ * Completion is decided by what the response itself declares: a `Content-Length`
+ * that is satisfied, a chunked body that reached its last-chunk terminator, a
+ * bodyless status, or — when the response carries no framing at all — only the
+ * peer closing the channel (so `complete` stays `false` here and the caller
+ * finishes on `eof`). Pure, so it is pinned by unit tests.
+ */
+export function inspectHttpResponse(bytes: Uint8Array): HttpResponseHead {
+  const head = latin1Text(bytes, HTTP_MAX_HEAD_BYTES);
+  const crlf = head.indexOf('\r\n\r\n');
+  const lf = crlf < 0 ? head.indexOf('\n\n') : -1;
+  const headEnd = crlf >= 0 ? crlf + 4 : lf >= 0 ? lf + 2 : -1;
+  if (headEnd < 0) {
+    return { status: null, headEnd: -1, complete: false };
+  }
+  const match = /^HTTP\/\d(?:\.\d)?\s+(\d{3})/.exec(head);
+  if (match === null) {
+    return { status: null, headEnd, complete: false };
+  }
+  const status = Number(match[1]);
+  if (status < 200 || BODYLESS_STATUSES.includes(status)) {
+    return { status, headEnd, complete: true };
+  }
+  const headers = head.slice(0, headEnd);
+  const contentLength = headerValue(headers, 'content-length');
+  if (contentLength !== null && /^\d+$/.test(contentLength)) {
+    return { status, headEnd, complete: bytes.length - headEnd >= Number(contentLength) };
+  }
+  if ((headerValue(headers, 'transfer-encoding') ?? '').toLowerCase().includes('chunked')) {
+    return { status, headEnd, complete: endsWithAscii(bytes, '0\r\n\r\n') };
+  }
+  return { status, headEnd, complete: false };
+}
+
+/** Options of one HTTP exchange over a tunnel channel. */
+export interface HttpExchangeOptions {
+  /** Budget of the whole exchange, in ms (default `HTTP_EXCHANGE_TIMEOUT_MS`). */
+  timeoutMs?: number;
+  /** Per-read window handed to the core, in ms (default `CHANNEL_READ_TIMEOUT_MS`). */
+  readTimeoutMs?: number;
+  /** Largest response it assembles before refusing, in bytes. */
+  maxBytes?: number;
+  /** Read frames it may consume before refusing. */
+  maxFrames?: number;
+  /** Bridge/logger/timeout overrides (`deps.call` is the native bridge). */
+  deps?: ProvisionDeps;
+}
+
+/** Outcome of one HTTP exchange over the tunnel. */
+export type HttpExchangeResult =
+  | {
+      ok: true;
+      /** Status code of the response line, or `null` when there was none. */
+      status: number | null;
+      /** Response head text (empty when no complete head arrived). */
+      head: string;
+      /** Everything the channel delivered, in order. */
+      response: Uint8Array;
+      /** True when the response is complete per its own framing. */
+      complete: boolean;
+      /** True when the peer closed the channel before the framing was satisfied. */
+      eof: boolean;
+      /** Read frames consumed. */
+      frames: number;
+    }
+  | { ok: false; error: ProvisionFailure };
+
+/**
+ * Speaks one HTTP request/response over the tunnel (S4): writes the request on
+ * the channel serving `port`, then reads frames until the response is complete
+ * (its own framing) or the peer closes the channel (S7: a closed channel is an
+ * `ok` result with `eof:true`, not a hang, and a failed read is a failure with
+ * the core's reason). Every wait is bounded: the per-read window by
+ * `readTimeoutMs` plus the TS guard, the whole exchange by `timeoutMs`.
+ */
+export async function httpOverTunnel(
+  tunnel: TunnelHandles,
+  port: number,
+  request: string | Uint8Array,
+  options: HttpExchangeOptions = {},
+): Promise<HttpExchangeResult> {
+  const channel = tunnelChannelFor(tunnel, port);
+  if (channel === null) {
+    return {
+      ok: false,
+      error: { kind: 'NoChannel', message: `El túnel no tiene un canal abierto al puerto ${port}.` },
+    };
+  }
+  const deps = options.deps ?? {};
+  const readWindow = options.readTimeoutMs ?? CHANNEL_READ_TIMEOUT_MS;
+  const maxBytes = options.maxBytes ?? HTTP_MAX_RESPONSE_BYTES;
+  const maxFrames = options.maxFrames ?? HTTP_MAX_FRAMES;
+  const deadline = Date.now() + (options.timeoutMs ?? HTTP_EXCHANGE_TIMEOUT_MS);
+
+  const written = await channelWrite(
+    tunnel.sessionId,
+    channel,
+    typeof request === 'string' ? utf8Bytes(request) : request,
+    deps,
+  );
+  if (!written.ok) {
+    return { ok: false, error: written.error };
+  }
+
+  let response = new Uint8Array(0);
+  let frames = 0;
+  let complete = false;
+  let eof = false;
+  let status: number | null = null;
+  let headEnd = -1;
+
+  while (frames < maxFrames) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return { ok: false, error: { kind: 'Timeout', message: TIMEOUT_COPY } };
+    }
+    const frame = await channelRead(tunnel.sessionId, channel, Math.max(1, Math.min(readWindow, remaining)), deps);
+    if (!frame.ok) {
+      return { ok: false, error: frame.error };
+    }
+    frames += 1;
+    if (frame.bytes.length > 0) {
+      if (response.length + frame.bytes.length > maxBytes) {
+        const error: ProvisionFailure = {
+          kind: 'TooLarge',
+          message: `La respuesta pasó el máximo de ${maxBytes} bytes.`,
+        };
+        await logChannelFailure(deps, channel, error, { received: response.length + frame.bytes.length });
+        return { ok: false, error };
+      }
+      const merged = new Uint8Array(response.length + frame.bytes.length);
+      merged.set(response);
+      merged.set(frame.bytes, response.length);
+      response = merged;
+    }
+    const head = inspectHttpResponse(response);
+    status = head.status ?? status;
+    headEnd = head.headEnd >= 0 ? head.headEnd : headEnd;
+    if (head.complete) {
+      complete = true;
+      break;
+    }
+    if (headEnd < 0 && response.length > HTTP_MAX_HEAD_BYTES) {
+      const error: ProvisionFailure = {
+        kind: 'Frame',
+        message: 'La respuesta no trae cabeceras HTTP válidas.',
+      };
+      await logChannelFailure(deps, channel, error, { received: response.length });
+      return { ok: false, error };
+    }
+    if (frame.eof) {
+      eof = true;
+      break;
+    }
+  }
+
+  if (eof && headEnd < 0) {
+    const error: ProvisionFailure = {
+      kind: 'Frame',
+      message: 'La respuesta terminó sin cabeceras HTTP.',
+    };
+    await logChannelFailure(deps, channel, error, { received: response.length });
+    return { ok: false, error };
+  }
+  if (!complete && !eof) {
+    const error: ProvisionFailure = {
+      kind: 'Frame',
+      message: `La respuesta no terminó en ${maxFrames} lecturas.`,
+    };
+    await logChannelFailure(deps, channel, error, { received: response.length, frames });
+    return { ok: false, error };
+  }
+
+  return {
+    ok: true,
+    status,
+    head: headEnd >= 0 ? latin1Text(response, headEnd) : '',
+    response,
+    // A head completed at eof with no framing header is the whole response.
+    complete: complete || headEnd >= 0,
+    eof,
+    frames,
+  };
+}
+
+/** What `closeTunnel` actually closed. */
+export interface TunnelCloseReport {
+  /** True only when every channel closed without an error. */
+  ok: boolean;
+  /** Ports whose channel closed. */
+  closed: number[];
+  /** Ports whose close failed, with the core reason verbatim. */
+  errors: { port: number; error: ProvisionFailure }[];
+}
+
+/**
+ * Closes every channel of the tunnel, best effort and honest (S4/S7): one
+ * failing close does not skip the rest and never throws; a channel that is
+ * already gone answers the core's `ssh` failure in `errors`.
+ */
+export async function closeTunnel(tunnel: TunnelHandles, deps: ProvisionDeps = {}): Promise<TunnelCloseReport> {
+  const closed: number[] = [];
+  const errors: { port: number; error: ProvisionFailure }[] = [];
+  for (const channel of tunnel.channels) {
+    const outcome = await channelClose(tunnel.sessionId, channel, deps);
+    if (outcome.ok) {
+      closed.push(channel.port);
+    } else {
+      errors.push({ port: channel.port, error: outcome.error });
+    }
+  }
+  return { ok: errors.length === 0, closed, errors };
+}
+
+/* ------------------------------------------------------------------ *
  * The flow
  * ------------------------------------------------------------------ */
 
@@ -695,7 +1310,16 @@ export async function provisionFlow(
   if (!tunneled.ok) {
     return stop('tunnel', tunneled.error, tunneled.raw);
   }
+  // The handles are the whole point of the step: keep them instead of dropping
+  // the result, or fail honestly when the core reported no channel (S4/S7).
+  let channels: TunnelChannel[];
+  try {
+    channels = parseTunnelChannels(tunneled.result);
+  } catch (error) {
+    return stop('tunnel', toChannelFailure(error), tunneled.result ?? null);
+  }
   callbacks.onStepDone?.('tunnel', tunneled.result);
+  log.info?.('túnel SSH abierto', { channels });
 
-  return { ok: true, sessionId, registration };
+  return { ok: true, sessionId, registration, tunnel: { sessionId, channels } };
 }
