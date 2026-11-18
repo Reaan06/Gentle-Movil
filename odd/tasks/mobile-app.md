@@ -36,6 +36,8 @@ this file (specs, tasks, log).
 - T7 (S1,S2) detect extension on PC loopback + SSH tunnel + register device key → Rust FFI (`sshExec`, `sshForwardLocal`) [pending, rewritten by gentle-movil-pivote]
 - T7b (S4+L10) suite install by SSH when the owner picks "both" modes: detect gentle-shell/engram/gentle-ai, install missing ones via exec, verify → provision step + mode-choice artboard [pending, added by owner amendment]
 - T7c (V5) Overview dashboard screen `/overview` per design/mobile-app-core/01-overview.html + views-plan §V5: pure view model in mobile/lib/overview.ts (tiles, 7-day token chart, states loading/empty/success/stale/offline, es-AR formatting), thin rendering shell mobile/app/overview.tsx, injectable demo data provider until the bridge data lands [pending, owner handoff 2026-11-18]
+- T7d (V6) Sessions list screen `/sessions-list` per design/mobile-app-core/02-sessions-list.html + views-plan §V6: pure session-list model in mobile/lib/sessions.ts (filters Working/Waiting/Done, session rows, honest demo provider), thin shell mobile/app/sessions-list.tsx [pending, owner batch 2026-11-18]
+- T7e (V9) Waiting inbox screen `/waiting-inbox` per design/mobile-app-core/04-waiting-inbox.html + views-plan §V9: pure inbox model in mobile/lib/waiting.ts (question cards, answer/quick-reply intents, demo provider), thin shell mobile/app/waiting-inbox.tsx [pending, owner batch 2026-11-18]
 - T8 (S1,S3) connected mode UI: V5–V13 over SSH tunnel → Expo screens + tunnel client (`/device/ws`, `X-GC-Proto-App: 1`) [pending]
 - T9 (S3) local mode: editor + embedded agent + gitoxide → Expo screens + nodejs-mobile runtime + `fs_*`/`git_*` FFI [pending]
 - T10 (S2) onboarding flow 100% from phone, V1–V4 → Expo screens + Rust pairing flow [pending]
