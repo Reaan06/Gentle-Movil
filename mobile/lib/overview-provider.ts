@@ -113,7 +113,11 @@ export function bridgeOverviewProvider(
     lastGood.mark();
     const data = overviewFromSessions(sessionsResult.body.sessions ?? []);
     if (health.ok) {
-      data.paired = { label: 'Live', host: health.body.name };
+      // §9.2 sends `bridge`; older builds sent `name`. Never invent a host.
+      const identity = health.body.bridge ?? health.body.name;
+      if (identity !== undefined) {
+        data.paired = { label: 'Live', host: identity };
+      }
     }
     if (data.working.count + data.waiting.count + data.done.count === 0) {
       throw new EmptySignal({ kind: 'empty' });
