@@ -87,7 +87,9 @@ function fakeBridge(script = {}) {
         if (key !== 'ok') {
           return JSON.stringify({ ok: false, error: { kind: key, message: `falló ${key}` }, raw: null });
         }
-        return JSON.stringify({ ok: true, result: { key: { public_hex: DEVICE_PUBKEY_HEX, secret: {} } } });
+        // The real core answers {"ok":true,"key":{...}} with the key at the TOP level
+        // (cabi gc_device_key_generate); the fake mirrors that placement.
+        return JSON.stringify({ ok: true, key: { public_hex: DEVICE_PUBKEY_HEX, secret: {} } });
       }
       const behaviour = script[payload.step] ?? script[fn] ?? 'ok';
       if (behaviour === 'hang') {
@@ -268,7 +270,7 @@ test('a tunnel without channel handles fails the step instead of reporting a tun
         return JSON.stringify({ ok: true, result: { sessionId: 7, fingerprint: PAIR.fp } });
       }
       if (fn === 'gc_device_key_generate') {
-        return JSON.stringify({ ok: true, result: { key: { public_hex: DEVICE_PUBKEY_HEX, secret: {} } } });
+        return JSON.stringify({ ok: true, key: { public_hex: DEVICE_PUBKEY_HEX, secret: {} } });
       }
       // The core answered ok but reported no opened channel.
       return JSON.stringify({ ok: true, result: payload.step === 'tunnel' ? { forwards: [] } : { step: payload.step } });
