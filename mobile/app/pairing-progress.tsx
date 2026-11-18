@@ -11,16 +11,12 @@ import {
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-/** Daemon device surface port (protocol spec §4); direct LAN path. */
-const DAEMON_PORT = 43722;
-
 import { GhostButton } from '../components/GhostButton';
 import { PrimaryButton } from '../components/PrimaryButton';
 import type { PairInfo, SshCredential } from '../lib/core';
 import { logger } from '../lib/logger';
 import {
   PROVISION_ROWS,
-  connectPair,
   overallPercent,
   provisionFlow,
   rowForStep,
@@ -34,10 +30,11 @@ import { colors, elevation, radius, spacing, typography } from '../lib/theme';
  * `design/mobile-app-onboarding/03-pairing-progress.html`, protocol §2–§4).
  *
  * The screen owns no state machine: `lib/provision.ts` runs
- * fingerprint-confirm → detect → upload → verify → start → register → tunnel
- * against the native core, and this view only paints the five visible rows,
- * the step-based progress bar and the failure callout. Every step transition
- * is a real event of that pipeline — there is no timer-driven fake progress.
+ * connect → fingerprint → detect → register → tunnel over SSH (pivote sin
+ * daemon, `odd/tasks/gentle-movil-pivote.md` S4/S5), and this view only paints
+ * the five visible rows, the step-based progress bar and the failure callout.
+ * Every step transition is a real event of that pipeline — there is no
+ * timer-driven fake progress.
  *
  * Failure path: the callout head is the verbatim reason the core returned,
  * `provision.ts` already recorded it with `logger.failure` (`{step, error,
@@ -45,26 +42,15 @@ import { colors, elevation, radius, spacing, typography } from '../lib/theme';
  */
 
 const EYEBROW = 'conexión · paso 2 de 2';
-const TITLE = 'Instalando el compañero';
+const TITLE = 'Emparejando tu computadora';
 
-/** Live detail line of each native step (artboard: one line per row). */
+/** Live detail line of each step (artboard: one line per row). */
 const STEP_COPY: Record<ProvisionStep, string> = {
-  'fingerprint-confirm': 'Confirmando la huella del host…',
-  detect: 'Comprobando la versión del daemon…',
-  upload: 'Subiendo el binario del daemon…',
-  verify: 'Verificando la firma ed25519…',
-  start: 'Arrancando el daemon…',
-  register: 'Registrando tu clave ed25519…',
-  tunnel: 'Abriendo el túnel seguro…',
-};
-
-/** Percent reached after each install sub-step (used when the core is silent). */
-const INSTALL_PERCENT: Partial<Record<ProvisionStep, number>> = {
-  'fingerprint-confirm': 0,
-  detect: 25,
-  upload: 70,
-  verify: 85,
-  start: 95,
+  connect: 'Abriendo la conexión segura…',
+  fingerprint: 'Comparando la huella del QR con la del host…',
+  detect: 'Buscando la extensión de Pi en tu computadora…',
+  register: 'Instalando tu clave ed25519 en el host…',
+  tunnel: 'Abriendo el túnel a la extensión…',
 };
 
 type RowState = 'pending' | 'active' | 'done' | 'failed';
@@ -72,24 +58,24 @@ type Rows = Record<ProvisionRow, RowState>;
 type Status = 'running' | 'ok' | 'failed' | 'missing';
 
 const initialRows = (): Rows => ({
-  ssh: 'pending',
+  connect: 'pending',
   fingerprint: 'pending',
-  install: 'pending',
+  detect: 'pending',
   register: 'pending',
   tunnel: 'pending',
 });
 
 const ROW_TEXT: Record<ProvisionRow, { title: string; pending: string; done: string }> = {
-  ssh: { title: 'Conectado por SSH', pending: 'Abriendo la conexión segura', done: 'sesión SSH abierta' },
+  connect: { title: 'Conectado por SSH', pending: 'Abriendo la conexión segura', done: 'sesión SSH abierta' },
   fingerprint: {
-    title: 'Huella confirmada',
+    title: 'Huella verificada',
     pending: 'Compará con la que muestra tu computadora',
     done: 'ed25519 coincide',
   },
-  install: {
-    title: 'Instalando daemon',
-    pending: 'Comprobando versión y subiendo el binario',
-    done: 'daemon instalado y firmado',
+  detect: {
+    title: 'Extensión Pi detectada',
+    pending: 'Buscándola en el loopback de tu computadora',
+    done: 'escuchando en 43721 y 43722',
   },
   register: {
     title: 'Registrar dispositivo',
@@ -199,9 +185,10 @@ export default function PairingProgressScreen() {
   const auth = single(params.auth);
   const secret = single(params.secret);
   const passphrase = single(params.passphrase);
-  // Pairing code embedded in the QR (CLI `gentle-movil pair`): with the daemon
-  // already running on the host, invite+code authenticate the claim over HTTP —
-  // QR-only pairing, no credential. Empty for the SSH fallback path.
+  // Pairing code from the QR (`gc://pair?…&code=…`). The pivot flow pairs over
+  // SSH only (`connect → fingerprint → detect → register → tunnel`), so the
+  // invite/code travel inside `PairInfo` for the protocol but no HTTP claim is
+  // attempted: the app reaches the extension exclusively through the tunnel.
   const codeParam = single(params.code);
   const pwParam = single(params.pw);
 
@@ -215,6 +202,8 @@ export default function PairingProgressScreen() {
       token,
       fp,
       code: codeParam,
+      // Extension device-surface port (protocol §4); the app only reaches it
+      // through the SSH forward, never over the LAN.
       dport: 43722,
       pw: pwParam,
       proto,
@@ -238,71 +227,10 @@ export default function PairingProgressScreen() {
   const [rows, setRows] = useState<Rows>(initialRows);
   const [status, setStatus] = useState<Status>('running');
   const [subLine, setSubLine] = useState('Preparando el emparejamiento…');
-  const [installPercent, setInstallPercent] = useState(0);
   const [failure, setFailure] = useState<{ label: string; reason: string; kind: string } | null>(null);
   const running = useRef(false);
 
   const missing = host === '' || user === '';
-
-  /**
-   * QR-only fast path (owner decision: «unicamente escaneando el QR ya lo
-   * empareje»): the daemon already runs on the host, so pairing happens over
-   * HTTP — POST /api/pairing/claim with the QR's single-use invite+code — with
-   * no SSH and no credential. The SSH pipeline below stays the fallback for
-   * hosts without a running daemon (then V2 collects the credential).
-   */
-  const runClaim = useCallback(async () => {
-    if (running.current || missing || codeParam === '') {
-      return;
-    }
-    running.current = true;
-    setStatus('running');
-    setFailure(null);
-    setRows(initialRows());
-    setInstallPercent(0);
-    setSubLine('Conectando con el daemon…');
-
-    const done = (step: ProvisionRow) => setRows((previous) => ({ ...previous, [step]: 'done' }));
-    try {
-      // 1) Reach the daemon device surface directly over the LAN.
-      const response = await fetch(`http://${host}:${DAEMON_PORT}/api/pairing/claim`, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          // The daemon's device-surface middleware treats POSTs as browser
-          // requests and requires an Origin it recognizes. Native clients don't
-          // send one, so we declare our own; the host allows it via
-          // PI_COMPANION_ALLOWED_ORIGINS (docs/cli.md, doctor hints it).
-          origin: `http://${host}:${DAEMON_PORT}`,
-        },
-        body: JSON.stringify({ invite: token, code: codeParam, deviceName: 'Gentle Movil' }),
-        signal: AbortSignal.timeout(15_000),
-      });
-      if (!response.ok) {
-        const body = await response.text().catch(() => '');
-        throw new Error(`El daemon rechazó el emparejamiento (HTTP ${response.status}): ${body.slice(0, 200)}`);
-      }
-      const result = (await response.json()) as { deviceId?: string; token?: string };
-      log.info('claim ok', { deviceId: result.deviceId ?? 'sin id' });
-
-      done('ssh');
-      done('fingerprint');
-      setRows((previous) => ({ ...previous, install: 'done' }));
-      setSubLine('El daemon ya está corriendo en tu computadora.');
-      done('register');
-      done('tunnel');
-      setStatus('ok');
-      setSubLine('Emparejado. Ya podés usar Gentle Movil con esta computadora.');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      log.failure('claim', error, { host, port: DAEMON_PORT });
-      setRows((previous) => ({ ...previous, ssh: 'failed' }));
-      setStatus('failed');
-      setFailure({ label: 'Emparejamiento directo', reason: message, kind: 'claim' });
-    } finally {
-      running.current = false;
-    }
-  }, [codeParam, host, log, missing, token]);
 
   const run = useCallback(async () => {
     if (running.current || missing) {
@@ -312,29 +240,11 @@ export default function PairingProgressScreen() {
     setStatus('running');
     setFailure(null);
     setRows(initialRows());
-    setInstallPercent(0);
     setSubLine('Abriendo la conexión segura…');
 
-    // QR-only pairing when the host already runs the daemon (no credential in
-    // the flow — the QR's invite+code authenticate over HTTP, spec §1+log).
-    if (credential === null && codeParam !== '') {
-      running.current = false;
-      await runClaim();
-      return;
-    }
-
-    const connection = await connectPair(pair, credential, { logger: log });
-    if (!connection.ok) {
-      setRows((previous) => ({ ...previous, ssh: 'failed' }));
-      setStatus('failed');
-      setFailure({ label: ROW_TEXT.ssh.title, reason: connection.error.message || connection.error.kind, kind: connection.error.kind });
-      log.failure('ssh', connection.error, connection.raw);
-      running.current = false;
-      return;
-    }
-
-    setRows((previous) => ({ ...previous, ssh: 'done' }));
-
+    // The flow owns every step, connect included (S4): the core's SSH session,
+    // the QR fingerprint, the extension on loopback, the phone key in
+    // `authorized_keys` and the forward to the extension ports.
     const result = await provisionFlow(
       pair,
       credential,
@@ -343,30 +253,15 @@ export default function PairingProgressScreen() {
           setRows((previous) => ({ ...previous, [rowForStep(step)]: 'active' }));
           setSubLine(STEP_COPY[step]);
         },
-        onStepDone(step, stepResult) {
-          const row = rowForStep(step);
-          const reported =
-            typeof stepResult === 'object' && stepResult !== null && 'percent' in stepResult
-              ? (stepResult as { percent?: unknown }).percent
-              : undefined;
-          if (typeof reported === 'number') {
-            setInstallPercent(Math.max(0, Math.min(100, reported)));
-          } else if (INSTALL_PERCENT[step] !== undefined) {
-            setInstallPercent(INSTALL_PERCENT[step] as number);
-          }
-          if (step === 'fingerprint-confirm' || step === 'start' || step === 'register' || step === 'tunnel') {
-            setRows((previous) => ({ ...previous, [row]: 'done' }));
-          }
-          if (step === 'start') {
-            setInstallPercent(100);
-          }
+        onStepDone(step) {
+          setRows((previous) => ({ ...previous, [rowForStep(step)]: 'done' }));
         },
         onStepError(step, error) {
           setRows((previous) => ({ ...previous, [rowForStep(step)]: 'failed' }));
           setFailure({ label: ROW_TEXT[rowForStep(step)].title, reason: error.message || error.kind, kind: error.kind });
         },
       },
-      { sessionId: connection.sessionId, logger: log },
+      { logger: log },
     );
 
     if (result.ok) {
@@ -402,7 +297,7 @@ export default function PairingProgressScreen() {
 
   const doneRows = PROVISION_ROWS.filter((row) => rows[row] === 'done').length;
   const activeRow = PROVISION_ROWS.find((row) => rows[row] === 'active');
-  const partial = rows.install === 'active' ? installPercent / 100 : activeRow === undefined ? 0 : 0.5;
+  const partial = activeRow === undefined ? 0 : 0.5;
   const percent = overallPercent(doneRows, PROVISION_ROWS.length, status === 'ok' ? 0 : partial);
 
   const chipLabel = status === 'ok' ? 'listo' : status === 'running' ? 'emparejando' : 'revisar';
@@ -476,7 +371,6 @@ export default function PairingProgressScreen() {
         <View style={styles.steps}>
           {PROVISION_ROWS.map((row, index) => {
             const state = rows[row];
-            const isInstall = row === 'install';
             return (
               <View
                 key={row}
@@ -492,14 +386,11 @@ export default function PairingProgressScreen() {
                 <View style={styles.stepBody}>
                   <Text style={[styles.stepTitle, state === 'pending' && styles.stepTitlePending]}>
                     {ROW_TEXT[row].title}
-                    {isInstall && state === 'active' ? (
-                      <Text style={styles.stepPercent}> {installPercent}%</Text>
-                    ) : null}
                   </Text>
                   <Text style={[styles.stepSub, row !== 'fingerprint' && styles.stepSubMono]}>
                     {state === 'active'
                       ? subLine
-                      : state === 'done' && row === 'ssh'
+                      : state === 'done' && row === 'connect'
                         ? `${host}:${pair.port} · SSH`
                         : state === 'done' && row === 'fingerprint'
                           ? `${shortFingerprint(fp)} coincide`
@@ -507,16 +398,6 @@ export default function PairingProgressScreen() {
                             ? ROW_TEXT[row].done
                             : ROW_TEXT[row].pending}
                   </Text>
-                  {isInstall && state === 'active' ? (
-                    <View
-                      style={[styles.track, styles.miniTrack]}
-                      accessibilityRole="progressbar"
-                      accessibilityLabel="Descarga e instalación del daemon"
-                      accessibilityValue={{ min: 0, max: 100, now: installPercent }}
-                    >
-                      <View style={[styles.trackFill, { width: `${installPercent}%` }]} />
-                    </View>
-                  ) : null}
                 </View>
                 <Text
                   style={[
@@ -749,10 +630,6 @@ const styles = StyleSheet.create({
     borderRadius: radius.pill,
     backgroundColor: colors.accent,
   },
-  miniTrack: {
-    height: 6,
-    marginTop: spacing.sm,
-  },
   steps: {
     marginTop: 14,
     borderWidth: 1,
@@ -821,11 +698,6 @@ const styles = StyleSheet.create({
   stepTitlePending: {
     color: colors.muted,
     fontWeight: '500',
-  },
-  stepPercent: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: colors.accentText,
   },
   stepSub: {
     fontSize: 11,
