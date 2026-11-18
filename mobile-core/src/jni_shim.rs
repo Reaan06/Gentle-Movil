@@ -142,32 +142,32 @@ fn panic_envelope() -> *mut c_char {
 /// Returns the ABI version string (e.g. "1"); an error envelope if the JVM refuses it.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcAbiVersion(
-    env: &mut JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
     let version = catch_unwind(AssertUnwindSafe(|| crate::cabi::gc_abi_version())).unwrap_or(0);
-    marshal_answer(env, Some(version.to_string().as_str()))
+    marshal_answer(&mut env, Some(version.to_string().as_str()))
 }
 
 /// Parses a `gc://pair?…` URI (JSON in/out), mirroring `gc_pair_from_qr`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcPairFromQr(
-    env: &mut JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     json: JString,
 ) -> jstring {
     // `extern "C" fn` items do not implement `FnOnce`, so the ABI function is wrapped.
-    call_one_string(env, &json, |uri| crate::cabi::gc_pair_from_qr(uri))
+    call_one_string(&mut env, &json, |uri| crate::cabi::gc_pair_from_qr(uri))
 }
 
 /// Opens an authenticated SSH session from a JSON config; returns `{"ok":true,"sessionId":N}`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshConnect(
-    env: &mut JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     json: JString,
 ) -> jstring {
-    call_one_string(env, &json, |config| crate::cabi::gc_ssh_connect(config))
+    call_one_string(&mut env, &json, |config| crate::cabi::gc_ssh_connect(config))
 }
 
 /// Error envelope for a channel document the split rejects (`input`, like the C ABI's own
@@ -217,11 +217,11 @@ fn channel_shim(
 /// document `{"sessionId":N,"channelId":M,"bytes":"<base64>"}`.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshChannelWrite(
-    env: &mut JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     json: JString,
 ) -> jstring {
-    channel_shim(env, json, |session_id, channel_id, payload| {
+    channel_shim(&mut env, json, |session_id, channel_id, payload| {
         crate::cabi::gc_ssh_channel_write(session_id, channel_id, payload)
     })
 }
@@ -232,11 +232,11 @@ pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshChannelWrite(
 /// stays a non-blocking poll.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshChannelRead(
-    env: &mut JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     json: JString,
 ) -> jstring {
-    channel_shim(env, json, |session_id, channel_id, payload| {
+    channel_shim(&mut env, json, |session_id, channel_id, payload| {
         crate::cabi::gc_ssh_channel_read(session_id, channel_id, payload)
     })
 }
@@ -245,11 +245,11 @@ pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshChannelRead(
 /// `{"sessionId":N,"channelId":M}`; the document's remaining fields are unused.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshChannelClose(
-    env: &mut JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     json: JString,
 ) -> jstring {
-    channel_shim(env, json, |session_id, channel_id, _payload| {
+    channel_shim(&mut env, json, |session_id, channel_id, _payload| {
         crate::cabi::gc_ssh_channel_close(session_id, channel_id)
     })
 }
@@ -258,13 +258,13 @@ pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshChannelClose(
 /// `{"sessionId":N, ...step}`; this shim splits the handle out and forwards.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcProvisionStep(
-    env: &mut JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     json: JString,
 ) -> jstring {
-    let input = match from_jstring(env, &json) {
+    let input = match from_jstring(&mut env, &json) {
         Ok(input) => input,
-        Err(reason) => return refuse_input(env, &reason),
+        Err(reason) => return refuse_input(&mut env, &reason),
     };
     let raw = match serde_json::from_str::<serde_json::Value>(&input) {
         Ok(mut value) => {
@@ -283,25 +283,25 @@ pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcProvisionStep(
         }
         Err(_) => panic_envelope(),
     };
-    pointer_to_jstring(env, raw)
+    pointer_to_jstring(&mut env, raw)
 }
 
 /// `gc_device_key_generate()` takes no input on the Rust side; Kotlin passes a
 /// JSON document for future options, ignored here.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcDeviceKeyGenerate(
-    env: &mut JNIEnv,
+    mut env: JNIEnv,
     _class: JClass,
     _json: JString,
 ) -> jstring {
     let raw = catch_unwind(AssertUnwindSafe(|| crate::cabi::gc_device_key_generate())).unwrap_or_else(|_| panic_envelope());
-    pointer_to_jstring(env, raw)
+    pointer_to_jstring(&mut env, raw)
 }
 
 /// Compatibility no-op: the shim frees every returned string immediately, so nothing to release.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcFree(
-    _env: &mut JNIEnv,
+    _env: JNIEnv,
     _class: JClass,
     pointer: jlong,
 ) {
