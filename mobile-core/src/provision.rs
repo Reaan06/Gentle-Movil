@@ -50,6 +50,10 @@ pub const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// Delay between two readiness probes while waiting for the daemon to come up.
 pub const START_PROBE_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Fixed budget for the rollback kill: SIGTERM plus proof that the pid exited (§5, S7).
+/// The readiness window may overshoot [`START_TIMEOUT`] by at most this much.
+const TERMINATE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// How long the registration exchange may take before it is reported as a timeout.
 pub const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -293,8 +297,8 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Start the uploaded daemon detached and wait until its port answers (§3.4).
 ///
-/// Uses the §5 window ([`START_TIMEOUT`]). On a timeout the caller's next step is
-/// [`rollback`], so the error names the pid and the port that never answered.
+/// Uses the §5 window ([`START_TIMEOUT`]). A daemon that does not answer in time is
+/// terminated and reported, and the caller's next step is [`rollback`].
 pub async fn start_daemon(
     session: &SshSession,
     remote_path: &str,
@@ -304,6 +308,9 @@ pub async fn start_daemon(
 }
 
 /// [`start_daemon`] with an explicit readiness window, so offline tests do not wait 10 s.
+///
+/// The window bounds the probe itself, and any failure after the detached start kills that
+/// exact pid before returning: a stale daemon must not survive [`rollback`] (§5, S7).
 pub async fn start_daemon_with_timeout(
     session: &SshSession,
     remote_path: &str,
@@ -334,24 +341,104 @@ pub async fn start_daemon_with_timeout(
     let pid = parse_pid(&String::from_utf8_lossy(&output.stdout))?;
 
     let started = std::time::Instant::now();
+    let mut last_error = String::from("window closed");
     loop {
-        match session.direct_tcp("127.0.0.1", port).await {
-            Ok(channel) => {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(start_failure(session, pid, port, timeout, &last_error).await);
+        }
+        // The open is bounded by the remaining window so a stalled host cannot stretch it.
+        let pause = match tokio::time::timeout(remaining, session.direct_tcp("127.0.0.1", port))
+            .await
+        {
+            Ok(Ok(channel)) => {
                 let _ = channel.close().await;
                 return Ok(StartResult { pid, port });
             }
+            Ok(Err(error)) => {
+                last_error = error.to_string();
+                // Recompute instead of reusing the pre-await value, which is now stale.
+                timeout.saturating_sub(started.elapsed())
+            }
+            // The open consumed the whole window: the timeout is now, so never sleep again.
+            Err(_) => {
+                last_error = "the channel open never completed".to_string();
+                return Err(start_failure(session, pid, port, timeout, &last_error).await);
+            }
+        };
+        tokio::time::sleep(START_PROBE_INTERVAL.min(pause)).await;
+    }
+}
+
+/// Terminate the pid the start reported and build the readiness-timeout error.
+///
+/// §5: a kill that cannot land, stalls or leaves the pid running is named in the message
+/// rather than hidden or turned into a panic (S7).
+async fn start_failure(
+    session: &SshSession, pid: u32, port: u16, timeout: Duration, reason: &str,
+) -> CoreError {
+    let outcome = terminate(session, pid).await;
+    CoreError::ssh(format!(
+        "daemon pid {pid} did not answer on 127.0.0.1:{port} within {} ms ({reason}); {outcome}",
+        timeout.as_millis()
+    ))
+}
+
+/// Kill `pid` and prove it exited, all inside the fixed [`TERMINATE_TIMEOUT`] budget.
+///
+/// `kill -0` succeeds while the pid is alive, so a failing probe proves the exit; every
+/// step is a bounded `exec`, so a host stalled mid-kill cannot hang §5.
+async fn terminate(session: &SshSession, pid: u32) -> String {
+    let deadline = std::time::Instant::now() + TERMINATE_TIMEOUT;
+    match bounded_exec(session, &format!("kill -TERM {pid}"), deadline).await {
+        Ok(output) if output.exit_code == 0 => {}
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return format!(
+                "terminating pid {pid} failed with exit code {}: {stderr}, so termination could not be confirmed",
+                output.exit_code
+            );
+        }
+        Err(error) => {
+            return format!(
+                "terminating pid {pid} failed ({error}), so termination could not be confirmed"
+            )
+        }
+    }
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return format!(
+                "pid {pid} did not exit within {} ms of SIGTERM and may still be running",
+                TERMINATE_TIMEOUT.as_millis()
+            );
+        }
+        match bounded_exec(session, &format!("kill -0 {pid}"), deadline).await {
+            Ok(output) if output.exit_code != 0 => return format!("pid {pid} was terminated"),
+            Ok(_) => {}
             Err(error) => {
-                let elapsed = started.elapsed();
-                if elapsed >= timeout {
-                    return Err(CoreError::ssh(format!(
-                        "daemon pid {pid} did not answer on 127.0.0.1:{port} within {} ms ({error})",
-                        timeout.as_millis()
-                    )));
-                }
-                let remaining = timeout.saturating_sub(elapsed);
-                tokio::time::sleep(START_PROBE_INTERVAL.min(remaining)).await;
+                return format!(
+                    "pid {pid} was sent SIGTERM but its exit could not be confirmed: {error}"
+                )
             }
         }
+        let pause = deadline.saturating_duration_since(std::time::Instant::now());
+        tokio::time::sleep(START_PROBE_INTERVAL.min(pause)).await;
+    }
+}
+
+/// Run one `exec` inside the shared termination budget, so a stalled host cannot hang §5.
+async fn bounded_exec(
+    session: &SshSession, script: &str, deadline: std::time::Instant,
+) -> Result<ExecOutput, CoreError> {
+    let command = posix(script);
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    match tokio::time::timeout(remaining, session.exec_once(&command)).await {
+        Ok(result) => result,
+        Err(_) => Err(CoreError::ssh(format!(
+            "the command did not complete within {} ms",
+            TERMINATE_TIMEOUT.as_millis()
+        ))),
     }
 }
 

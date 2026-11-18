@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -37,6 +38,8 @@ enum TcpReply {
     Events(Vec<ChannelEvent>),
     /// The tunnel cannot be opened (the daemon port does not answer yet).
     Failure(String),
+    /// The channel open never completes, like a host that stops answering mid-handshake.
+    Stall,
 }
 
 /// The shared script and the observed traffic.
@@ -48,6 +51,8 @@ struct Shared {
     sftp: Mutex<VecDeque<ChannelEvent>>,
     tcp_writes: Mutex<Vec<Vec<u8>>>,
     sftp_writes: Mutex<Vec<Vec<u8>>>,
+    /// Commands whose `execOnce` never completes (a host stalled mid-command).
+    stalled_exec: Mutex<Vec<String>>,
 }
 
 impl Shared {
@@ -65,6 +70,15 @@ impl Shared {
 
     fn push_tcp(&self, reply: TcpReply) {
         self.tcp.lock().expect("tcp queue").push_back(reply);
+    }
+
+    /// Make every `execOnce` whose command contains `needle` never return, like a host that
+    /// stalls mid-command.
+    fn stall_exec_containing(&self, needle: &str) {
+        self.stalled_exec
+            .lock()
+            .expect("stall")
+            .push(needle.to_string());
     }
 
     fn pop_tcp(&self) -> TcpReply {
@@ -127,6 +141,11 @@ impl TransportSession for ScriptedSession {
             .lock()
             .expect("commands")
             .push(command.to_string());
+        let stalled = self.shared.stalled_exec.lock().expect("stall");
+        if stalled.iter().any(|needle| command.contains(needle.as_str())) {
+            return Box::pin(std::future::pending());
+        }
+        drop(stalled);
         let output = self.shared.pop_exec();
         Box::pin(async move { Ok(output) })
     }
@@ -141,6 +160,7 @@ impl TransportSession for ScriptedSession {
             TcpReply::Failure(reason) => {
                 Box::pin(async move { Err(mobile_core::CoreError::ssh(reason)) })
             }
+            TcpReply::Stall => Box::pin(std::future::pending()),
             TcpReply::Events(events) => {
                 let channel = TcpChannel {
                     shared: Arc::clone(&self.shared),
@@ -645,6 +665,8 @@ async fn start_timeout_reports_and_rollback_restores_the_previous_binary() {
     for _ in 0..4 {
         script.push_tcp(TcpReply::Failure("connection refused".to_string()));
     }
+    script.push_exec(exec_ok("")); // kill -TERM of the pid that never answered
+    script.push_exec(exec_fail(1, "")); // kill -0: the pid is gone
     script.push_exec(exec_ok("")); // rollback mv
 
     let session = mock_session(&script).await;
@@ -671,10 +693,118 @@ async fn start_timeout_reports_and_rollback_restores_the_previous_binary() {
         "/home/reaan/.gentle-movil/daemon.prev"
     );
     let commands = script.commands();
+    assert_eq!(commands[1], posix_command("kill -TERM 700"));
+    assert_eq!(commands[2], posix_command("kill -0 700"));
     assert!(
-        commands[1].contains("mv -f") && commands[1].contains("daemon.prev"),
+        commands[3].contains("mv -f") && commands[3].contains("daemon.prev"),
         "{}",
-        commands[1]
+        commands[3]
+    );
+}
+
+#[tokio::test]
+async fn start_timeout_terminates_the_exact_pid_it_started() {
+    let script = shared();
+    script.push_exec(exec_ok("700\n"));
+    script.push_tcp(TcpReply::Failure("connection refused".to_string()));
+    script.push_tcp(TcpReply::Failure("connection refused".to_string()));
+    script.push_exec(exec_ok("")); // kill -TERM 700
+    script.push_exec(exec_fail(1, "")); // kill -0: the pid is gone
+    let session = mock_session(&script).await;
+    let error =
+        start_daemon_with_timeout(&session, REMOTE_PATH, 43722, Duration::from_millis(50))
+            .await
+            .expect_err("never answered");
+    assert!(error.to_string().contains("pid 700 was terminated"), "{error}");
+    assert_eq!(script.commands()[1], posix_command("kill -TERM 700"));
+    assert_eq!(script.commands()[2], posix_command("kill -0 700"));
+}
+
+#[tokio::test]
+async fn a_pid_that_survives_sigterm_is_reported_as_unconfirmed() {
+    let script = shared();
+    script.push_exec(exec_ok("700\n"));
+    script.push_tcp(TcpReply::Failure("connection refused".to_string()));
+    // SIGTERM lands and every `kill -0` succeeds: the daemon ignores TERM and keeps running.
+    for _ in 0..48 {
+        script.push_exec(exec_ok(""));
+    }
+    let session = mock_session(&script).await;
+    let error = start_daemon_with_timeout(&session, REMOTE_PATH, 43722, Duration::from_millis(50))
+        .await
+        .expect_err("never answered")
+        .to_string();
+    assert!(
+        error.contains("did not exit within") && error.contains("may still be running"),
+        "a surviving pid must be named: {error}"
+    );
+    assert!(!error.contains("was terminated"), "{error}");
+    let probe = posix_command("kill -0 700");
+    let commands = script.commands();
+    assert_eq!(commands[1], posix_command("kill -TERM 700"));
+    assert!(
+        commands.len() > 2 && commands[2..].iter().all(|command| *command == probe),
+        "the poll must only probe the exact pid: {commands:?}"
+    );
+}
+
+#[tokio::test]
+async fn start_readiness_window_expires_while_a_channel_open_stalls() {
+    let script = shared();
+    script.push_exec(exec_ok("700\n"));
+    script.push_tcp(TcpReply::Stall);
+    script.push_exec(exec_fail(1, "no such process\n"));
+    let session = mock_session(&script).await;
+    let window = Duration::from_secs(1);
+    let started = std::time::Instant::now();
+    let stalled = start_daemon_with_timeout(&session, REMOTE_PATH, 43722, window);
+    let outcome = tokio::time::timeout(Duration::from_secs(5), stalled)
+        .await
+        .expect("the readiness window must expire even when the channel open stalls");
+    let elapsed = started.elapsed();
+    let message = outcome.expect_err("no daemon answered").to_string();
+    assert!(
+        message.contains("the channel open never completed")
+            && message.contains("terminating pid 700 failed"),
+        "{message}"
+    );
+    // The stalled open consumed the whole window, so the recorded sequence is exactly the
+    // start and the kill: no probe step after it.
+    assert_eq!(script.commands().len(), 2, "{:?}", script.commands());
+    // And no sleep on the stale pre-await `remaining`, which would add up to
+    // START_PROBE_INTERVAL of overshoot past the window.
+    assert!(
+        elapsed < window + Duration::from_millis(180),
+        "the timeout must return at the window, not after a stale sleep: {elapsed:?}"
+    );
+    assert_eq!(script.commands()[1], posix_command("kill -TERM 700"));
+}
+
+#[tokio::test]
+async fn a_stalled_kill_still_returns_the_timeout_error_bounded() {
+    let script = shared();
+    script.push_exec(exec_ok("700\n"));
+    script.push_tcp(TcpReply::Failure("connection refused".to_string()));
+    script.stall_exec_containing("kill -TERM"); // the kill itself never completes
+    let session = mock_session(&script).await;
+    let started = std::time::Instant::now();
+    let stalled = start_daemon_with_timeout(&session, REMOTE_PATH, 43722, Duration::from_millis(60));
+    let outcome = tokio::time::timeout(Duration::from_secs(10), stalled)
+        .await
+        .expect("a stalled kill must not hang the timeout path");
+    let message = outcome.expect_err("no daemon answered").to_string();
+    assert!(
+        message.contains("daemon pid 700 did not answer on 127.0.0.1:43722"),
+        "{message}"
+    );
+    assert!(
+        message.contains("termination could not be confirmed"),
+        "the message must stay honest when the kill stalls: {message}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the bounded kill must return promptly: {:?}",
+        started.elapsed()
     );
 }
 

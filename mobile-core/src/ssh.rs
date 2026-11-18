@@ -526,9 +526,7 @@ impl TransportSession for RusshSession {
                 )
                 .await
                 .map_err(map_russh_error)?;
-            Ok(Box::new(RusshChannel {
-                channel: tokio::sync::Mutex::new(channel),
-            }) as Box<dyn TransportChannel>)
+            Ok(Box::new(RusshChannel::new(channel)) as Box<dyn TransportChannel>)
         })
     }
 
@@ -546,26 +544,57 @@ impl TransportSession for RusshSession {
                 .request_subsystem(true, name)
                 .await
                 .map_err(map_russh_error)?;
-            Ok(Box::new(RusshChannel {
-                channel: tokio::sync::Mutex::new(channel),
-            }) as Box<dyn TransportChannel>)
+            Ok(Box::new(RusshChannel::new(channel)) as Box<dyn TransportChannel>)
         })
     }
 }
 
-/// Live russh channel.
-struct RusshChannel {
-    // `Channel::wait` needs `&mut self` while `data`/`close` need `&self`; the async mutex
-    // is held only for the duration of a single frame operation.
-    channel: tokio::sync::Mutex<russh::Channel<Msg>>,
+/// The read half of a channel: `russh::ChannelReadHalf` in production, scripted in tests.
+trait FrameSource: Send {
+    fn wait_frame<'a>(&'a mut self) -> BoxFuture<'a, Option<ChannelMsg>>;
 }
 
-impl TransportChannel for RusshChannel {
+impl FrameSource for russh::ChannelReadHalf {
+    fn wait_frame<'a>(&'a mut self) -> BoxFuture<'a, Option<ChannelMsg>> {
+        Box::pin(self.wait())
+    }
+}
+
+/// The write half of a channel: `russh::ChannelWriteHalf` in production, scripted in tests.
+trait FrameSink: Send + Sync {
+    fn send_data<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<(), CoreError>>;
+    fn finish(&self) -> BoxFuture<'_, Result<(), CoreError>>;
+}
+
+impl FrameSink for russh::ChannelWriteHalf<Msg> {
+    fn send_data<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<(), CoreError>> {
+        Box::pin(async move { self.data(bytes).await.map_err(map_russh_error) })
+    }
+
+    fn finish(&self) -> BoxFuture<'_, Result<(), CoreError>> {
+        Box::pin(async move {
+            self.eof().await.map_err(map_russh_error)?;
+            self.close().await.map_err(map_russh_error)
+        })
+    }
+}
+
+/// Live russh channel held as two halves (§4: the tunnel is read and written concurrently).
+struct RusshChannel<R, W> { reader: tokio::sync::Mutex<R>, writer: W }
+
+impl RusshChannel<russh::ChannelReadHalf, russh::ChannelWriteHalf<Msg>> {
+    fn new(channel: russh::Channel<Msg>) -> Self {
+        let (reader, writer) = channel.split();
+        Self { reader: tokio::sync::Mutex::new(reader), writer }
+    }
+}
+
+impl<R: FrameSource, W: FrameSink> TransportChannel for RusshChannel<R, W> {
     fn read<'a>(&'a self) -> BoxFuture<'a, Result<ChannelEvent, CoreError>> {
         Box::pin(async move {
-            let mut channel = self.channel.lock().await;
+            let mut reader = self.reader.lock().await;
             loop {
-                match channel.wait().await {
+                match reader.wait_frame().await {
                     Some(ChannelMsg::Data { data }) => return Ok(ChannelEvent::Data(data.to_vec())),
                     Some(ChannelMsg::ExtendedData { data, ext }) => {
                         return Ok(ChannelEvent::ExtendedData {
@@ -583,18 +612,11 @@ impl TransportChannel for RusshChannel {
     }
 
     fn write<'a>(&'a self, bytes: &'a [u8]) -> BoxFuture<'a, Result<(), CoreError>> {
-        Box::pin(async move {
-            let channel = self.channel.lock().await;
-            channel.data(bytes).await.map_err(map_russh_error)
-        })
+        self.writer.send_data(bytes)
     }
 
     fn close(&self) -> BoxFuture<'_, Result<(), CoreError>> {
-        Box::pin(async move {
-            let channel = self.channel.lock().await;
-            channel.eof().await.map_err(map_russh_error)?;
-            channel.close().await.map_err(map_russh_error)
-        })
+        self.writer.finish()
     }
 }
 
@@ -901,6 +923,38 @@ mod tests {
         assert!(!inner.is_closed().await);
         channel.close().await.expect("close");
         assert!(inner.is_closed().await);
+    }
+
+    struct ScriptedHalf;
+    impl FrameSource for ScriptedHalf {
+        fn wait_frame<'a>(&'a mut self) -> BoxFuture<'a, Option<ChannelMsg>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    impl FrameSink for ScriptedHalf {
+        fn send_data<'a>(&'a self, _bytes: &'a [u8]) -> BoxFuture<'a, Result<(), CoreError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn finish(&self) -> BoxFuture<'_, Result<(), CoreError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pending_read_never_blocks_write_or_close() {
+        let channel = RusshChannel {
+            reader: tokio::sync::Mutex::new(ScriptedHalf),
+            writer: ScriptedHalf,
+        };
+        let mut read = channel.read(); // parks on a frame the scripted peer never sends
+        assert!(tokio::time::timeout(Duration::from_millis(20), &mut read).await.is_err());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            channel.write(b"payload").await.expect("write");
+            channel.close().await.expect("close");
+        })
+        .await
+        .expect("a pending read must not stall write or close");
     }
 
     #[test]
