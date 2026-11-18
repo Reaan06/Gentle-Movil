@@ -131,6 +131,109 @@ El agente (harness pi sobre nodejs-mobile) recibe del core Rust:
 - El túnel SSH no expone el daemon a la red: el listener 43722 sigue siendo el
   del daemon; el SSH es la única puerta.
 
+## 9. Puente en loopback: extensión Pi (`proto: 1`)
+
+Reemplaza al daemon de §3-§5. Ya no hay binario, ni instalación, ni `sudo`: el
+**propio agente** (Pi / Gentle Shell) sirve los dos puertos en TS puro
+(`pi-extension/`). El teléfono los alcanza exclusivamente por el túnel SSH de §4.
+
+### 9.1 Superficie
+
+| Puerto | Bind | Superficie |
+|---|---|---|
+| 43721 | `127.0.0.1` | API HTTP: identidad y sesiones (CLI, `doctor`, teléfono) |
+| 43722 | `127.0.0.1` | Canal de dispositivos: WebSocket en `/ws/device` |
+
+Nunca se bindea `0.0.0.0` ni ninguna otra interfaz; el host no es configurable.
+Los puertos sí, por entorno: `GENTLE_MOVIL_API_PORT` y
+`GENTLE_MOVIL_DEVICE_PORT` (valores inválidos caen al default documentado).
+
+- Extensión (dentro del agente): `pi -e ./pi-extension/src/extension.ts`, o el path
+exacto en `extensions` de `settings.json`.
+- Proceso suelto (sin agente, para `curl`, `doctor` y tests):
+`node pi-extension/server.mjs`. En este modo no hay agente al que inyectar
+entrada: `input` se devuelve como eco (`deliver: "echo"`).
+
+### 9.2 Identidad — `GET /api/health`
+
+```json
+{"app":"gentle-shell","bridge":"gentle-movil","proto":1,"version":"<semver>"}
+```
+
+`content-type: application/json`. Es la prueba de qué está escuchando: otro
+servidor en el mismo puerto no puede producir este payload. **Ambos puertos
+responden la misma identidad** (`43721` y `43722`): el CLI verifica los dos, de
+modo que un proceso ajeno ocupando el puerto de dispositivos se reporta como
+impostor en vez de pasar por el puente. La identidad no es un secreto: la
+autenticación real es el túnel SSH que el teléfono ya estableció. Cualquier otra
+ruta HTTP plana en 43722 responde `404 {"error":"not_found"}`.
+
+### 9.3 Sesiones — `GET /api/sessions`
+
+Array JSON (posiblemente vacío). Cada elemento:
+
+```json
+{"id":"<uuid>","title":"<nombre o primero del usuario>","status":"idle|busy|unknown","cwd":"<path>","updatedAt":"<ISO>","current":true}
+```
+
+Honesto por contrato: si la plataforma no expone sesiones (sin directorio de
+sesiones, host sin agente), la lista es `[]` — nunca se inventan sesiones ni se
+rompe el endpoint. `status` es `unknown` para toda sesión cuyo estado la
+plataforma no publica; solo la sesión viva del agente reporta `idle`/`busy`.
+
+### 9.4 Canal de dispositivos — `ws://127.0.0.1:43722/ws/device`
+
+WebSocket de texto (RFC 6455, sin dependencias), `proto: 1`. Subprotocolo
+opcional: si el cliente ofrece `gentle-movil.v1` se acepta. Cada frame es un
+objeto JSON con discriminante `type`; un `id` opcional en el pedido se repite en
+la respuesta o el error correspondiente.
+
+**Cliente → puente**
+
+| `type` | Campos | Respuesta |
+|---|---|---|
+| `hello` | `proto`, `client?` | `hello`; `proto` distinto → `error unsupported_proto` |
+| `sessions.list` | `id?` | `sessions.list` con `sessions` |
+| `session.attach` | `id?`, `sessionId` | `session.attached` con `session`; desconocida → `unknown_session` |
+| `session.detach` | `id?` | `session.detached`; sin sesión adjunta → `not_attached` |
+| `input` | `id?`, `text` | `input.accepted`, después uno o más `output` |
+| `ping` | `id?` | `pong` |
+
+**Puente → cliente**
+
+| `type` | Campos |
+|---|---|
+| `hello` | `proto`, `bridge`, `version` |
+| `sessions.list` | `id?`, `sessions[]` (forma de §9.3) |
+| `session.attached` | `id?`, `sessionId`, `session` |
+| `session.detached` | `id?`, `sessionId` |
+| `input.accepted` | `id?`, `sessionId`, `deliver`: `agent` (llegó al agente) o `echo` (no hay agente) |
+| `output` | `sessionId`, `text`, `source`: `agent` o `echo`, `seq` (entero creciente por conexión, empieza en 1) |
+| `pong` | `id?` |
+| `error` | `code`, `message`, `id?`, `sessionId?` |
+
+**Códigos de error:** `bad_frame` (JSON inválido o campo faltante),
+`unsupported_proto`, `unsupported_type`, `not_attached`, `unknown_session`,
+`input_too_large`, `input_failed` (el agente rechazó la entrada),
+`internal_error`. Un error nunca cierra la conexión: el cliente puede corregir y
+seguir.
+
+**Límites y cierre:** solo frames de texto (binario → close `1003`), payload
+máximo 1 MiB (`1009`), `input.text` máximo 64 KiB (`input_too_large`). Un frame
+que declara más bytes de los permitidos se rechaza al leer el header, sin
+almacenar el cuerpo. Si el cliente desaparece a mitad de frame, el puente tira
+el socket, registra `ws.client_disconnected_mid_frame` en una línea JSON y sigue
+sirviendo ambos puertos: nunca crashea ni deja el puerto tomado.
+
+**Enrutamiento de `output`:** el texto del agente (mensajes del asistente en la
+sesión adjunta) se emite como un frame `output` completo por mensaje; el
+streaming token a token queda para `proto: 2`. En modo proceso suelto (`echo`),
+el mismo texto vuelve con `source: "echo"` para probar el round-trip sin agente.
+
+**Sin autenticación propia:** igual que §8, el puente solo escucha en loopback y
+el túnel SSH autenticado es la puerta. Si un tercero puede alcanzar 43721/43722
+en el host, ya tiene la sesión del usuario.
+
 ## Log
 
 - L1 (2026-11-17): «sube un issue con la propuesta al repositorio y pide que le
@@ -148,3 +251,10 @@ El agente (harness pi sobre nodejs-mobile) recibe del core Rust:
 - El "puente oficial" es una extensión Pi que sirve HTTP/WS en loopback 43721/43722 en TS puro (la vieja `/remote-control` era cliente WS; el daemon Rust servía los puertos y fue borrado).
 - Conectado: QR (host+puerto+usuario+pw+huella) → SSH russh → detectar extensión en loopback → registrar clave ed25519 en authorized_keys → túnel SSH forward. Sin sudo, sin SFTP, sin binarios.
 - Ver `odd/tasks/gentle-movil-pivote.md` (S1-S10, T1-T6).
+- L4 (T3a, `proto: 1`): §9 documenta el puente real. `pi-extension/` sirve 43721
+  (HTTP: `/api/health` con identidad `gentle-shell`/`gentle-movil`, `/api/sessions`)
+  y 43722 (`/ws/device`) en `127.0.0.1` únicamente, en TS puro sin dependencias ni
+  instalación. Identidad semver `0.1.0`; frames de §9.4 verificados por tests
+  offline (`node --test pi-extension/test/`, 18 verdes) incluido el cliente que
+  desaparece a mitad de frame. El modo proceso suelto devuelve `deliver: "echo"`:
+  sin agente no se finge una sesión viva.

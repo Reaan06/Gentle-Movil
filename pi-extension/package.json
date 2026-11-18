@@ -1,0 +1,17 @@
+{
+  "name": "gentle-movil-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pi / Gentle Shell extension that serves the Gentle Movil bridge on loopback (43721 HTTP API, 43722 device channel). Replaces the removed Rust daemon.",
+  "type": "module",
+  "pi": {
+    "extensions": ["./src/extension.ts"]
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  }
+}
