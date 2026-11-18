@@ -84,6 +84,13 @@ class GcCoreModule : Module() {
         "gc_ssh_channel_close" -> GcNative.gcSshChannelClose(payload)
         else -> return failureEnvelope("UnknownFunction", "El núcleo no expone «$fn».")
       }
+      // Diagnostic: the raw JNI answer, so a blank/empty return is distinguishable
+      // from a null one in `adb logcat` (tag GcCore). Costs one line per native call.
+      android.util.Log.d(
+        "GcCore",
+        "$fn available=${GcNative.available} raw=" +
+          (response?.let { "<${it.length} chars: ${it.take(120)}>" } ?: "NULL"),
+      )
       if (response.isNullOrBlank()) {
         failureEnvelope("EmptyResponse", "El núcleo no devolvió nada para «$fn».")
       } else {

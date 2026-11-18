@@ -196,6 +196,9 @@ export default function ScanQrScreen() {
         fp: pair.fp,
         proto: pair.proto,
         code: pair.code,
+        // The QR can carry the SSH password; without passing it the flow reaches
+        // connect with a null credential and the core rejects it as untyped.
+        ...(pair.pw ? { auth: 'password', secret: pair.pw } : {}),
       },
     });
   }, [pair, router]);

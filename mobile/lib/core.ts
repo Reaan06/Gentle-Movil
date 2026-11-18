@@ -50,8 +50,8 @@ export interface PairInfo {
  * (spec §2.1).
  */
 export type SshCredential =
-  | { type: 'password'; value: string }
-  | { type: 'key'; path: string; passphrase?: string };
+  | { kind: 'password'; value: string }
+  | { kind: 'key'; path: string; passphrase?: string };
 
 /** Live SSH session returned by `sshConnect`. */
 export interface SshSessionHandle {

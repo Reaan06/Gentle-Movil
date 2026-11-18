@@ -49,7 +49,7 @@ const PAIR = {
   proto: '3',
 };
 
-const CREDENTIAL = { type: 'password', value: 'correcta' };
+const CREDENTIAL = { kind: 'password', value: 'correcta' };
 
 /** Device key the fake core hands out (32-byte ed25519 public key, hex). */
 const DEVICE_PUBKEY_HEX = 'ab'.repeat(32);
@@ -151,6 +151,13 @@ test('the happy path runs the five steps in order and reports each one', async (
   assert.equal(result.sessionId, '7');
   // connect is the very first native call of the flow, then the composed steps.
   assert.equal(bridge.calls[0].fn, 'gc_ssh_connect');
+  // The core's SshConnectConfig expects an adjacently tagged credential
+  // ({"kind":"password","value":...}); a `type` field or a null credential is
+  // rejected on the device as "invalid type: null, expected ... SshCredential".
+  assert.deepEqual(bridge.calls[0].payload.credential, {
+    kind: 'password',
+    value: 'correcta',
+  });
   assert.deepEqual(
     bridge.calls.map((entry) => entry.payload.step ?? entry.fn),
     ['gc_ssh_connect', 'detect', 'gc_device_key_generate', 'register', 'tunnel'],
