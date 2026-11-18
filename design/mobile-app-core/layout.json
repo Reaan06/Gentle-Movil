@@ -1,0 +1,53 @@
+{
+  "arrangement": "free",
+  "positions": {
+    "system": {
+      "x": 0,
+      "y": 16
+    },
+    "01-overview.html": {
+      "x": 1542,
+      "y": 38
+    },
+    "02-sessions-list.html": {
+      "x": 2035,
+      "y": 38
+    },
+    "03-terminal-control.html": {
+      "x": 2540,
+      "y": 16
+    },
+    "04-waiting-inbox.html": {
+      "x": 3050,
+      "y": 16
+    },
+    "05-automations.html": {
+      "x": 3560,
+      "y": 16
+    },
+    "06-automation-editor.html": {
+      "x": 4070,
+      "y": 16
+    },
+    "07-local-projects.html": {
+      "x": 4580,
+      "y": 16
+    },
+    "08-local-editor.html": {
+      "x": 5090,
+      "y": 16
+    },
+    "09-git-changes.html": {
+      "x": 5600,
+      "y": 16
+    },
+    "10-settings.html": {
+      "x": 6110,
+      "y": 16
+    },
+    "11-global-states.html": {
+      "x": 6636,
+      "y": 0
+    }
+  }
+}

@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=430, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Gentle Movil · Te esperan</title>
+<style>
+  :root{
+    --bg:#060407; --bg-sunken:#0a060c; --surface:#100A0F;
+    --border:#563040; --border-strong:#7a4558;
+    --text:#F6EFF3; --accent:#F095C8; --accent-hover:#FFB1DD; --accent-ink:#28121E;
+    --accent-text:#FFB1DD; --deep-pink:#C96AA2;
+    --warning:#F2B86D; --ok:#4fc58c; --danger:#FF718F;
+    --code-bg:#0f0c12; --overlay:rgb(0 0 0 / 0.55);
+    --accent-soft:rgb(240 149 200 / 0.12); --glow:0 10px 30px #f095c84d;
+    --radius-sm:8px; --radius-md:12px; --radius-lg:16px; --radius-bento:20px; --radius-pill:999px;
+    --shadow:0 1px 0 rgb(255 255 255 / 0.03) inset, 0 18px 40px -18px rgb(0 0 0 / 0.6);
+    --mono:"IosevkaTerm NF","Iosevka Term","JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,"DejaVu Sans Mono",monospace;
+    --muted:color-mix(in srgb, var(--text) 64%, transparent);
+    --faint:color-mix(in srgb, var(--text) 52%, transparent);
+  }
+  *,*::before,*::after{box-sizing:border-box}
+  body{
+    margin:0;width:430px;height:932px;overflow:hidden;
+    display:flex;flex-direction:column;
+    color:var(--text);font:400 .9rem/1.5 var(--mono);letter-spacing:.01em;
+    background:
+      radial-gradient(120% 55% at 50% -10%, color-mix(in srgb, var(--accent) 8%, transparent), transparent 70%),
+      var(--bg);
+    -webkit-font-smoothing:antialiased;
+  }
+  h1,h2,h3,p,ul,ol,figure{margin:0}
+  ul,ol{padding:0;list-style:none}
+  a{color:inherit;text-decoration:none}
+  button,input,select,textarea{font:inherit;color:inherit;letter-spacing:inherit}
+  button{background:none;border:0;padding:0;cursor:pointer}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--radius-sm)}
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+  .meta{font-size:.7rem;color:var(--faint);line-height:1.45}
+  .ico{width:15px;height:15px;flex:none}
+  .screen{flex:1;min-height:0;display:flex;flex-direction:column;position:relative}
+  .appbar{flex:none;display:flex;align-items:center;gap:8px;padding:14px 14px 10px 8px}
+  .appbar__title{flex:1;min-width:0}
+  .screen-title{font-size:1.05rem;font-weight:600;letter-spacing:-.01em;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .icon-btn{
+    flex:none;width:44px;height:44px;display:grid;place-items:center;
+    border-radius:var(--radius-pill);color:var(--muted);border:1px solid transparent;
+  }
+  .icon-btn:hover{color:var(--text);background:var(--bg-sunken)}
+  .chip{
+    display:inline-flex;align-items:center;gap:6px;flex:none;
+    padding:4px 10px;border-radius:var(--radius-pill);
+    border:1px solid var(--border);background:var(--surface);
+    font-size:.7rem;line-height:1.2;color:var(--muted);white-space:nowrap;
+  }
+  .chip .ico{width:12px;height:12px}
+  .chip--waiting{background:color-mix(in srgb, var(--warning) 10%, var(--surface));border-color:color-mix(in srgb, var(--warning) 32%, transparent);color:var(--warning)}
+  .chip--ok{background:color-mix(in srgb, var(--ok) 8%, var(--surface));border-color:color-mix(in srgb, var(--ok) 26%, transparent);color:var(--ok)}
+  main{flex:1;min-height:0;overflow-y:auto;padding:4px 20px 20px;scrollbar-width:none}
+  main::-webkit-scrollbar{width:0;height:0}
+  .intro{margin-top:2px;font-size:.8rem;color:var(--muted);line-height:1.5}
+  .qcards{display:flex;flex-direction:column;gap:14px;margin-top:14px}
+  .qcard{
+    padding:16px;border-radius:var(--radius-bento);
+    background:var(--surface);border:1px solid var(--border);box-shadow:var(--shadow);
+  }
+  .qcard--open{border-color:color-mix(in srgb, var(--warning) 24%, var(--border))}
+  .qcard__head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .qcard__session{display:inline-flex;align-items:center;gap:6px;font-size:.75rem;font-weight:600;color:var(--accent-text)}
+  .qcard__session .ico{width:13px;height:13px}
+  .qcard__q{margin-top:10px;font-size:.95rem;font-weight:600;line-height:1.45;letter-spacing:-.005em}
+  .qcard__q strong{font-weight:600;color:var(--accent-text)}
+  .qcard__ctx{margin-top:6px;font-size:.75rem;color:var(--muted);line-height:1.55}
+  .choices{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}
+  .choice{
+    display:inline-flex;align-items:center;gap:7px;
+    min-height:44px;padding:0 14px;border-radius:var(--radius-pill);
+    border:1px solid var(--border);background:var(--bg-sunken);
+    font-size:.75rem;color:var(--text);
+    transition:border-color .15s ease,background-color .15s ease;
+  }
+  .choice:hover{border-color:var(--deep-pink);background:var(--surface)}
+  .choice--suggested{border-color:color-mix(in srgb, var(--accent) 45%, transparent);background:var(--accent-soft);color:var(--accent-text);font-weight:600}
+  .choice__hint{font-size:.7rem;font-weight:400;color:var(--accent-text);opacity:1}
+  .answer{display:flex;align-items:center;gap:8px;margin-top:10px}
+  .answer input{
+    flex:1;min-width:0;min-height:44px;padding:0 14px;
+    border-radius:var(--radius-pill);border:1px solid var(--border-strong);
+    background:var(--bg-sunken);font-size:.75rem;
+  }
+  .answer input::placeholder{color:var(--faint)}
+  .send{
+    width:44px;height:44px;flex:none;display:grid;place-items:center;
+    border-radius:50%;background:var(--accent);color:var(--accent-ink);
+    transition:background-color .15s ease;
+  }
+  .send:hover{background:var(--accent-hover)}
+  .send .ico{width:18px;height:18px}
+  .qcard__foot{display:flex;align-items:center;gap:6px;margin-top:10px;font-size:.7rem;color:var(--faint)}
+  .answered{
+    border:1px solid var(--border);border-radius:var(--radius-lg);
+    background:color-mix(in srgb, var(--surface) 72%, var(--bg));
+  }
+  .answered summary{
+    display:grid;grid-template-columns:20px 1fr 16px;gap:10px;align-items:start;
+    padding:14px 16px;cursor:pointer;list-style:none;
+  }
+  .answered summary::-webkit-details-marker{display:none}
+  .answered summary:hover .answered__session{color:var(--accent-text)}
+  .answered__chev{color:var(--faint);display:grid;place-items:center;padding-top:2px;transition:transform .15s ease}
+  .answered[open] .answered__chev{transform:rotate(90deg)}
+  .answered__check{color:var(--ok);display:grid;place-items:center;padding-top:1px}
+  .answered__check .ico{width:16px;height:16px}
+  .answered__head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+  .answered__session{font-size:.75rem;font-weight:600;color:var(--text)}
+  .answered__q{display:block;margin-top:4px;font-size:.75rem;color:var(--muted);line-height:1.45}
+  .answered__body{padding:0 16px 14px 46px;font-size:.75rem;color:var(--muted);line-height:1.55}
+  .answered__body strong{color:var(--text);font-weight:600}
+  .note{display:flex;align-items:center;gap:8px;margin-top:18px;font-size:.7rem;color:var(--faint);line-height:1.5}
+  .home-bar{flex:none;height:18px;display:grid;place-items:center}
+  .home-bar span{width:120px;height:4px;border-radius:var(--radius-pill);background:var(--border-strong)}
+  @media (prefers-reduced-motion: reduce){
+    *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important;scroll-behavior:auto !important}
+  }
+</style>
+</head>
+<body>
+<div class="screen">
+  <header class="appbar">
+    <a class="icon-btn" href="01-overview.html" aria-label="Volver al overview">
+      <svg class="ico" viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 6-6 6 6 6"/></svg>
+    </a>
+    <div class="appbar__title">
+      <h1 class="screen-title">Te esperan</h1>
+      <p class="meta">2 preguntas abiertas</p>
+    </div>
+    <span class="chip chip--waiting">
+      <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>
+      2 pendientes
+    </span>
+  </header>
+
+  <main id="main">
+    <p class="intro">El agente se detuvo para no decidir por vos. Respondé y sigue solo.</p>
+
+    <div class="qcards">
+      <article class="qcard qcard--open" aria-labelledby="q1">
+        <div class="qcard__head">
+          <a class="qcard__session" href="03-terminal-control.html">
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4v9a4 4 0 0 0 4 4h8"/><circle cx="6" cy="4" r="1.8"/><circle cx="18" cy="17" r="1.8"/></svg>
+            feat/auth-login
+          </a>
+          <span class="chip chip--waiting">
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>
+            Esperando
+          </span>
+        </div>
+        <h2 class="qcard__q" id="q1">¿Uso <strong>bcrypt</strong> o <strong>argon2</strong> para los hashes?</h2>
+        <p class="qcard__ctx">El agente está en <span class="meta">src/features/auth/password.ts</span> y no puede seguir sin esta decisión. Los tests ya están escritos para las dos opciones.</p>
+        <div class="choices" role="group" aria-label="Respuestas rápidas para feat/auth-login">
+          <button class="choice choice--suggested" type="button">argon2id <span class="choice__hint">sugerido</span></button>
+          <button class="choice" type="button">bcrypt</button>
+          <button class="choice" type="button">Decidí vos</button>
+        </div>
+        <form class="answer" action="#" method="post">
+          <label class="sr-only" for="a1">Otra respuesta para feat/auth-login</label>
+          <input id="a1" name="a1" type="text" placeholder="O escribí una respuesta…" autocomplete="off">
+          <button class="send" type="submit" aria-label="Responder a feat/auth-login">
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h13M12 5l7 7-7 7"/></svg>
+          </button>
+        </form>
+        <p class="qcard__foot">hace 4 min · el agente espera</p>
+      </article>
+
+      <article class="qcard qcard--open" aria-labelledby="q2">
+        <div class="qcard__head">
+          <a class="qcard__session" href="03-terminal-control.html">
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 4v9a4 4 0 0 0 4 4h8"/><circle cx="6" cy="4" r="1.8"/><circle cx="18" cy="17" r="1.8"/></svg>
+            fix/daemon-retry
+          </a>
+          <span class="chip chip--waiting">
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/></svg>
+            Esperando
+          </span>
+        </div>
+        <h2 class="qcard__q" id="q2">El túnel se cortó 3 veces en 20 min. ¿Reintento ahora o espero a que vuelva la red?</h2>
+        <p class="qcard__ctx">Última caída hace 40 s, en la red del café. La sesión quedó pausada con los tests a medio correr.</p>
+        <div class="choices" role="group" aria-label="Respuestas rápidas para fix/daemon-retry">
+          <button class="choice" type="button">Reintentar ahora</button>
+          <button class="choice choice--suggested" type="button">Esperar 10 min <span class="choice__hint">sugerido</span></button>
+        </div>
+        <p class="qcard__foot">hace 8 min · 3 cortes seguidos</p>
+      </article>
+
+      <details class="answered">
+        <summary>
+          <span class="answered__check" aria-hidden="true">
+            <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="m8.5 12 2.5 2.5 4.5-4.5"/></svg>
+          </span>
+          <span>
+            <span class="answered__head">
+              <span class="answered__session">chore/ota-config</span>
+              <span class="meta">respondido hace 5 min</span>
+            </span>
+            <span class="answered__q">«¿Publico el update en el canal preview?»</span>
+          </span>
+          <span class="answered__chev" aria-hidden="true">
+            <svg class="ico" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 6 6 6-6 6"/></svg>
+          </span>
+        </summary>
+        <div class="answered__body">
+          <p><strong>Tu respuesta:</strong> Sí, canal preview.</p>
+          <p>El agente publicó el update 1.4.2 y lo verificó en el dispositivo. La sesión terminó con ✓ ok.</p>
+        </div>
+      </details>
+    </div>
+
+    <p class="note">
+      <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4l7 3v5c0 4-3 6.5-7 8-4-1.5-7-4-7-8V7z"/></svg>
+      Las respuestas viajan por el túnel SSH y quedan guardadas en la sesión.
+    </p>
+  </main>
+
+  <div class="home-bar" aria-hidden="true"><span></span></div>
+</div>
+</body>
+</html>

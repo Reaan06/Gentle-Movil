@@ -1,0 +1,84 @@
+{
+  "title": "Gentle Movil — app móvil (SSH + modo local)",
+  "brief": "App móvil Expo + Rust para controlar la PC por SSH (sesiones, terminal del agente, automatizaciones) y trabajar sin PC con editor, agente y git local. Identidad terminal elegante: mono en todo, tema oscuro, acento rosa restringido, marca π, español rioplatense con términos de producto en inglés.",
+  "artboards": [
+    {
+      "file": "01-overview.html",
+      "title": "Overview · estado y atajos",
+      "tradeoff": "Todo el estado en una pantalla; los detalles de cada sesión quedan a un toque",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "02-sessions-list.html",
+      "title": "Sesiones · lista con filtros y túnel caído",
+      "tradeoff": "Lista densa y filtrable con banner de reconexión; menos contexto por sesión que una vista de detalle",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "03-terminal-control.html",
+      "title": "Control de terminal · transcript y aprobación",
+      "tradeoff": "Control total y transparente del agente; exige leer el transcript en pantalla chica",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "04-waiting-inbox.html",
+      "title": "Te esperan · preguntas agregadas",
+      "tradeoff": "Resuelve bloqueos de varias sesiones en un solo lugar; agrega un destino más que revisar",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "05-automations.html",
+      "title": "Automatizaciones · filas con switch",
+      "tradeoff": "Estado y control por fila sin entrar al editor; editar requiere un toque más",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "06-automation-editor.html",
+      "title": "Editor de automatización · error de validación",
+      "tradeoff": "Formulario completo con validación en contexto; el error bloquea el guardado hasta corregir",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "07-local-projects.html",
+      "title": "Modo local · proyectos",
+      "tradeoff": "Deja claro que todo corre en el teléfono; menos señales de estado del daemon remoto",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "08-local-editor.html",
+      "title": "Editor local · código y agente",
+      "tradeoff": "Código, git y agente en una sola vista; el espacio vertical del editor se reduce por el chat",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "09-git-changes.html",
+      "title": "Cambios git (V13)",
+      "tradeoff": "Diff legible en móvil; diff completo queda en la PC",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "10-settings.html",
+      "title": "Ajustes (V18)",
+      "tradeoff": "Control completo de dispositivos y seguridad; una pantalla más fuera del tab bar",
+      "width": 430,
+      "height": 932
+    },
+    {
+      "file": "11-global-states.html",
+      "title": "Estados globales (V19-V20)",
+      "tradeoff": "Galería de referencia de todos los estados; no es una pantalla navegable",
+      "width": 430,
+      "height": 932
+    }
+  ],
+  "feature": "odd/tasks/mobile-app.md"
+}

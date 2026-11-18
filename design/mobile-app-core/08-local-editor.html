@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=430, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Gentle Movil · Editor local</title>
+<style>
+  :root{
+    --bg:#060407; --bg-sunken:#0a060c; --surface:#100A0F;
+    --border:#563040; --border-strong:#7a4558;
+    --text:#F6EFF3; --accent:#F095C8; --accent-hover:#FFB1DD; --accent-ink:#28121E;
+    --accent-text:#FFB1DD; --deep-pink:#C96AA2;
+    --warning:#F2B86D; --ok:#4fc58c; --danger:#FF718F;
+    --code-bg:#0f0c12; --overlay:rgb(0 0 0 / 0.55);
+    --accent-soft:rgb(240 149 200 / 0.12); --glow:0 10px 30px #f095c84d;
+    --radius-sm:8px; --radius-md:12px; --radius-lg:16px; --radius-bento:20px; --radius-pill:999px;
+    --shadow:0 1px 0 rgb(255 255 255 / 0.03) inset, 0 18px 40px -18px rgb(0 0 0 / 0.6);
+    --mono:"IosevkaTerm NF","Iosevka Term","JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,"DejaVu Sans Mono",monospace;
+    --muted:color-mix(in srgb, var(--text) 64%, transparent);
+    --faint:color-mix(in srgb, var(--text) 52%, transparent);
+  }
+  *,*::before,*::after{box-sizing:border-box}
+  body{
+    margin:0;width:430px;height:932px;overflow:hidden;
+    display:flex;flex-direction:column;
+    color:var(--text);font:400 .9rem/1.5 var(--mono);letter-spacing:.01em;
+    background:
+      radial-gradient(120% 55% at 50% -10%, color-mix(in srgb, var(--accent) 8%, transparent), transparent 70%),
+      var(--bg);
+    -webkit-font-smoothing:antialiased;
+  }
+  h1,h2,h3,p,ul,ol,pre{margin:0}
+  ul,ol{padding:0;list-style:none}
+  a{color:inherit;text-decoration:none}
+  button,input,select,textarea{font:inherit;color:inherit;letter-spacing:inherit}
+  button{background:none;border:0;padding:0;cursor:pointer}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:var(--radius-sm)}
+  .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+  .meta{font-size:.7rem;color:var(--faint);line-height:1.45}
+  .ico{width:15px;height:15px;flex:none}
+  .screen{flex:1;min-height:0;display:flex;flex-direction:column;position:relative}
+  .appbar{flex:none;display:flex;align-items:center;gap:4px;padding:14px 12px 8px 8px}
+  .appbar__title{flex:1;min-width:0}
+  .icon-btn{
+    flex:none;width:44px;height:44px;display:grid;place-items:center;
+    border-radius:var(--radius-pill);color:var(--muted);border:1px solid transparent;
+  }
+  .icon-btn:hover{color:var(--text);background:var(--bg-sunken)}
+  .crumb{min-width:0}
+  .crumb ol{display:flex;align-items:baseline;overflow:hidden;white-space:nowrap;font-size:.75rem;color:var(--faint)}
+  .crumb li{overflow:hidden;text-overflow:ellipsis}
+  .crumb li + li::before{content:"/";padding:0 1px;color:var(--border-strong)}
+  .crumb li[aria-current="page"]{color:var(--text);font-weight:600;overflow:visible;flex:none}
+  .tabsrow{
+    flex:none;display:flex;align-items:stretch;padding:0 8px;
+    border-bottom:1px solid var(--border);
+  }
+  .filetabs{
+    display:flex;flex:1;gap:2px;overflow-x:auto;scrollbar-width:none;
+  }
+  .filetabs::-webkit-scrollbar{height:0}
+  .tree-btn{
+    flex:none;width:44px;min-height:44px;display:grid;place-items:center;
+    color:var(--muted);border-right:1px solid var(--border);margin-right:6px;
+  }
+  .tree-btn:hover{color:var(--text)}
+  .filetab{
+    position:relative;display:inline-flex;align-items:center;gap:7px;flex:none;
+    min-height:44px;padding:0 12px;font-size:.75rem;color:var(--faint);
+    border-bottom:2px solid transparent;margin-bottom:-1px;
+    transition:color .15s ease;
+  }
+  .filetab:hover{color:var(--text)}
+  .filetab[aria-selected="true"]{color:var(--text);border-bottom-color:var(--accent);background:var(--code-bg)}
+  .unsaved{width:6px;height:6px;border-radius:50%;background:var(--accent)}
+  main{flex:1;min-height:0;display:flex;flex-direction:column;padding:2px 16px 10px}
+  .codepane{
+    flex:1;min-height:0;overflow:auto;
+    border:1px solid var(--border);border-radius:var(--radius-lg);
+    background:var(--code-bg);box-shadow:var(--shadow);
+    scrollbar-width:thin;scrollbar-color:var(--border-strong) transparent;
+  }
+  .code{display:block;padding:14px;font-family:var(--mono);font-size:.7rem;line-height:1.75;white-space:pre;color:var(--text)}
+  .code .l{display:block;min-height:1.75em;padding-right:12px}
+  .code .l::before{
+    content:attr(data-ln);display:inline-block;width:20px;margin-right:14px;
+    text-align:right;color:var(--faint);
+  }
+  .code .is-changed{background:color-mix(in srgb, var(--accent) 7%, transparent);box-shadow:inset 2px 0 0 var(--accent)}
+  .kw{color:var(--accent-text)}
+  .str{color:var(--ok)}
+  .cm{color:var(--faint)}
+  .ty{color:var(--warning)}
+  .fn{color:var(--text);font-weight:600}
+  .pun{color:var(--muted)}
+  .gitrow{
+    flex:none;display:flex;align-items:center;justify-content:space-between;gap:10px;
+    min-height:44px;margin:0 16px 8px;padding:0 14px;
+    border-radius:var(--radius-md);border:1px solid var(--border);background:var(--surface);
+    font-size:.75rem;color:var(--muted);
+    transition:border-color .15s ease,color .15s ease;
+  }
+  .gitrow:hover{border-color:var(--border-strong);color:var(--text)}
+  .gitrow__stats{display:inline-flex;align-items:center;gap:6px;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .add{color:var(--ok)}
+  .del{color:var(--danger)}
+  .gitrow__cta{display:inline-flex;align-items:center;gap:4px;font-weight:600;color:var(--accent-text);flex:none}
+  .agentbar{
+    flex:none;border-top:1px solid var(--border);
+    background:color-mix(in srgb, var(--bg-sunken) 92%, var(--bg));
+    padding:12px 16px 0;
+  }
+  .agentmsg{display:flex;align-items:flex-start;gap:10px}
+  .agentmsg__avatar{
+    flex:none;width:28px;height:28px;display:grid;place-items:center;
+    border-radius:50%;border:1px solid var(--border);background:var(--accent-soft);
+    color:var(--accent-text);font-size:.8rem;font-weight:600;
+  }
+  .agentmsg__who{display:flex;align-items:center;gap:6px;font-size:.7rem;color:var(--faint)}
+  .agentmsg__text{font-size:.75rem;line-height:1.5}
+  .quickchips{display:flex;gap:8px;margin-top:10px;overflow-x:auto;scrollbar-width:none}
+  .quickchips::-webkit-scrollbar{height:0}
+  .quickchips button{
+    flex:none;min-height:40px;padding:0 14px;border-radius:var(--radius-pill);
+    border:1px solid var(--border);background:var(--surface);
+    font-size:.75rem;color:var(--muted);
+    transition:border-color .15s ease,color .15s ease;
+  }
+  .quickchips button:hover{color:var(--text);border-color:var(--border-strong)}
+  .composer{display:flex;align-items:center;gap:8px;margin-top:10px}
+  .composer input{
+    flex:1;min-width:0;min-height:44px;padding:0 14px;
+    border-radius:var(--radius-pill);border:1px solid var(--border-strong);
+    background:var(--surface);font-size:.75rem;
+  }
+  .composer input::placeholder{color:var(--faint)}
+  .send{
+    width:44px;height:44px;flex:none;display:grid;place-items:center;
+    border-radius:50%;background:var(--accent);color:var(--accent-ink);
+    transition:background-color .15s ease;
+  }
+  .send:hover{background:var(--accent-hover)}
+  .send .ico{width:18px;height:18px}
+  .home-bar{height:18px;display:grid;place-items:center}
+  .home-bar span{width:120px;height:4px;border-radius:var(--radius-pill);background:var(--border-strong)}
+  @media (prefers-reduced-motion: reduce){
+    *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important;scroll-behavior:auto !important}
+  }
+</style>
+</head>
+<body>
+<div class="screen">
+  <header class="appbar">
+    <a class="icon-btn" href="07-local-projects.html" aria-label="Volver a proyectos locales">
+      <svg class="ico" viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 6-6 6 6 6"/></svg>
+    </a>
+    <div class="appbar__title">
+      <h1 class="sr-only">Editor local · src/features/auth/login.ts</h1>
+      <nav class="crumb" aria-label="Ruta del archivo">
+        <ol>
+          <li>src</li>
+          <li>features</li>
+          <li>auth</li>
+          <li aria-current="page">login.ts</li>
+        </ol>
+      </nav>
+    </div>
+    <button class="icon-btn" type="button" aria-label="Acciones del archivo">
+      <svg class="ico" viewBox="0 0 24 24" width="19" height="19" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg>
+    </button>
+  </header>
+
+  <div class="tabsrow">
+    <button class="tree-btn" type="button" aria-expanded="false" aria-label="Abrir árbol de archivos">
+      <svg class="ico" viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h11M4 17h16"/></svg>
+    </button>
+    <div class="filetabs" role="tablist" aria-label="Archivos abiertos">
+      <button class="filetab" type="button" role="tab" id="tab-login" aria-selected="true" aria-controls="code-login">
+        login.ts
+        <span class="unsaved" aria-hidden="true"></span>
+        <span class="sr-only">cambios sin guardar</span>
+      </button>
+      <button class="filetab" type="button" role="tab" id="tab-password" aria-selected="false" tabindex="-1">password.ts</button>
+      <button class="filetab" type="button" role="tab" id="tab-spec" aria-selected="false" tabindex="-1">auth.spec.ts</button>
+    </div>
+  </div>
+
+  <main id="main">
+    <pre class="code" id="code-login" role="tabpanel" aria-labelledby="tab-login" tabindex="0"><span class="l" data-ln="1"><span class="kw">import</span> { z } <span class="kw">from</span> <span class="str">"zod"</span><span class="pun">;</span></span><span class="l" data-ln="2"></span><span class="l" data-ln="3"><span class="kw">import</span> { auth } <span class="kw">from</span> <span class="str">"@/lib/auth"</span><span class="pun">;</span></span><span class="l" data-ln="4"></span>
+<span class="l is-changed" data-ln="5"><span class="kw">const</span> <span class="ty">loginSchema</span> <span class="pun">=</span> z<span class="pun">.</span><span class="fn">object</span><span class="pun">({</span></span>
+<span class="l is-changed" data-ln="6">  email<span class="pun">:</span> z<span class="pun">.</span><span class="fn">string</span><span class="pun">().</span><span class="fn">email</span><span class="pun">(</span><span class="str">"Email inválido"</span><span class="pun">),</span></span>
+<span class="l is-changed" data-ln="7">  password<span class="pun">:</span> z<span class="pun">.</span><span class="fn">string</span><span class="pun">().</span><span class="fn">min</span><span class="pun">(</span><span class="str">8</span><span class="pun">,</span> <span class="str">"Mínimo 8 caracteres"</span><span class="pun">),</span></span>
+<span class="l is-changed" data-ln="8"><span class="pun">});</span></span><span class="l" data-ln="9"></span><span class="l" data-ln="10"><span class="kw">export async function</span> <span class="fn">login</span><span class="pun">(</span>input<span class="pun">:</span> <span class="ty">unknown</span><span class="pun">) {</span></span><span class="l" data-ln="11">  <span class="kw">const</span> parsed <span class="pun">=</span> loginSchema<span class="pun">.</span><span class="fn">safeParse</span><span class="pun">(</span>input<span class="pun">);</span></span><span class="l" data-ln="12"></span><span class="l" data-ln="13">  <span class="kw">if</span> <span class="pun">(!</span>parsed<span class="pun">.</span>success<span class="pun">) {</span></span><span class="l" data-ln="14">    <span class="kw">const</span> errors <span class="pun">=</span> parsed<span class="pun">.</span>error<span class="pun">.</span><span class="fn">flatten</span><span class="pun">().</span>fieldErrors<span class="pun">;</span></span><span class="l" data-ln="15">    <span class="kw">return</span> <span class="pun">{</span> ok<span class="pun">:</span> <span class="kw">false</span><span class="pun">,</span> errors <span class="pun">};</span></span><span class="l" data-ln="16">  <span class="pun">}</span></span><span class="l" data-ln="17"></span><span class="l" data-ln="18">  <span class="kw">const</span> <span class="pun">{</span> email<span class="pun">,</span> password <span class="pun">} =</span> parsed<span class="pun">.</span>data<span class="pun">;</span></span><span class="l" data-ln="19">  <span class="kw">return</span> auth<span class="pun">.</span><span class="fn">signIn</span><span class="pun">(</span>email<span class="pun">,</span> password<span class="pun">);</span></span><span class="l" data-ln="20"><span class="pun">}</span></span></pre>
+  </main>
+
+  <button class="gitrow" type="button" aria-label="Ver cambios en git: 4 líneas agregadas, 1 eliminada, 3 archivos cambiados">
+    <span class="gitrow__stats">
+      <span class="add">+4</span>
+      <span class="del">−1</span>
+      <span aria-hidden="true">·</span>
+      <span>3 archivos cambiados</span>
+    </span>
+    <span class="gitrow__cta">
+      Ver git
+      <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+    </span>
+  </button>
+
+  <footer class="agentbar">
+    <section aria-label="Agente local">
+      <div class="agentmsg">
+        <span class="agentmsg__avatar" aria-hidden="true">π</span>
+        <div>
+          <p class="agentmsg__who">π agente <span class="meta">local</span></p>
+          <p class="agentmsg__text">Listo, agregué validación al formulario. ¿Corro los tests?</p>
+        </div>
+      </div>
+
+      <div class="quickchips" role="group" aria-label="Respuestas rápidas al agente">
+        <button type="button">Corré los tests</button>
+        <button type="button">Mostrame el diff</button>
+      </div>
+
+      <form class="composer" action="#" method="post">
+        <label class="sr-only" for="agent-input">Mensaje para el agente local</label>
+        <input id="agent-input" name="agent-input" type="text" placeholder="Pedile algo al agente…" autocomplete="off">
+        <button class="send" type="submit" aria-label="Enviar mensaje al agente">
+          <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h13M12 5l7 7-7 7"/></svg>
+        </button>
+      </form>
+    </section>
+    <div class="home-bar" aria-hidden="true"><span></span></div>
+  </footer>
+</div>
+</body>
+</html>
