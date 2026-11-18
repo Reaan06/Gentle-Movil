@@ -48,7 +48,7 @@ import { colors, elevation, radius, spacing, typography } from '../lib/theme';
  * - `+ Nuevo proyecto` opens a minimal inline name form that really validates
  *   and really persists the record; `git init` is gitoxide work and waits for
  *   the core, which the form says out loud;
- * - tapping a project logs `route pending` for `/local-editor` with the project
+ * - tapping a project opens `/local-editor` with the project id and name
  *   id, because the editor is the next slice and navigating would be a lie.
  */
 
@@ -140,14 +140,17 @@ export default function LocalProjectsScreen() {
     router.replace('/overview');
   }, [router]);
 
-  const openProject = useCallback((row: ProjectRow) => {
-    log.info('project tap', { projectId: row.id, route: row.open.route });
-    log.warn('route pending', {
-      route: row.open.route,
-      projectId: row.id,
-      reason: 'local-editor-not-built',
-    });
-  }, []);
+  const openProject = useCallback(
+    (row: ProjectRow) => {
+      log.info('project tap', { projectId: row.id, route: row.open.route });
+      try {
+        router.push({ pathname: row.open.route, params: { project: row.id, name: row.name } });
+      } catch (error) {
+        log.failure('navigate', error, { route: row.open.route, projectId: row.id });
+      }
+    },
+    [log, router],
+  );
 
   const submit = useCallback(async () => {
     const result = createProjectIntent(name, loadedProjects(state));
