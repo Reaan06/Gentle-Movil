@@ -5,51 +5,128 @@
 //! The JNI boundary is the module's one unsafe surface: JNI accessors and
 //! `CString` reconstruction. Every cabi call is `catch_unwind`-ed, so a Rust
 //! panic surfaces as a JSON error envelope, never as a JVM crash.
+//!
+//! ## Never `null` to Kotlin (S4, S7)
+//!
+//! `GcCoreModule` turns a null `jstring` into `EmptyResponse` ("El núcleo no devolvió
+//! nada para «…»"), which hides both the real cause and the answer the core produced. So
+//! the shim treats every answer as *text*: it marshals
+//! [`cabi::primary_answer_text`](crate::cabi::primary_answer_text) and, when the JVM
+//! refuses that text, retries once with
+//! [`cabi::answer_refused_envelope`](crate::cabi::answer_refused_envelope). Both decisions
+//! live in `cabi` so the offline suite tests them; only the two JNI calls themselves are
+//! device-only.
+//!
+//! ## A pending exception poisons the next call
+//!
+//! `JNIEnv::new_string` returns an error while a Java exception is pending, so a throwable
+//! left behind by an earlier failing accessor (classically `GetStringUTFChars` inside
+//! [`from_jstring`]) used to make the whole answer vanish even though the core had
+//! answered. [`from_jstring`] and [`marshal_text`] therefore clear the pending exception,
+//! and the fallback envelope names the cleared exception instead of swallowing it.
 #![allow(unsafe_code)]
 #![allow(non_snake_case)]
 
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use jni::objects::{JClass, JString};
 use jni::sys::{jlong, jstring};
 use jni::JNIEnv;
 
-/// Marshals a raw cabi pointer into a JNI-owned `jstring` and frees nothing —
-/// the pointer still belongs to the caller's `gc_free` contract.
-fn pointer_to_jstring(env: &mut JNIEnv, raw: *mut c_char) -> jstring {
-    if raw.is_null() {
-        return std::ptr::null_mut();
+use crate::cabi::{
+    answer_refused_envelope, primary_answer_text, refused_input_envelope, take_answer_text,
+    MarshalFailure,
+};
+
+/// Asks the JVM for `text` as a `jstring`, after clearing any exception an earlier call left
+/// pending — `NewStringUTF` fails while one is set, which is what used to null the answer.
+///
+/// A refused text is described in [`MarshalFailure`] so the caller can answer an envelope
+/// that names both the cleared exception and the JVM's own reason.
+fn marshal_text(env: &mut JNIEnv, text: &str) -> Result<jstring, MarshalFailure> {
+    let mut failure = MarshalFailure::default();
+    // `ExceptionCheck` never throws; if it somehow cannot answer, assume pending and clear,
+    // because a stray throwable is far worse than a redundant `ExceptionClear`.
+    if env.exception_check().unwrap_or(true) {
+        let _ = env.exception_clear();
+        failure.pending_exception_cleared = true;
     }
-    // SAFETY: `raw` was produced by `into_c_string` (a `CString::into_raw`)
-    // inside the cabi layer and is valid until `gc_free`.
-    let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
-    // The pointer is released here: Kotlin received a copy as a jstring, so
-    // keeping it until gc_free would leak per call. This keeps the ownership
-    // rule simple for the Kotlin side: never call gcFree.
-    let _ = catch_unwind(AssertUnwindSafe(|| unsafe { crate::cabi::gc_free(raw) }));
     match env.new_string(text) {
-        Ok(s) => s.into_raw(),
-        Err(_) => std::ptr::null_mut(),
+        Ok(text) => Ok(text.into_raw()),
+        Err(error) => {
+            // The failed call may have raised its own throwable: clear it, otherwise the
+            // fallback below would fail for the very same reason.
+            let _ = env.exception_clear();
+            failure.reason = error.to_string();
+            Err(failure)
+        }
     }
 }
 
-/// Marshals a Kotlin `String` argument into a Rust `String` (empty on null).
-fn from_jstring(env: &mut JNIEnv, value: &JString) -> String {
+/// Marshals one answer into a `jstring`, falling back to an error envelope.
+///
+/// The only case that still answers `null` is "the JVM refused both the answer and the
+/// envelope explaining the refusal" (`NewStringUTF` has to allocate, so that is an
+/// out-of-memory / dying-VM state). `GcCoreModule` reports it as `EmptyResponse`; nothing
+/// left in this process can describe it in a string any more.
+fn marshal_answer(env: &mut JNIEnv, answer: Option<&str>) -> jstring {
+    let primary = primary_answer_text(answer);
+    match marshal_text(env, &primary) {
+        Ok(text) => text,
+        Err(failure) => match marshal_text(env, &answer_refused_envelope(&failure)) {
+            Ok(text) => text,
+            Err(_) => std::ptr::null_mut(),
+        },
+    }
+}
+
+/// Marshals a raw cabi pointer into a JNI-owned `jstring`; see [`marshal_answer`] for the
+/// one remaining `null` case.
+fn pointer_to_jstring(env: &mut JNIEnv, raw: *mut c_char) -> jstring {
+    // The pointer is released while it is read (Kotlin gets a copy), so the ownership rule
+    // stays simple for the Kotlin side: never call gcFree.
+    let answer = take_answer_text(raw);
+    marshal_answer(env, answer.as_deref())
+}
+
+/// Reads a Kotlin `String` argument into a Rust `String`, or says why it could not.
+///
+/// A failed `get_string` leaves the exception it threw **pending**; that is what made the
+/// following `new_string` fail and the answer disappear. It is cleared here, and the reason
+/// travels back to the caller so it answers an `input` envelope naming the real cause
+/// instead of pretending the argument was empty JSON.
+fn from_jstring(env: &mut JNIEnv, value: &JString) -> Result<String, String> {
     match env.get_string(value) {
-        Ok(s) => s.to_string_lossy().into_owned(),
-        Err(_) => String::new(),
+        Ok(text) => Ok(text.to_string_lossy().into_owned()),
+        Err(error) => {
+            let _ = env.exception_clear();
+            Err(error.to_string())
+        }
     }
 }
 
-/// One-string cabi call: marshal in, call under catch_unwind, marshal out.
-fn call_one_string(env: &mut JNIEnv, input: &JString, call: impl FnOnce(&str) -> *mut c_char) -> jstring {
-    let input = from_jstring(env, input);
-    let raw = match catch_unwind(AssertUnwindSafe(|| call(&input))) {
-        Ok(ptr) => ptr,
-        // A panic that somehow escapes the cabi's own catch_unwind still must
-        // not cross the JVM boundary; fall back to a minimal error envelope.
-        Err(_) => panic_envelope(),
+/// Answers a call whose Kotlin argument could not be read: an `input` envelope, never null.
+fn refuse_input(env: &mut JNIEnv, reason: &str) -> jstring {
+    marshal_answer(env, Some(refused_input_envelope(reason).as_str()))
+}
+
+/// One-string cabi call: marshal in, call under `catch_unwind`, marshal out.
+fn call_one_string(
+    env: &mut JNIEnv,
+    input: &JString,
+    call: impl FnOnce(*const c_char) -> *mut c_char,
+) -> jstring {
+    let input = match from_jstring(env, input) {
+        Ok(input) => input,
+        Err(reason) => return refuse_input(env, &reason),
+    };
+    let raw = match CString::new(input) {
+        Ok(text) => catch_unwind(AssertUnwindSafe(|| call(text.as_ptr())))
+            .unwrap_or_else(|_| panic_envelope()),
+        // A Kotlin string can carry a NUL byte (a password, for instance) and `CString`
+        // cannot hold one; the ABI's `input` kind says so instead of the old `panic` answer.
+        Err(_) => return refuse_input(env, "the argument contains a NUL byte"),
     };
     pointer_to_jstring(env, raw)
 }
@@ -62,17 +139,14 @@ fn panic_envelope() -> *mut c_char {
     }
 }
 
-/// Returns the ABI version string (e.g. "1"); "0" if the core panicked.
+/// Returns the ABI version string (e.g. "1"); an error envelope if the JVM refuses it.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcAbiVersion(
     env: &mut JNIEnv,
     _class: JClass,
 ) -> jstring {
     let version = catch_unwind(AssertUnwindSafe(|| crate::cabi::gc_abi_version())).unwrap_or(0);
-    match env.new_string(version.to_string()) {
-        Ok(s) => s.into_raw(),
-        Err(_) => std::ptr::null_mut(),
-    }
+    marshal_answer(env, Some(version.to_string().as_str()))
 }
 
 /// Parses a `gc://pair?…` URI (JSON in/out), mirroring `gc_pair_from_qr`.
@@ -82,12 +156,8 @@ pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcPairFromQr(
     _class: JClass,
     json: JString,
 ) -> jstring {
-    let input = from_jstring(env, &json);
-    let raw = match CString::new(input) {
-        Ok(uri) => catch_unwind(AssertUnwindSafe(|| crate::cabi::gc_pair_from_qr(uri.as_ptr()))).unwrap_or_else(|_| panic_envelope()),
-        Err(_) => panic_envelope(),
-    };
-    pointer_to_jstring(env, raw)
+    // `extern "C" fn` items do not implement `FnOnce`, so the ABI function is wrapped.
+    call_one_string(env, &json, |uri| crate::cabi::gc_pair_from_qr(uri))
 }
 
 /// Opens an authenticated SSH session from a JSON config; returns `{"ok":true,"sessionId":N}`.
@@ -97,12 +167,7 @@ pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshConnect(
     _class: JClass,
     json: JString,
 ) -> jstring {
-    let input = from_jstring(env, &json);
-    let raw = match CString::new(input) {
-        Ok(cfg) => catch_unwind(AssertUnwindSafe(|| crate::cabi::gc_ssh_connect(cfg.as_ptr()))).unwrap_or_else(|_| panic_envelope()),
-        Err(_) => panic_envelope(),
-    };
-    pointer_to_jstring(env, raw)
+    call_one_string(env, &json, |config| crate::cabi::gc_ssh_connect(config))
 }
 
 /// Error envelope for a channel document the split rejects (`input`, like the C ABI's own
@@ -131,7 +196,10 @@ fn channel_shim(
     json: JString,
     call: impl FnOnce(u64, u64, *const c_char) -> *mut c_char,
 ) -> jstring {
-    let input = from_jstring(env, &json);
+    let input = match from_jstring(env, &json) {
+        Ok(input) => input,
+        Err(reason) => return refuse_input(env, &reason),
+    };
     let raw = match crate::cabi::split_channel_document(&input) {
         Ok(split) => match CString::new(split.payload) {
             Ok(payload) => catch_unwind(AssertUnwindSafe(|| {
@@ -194,7 +262,10 @@ pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcProvisionStep(
     _class: JClass,
     json: JString,
 ) -> jstring {
-    let input = from_jstring(env, &json);
+    let input = match from_jstring(env, &json) {
+        Ok(input) => input,
+        Err(reason) => return refuse_input(env, &reason),
+    };
     let raw = match serde_json::from_str::<serde_json::Value>(&input) {
         Ok(mut value) => {
             let session_id = value.get("sessionId").and_then(|v| v.as_u64()).unwrap_or(0);

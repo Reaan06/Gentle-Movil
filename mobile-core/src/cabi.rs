@@ -849,6 +849,123 @@ fn into_c_string(text: String) -> *mut c_char {
     cstring.into_raw()
 }
 
+// ===========================================================================
+// JNI marshalling seam
+// ===========================================================================
+//
+// [`crate::jni_shim`] is Android-only (`cfg(all(target_os = "android", feature =
+// "jni-shim"))`), so none of it can run in the offline suite — yet the defect it has to
+// avoid lives exactly there: `JNIEnv::new_string` fails while a Java exception is pending,
+// the shim answered `null`, and `GcCoreModule` turned that into `EmptyResponse` ("el núcleo
+// no devolvió nada para «gc_ssh_connect»"), throwing away an answer the core had produced.
+//
+// Every decision that does not need a `JNIEnv` is therefore made here, under the offline
+// tests: which text to marshal, what to answer when the core returns no pointer, and which
+// envelope to retry with when the JVM refuses that text (S7: honest state, never a null).
+// The shim keeps only the two JNI calls and the exception bookkeeping around them.
+
+/// What the shim saw when the JVM refused to create a string for the answer.
+///
+/// The shim fills it from the JNI call itself; everything that shapes the fallback envelope
+/// from it is host-compiled and tested, so the wording cannot regress on the device.
+#[doc(hidden)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarshalFailure {
+    /// A Java exception was already pending when the shim tried to marshal, and the shim
+    /// cleared it first: leaving it pending is exactly what made every later answer null.
+    pub pending_exception_cleared: bool,
+    /// The JVM's own description of the refusal; empty when the shim has none.
+    pub reason: String,
+}
+
+/// The JVM refused to create a string for the core's answer.
+const MARSHALL_REFUSED: &str = "the JVM could not create a string for the core's answer";
+/// A stale exception was found pending before marshalling and cleared.
+const PENDING_EXCEPTION_CLEARED: &str =
+    "a pending JVM exception from an earlier JNI call was cleared first";
+/// The C ABI answered a null pointer, which it never does.
+const MISSING_ANSWER: &str = "the native core returned no answer";
+
+/// One `{"ok":false,"error":{…}}` document, always NUL-free because `serde_json` escapes
+/// control characters (`\u0000`) instead of emitting them.
+fn envelope(kind: &str, message: &str) -> String {
+    json!({ "ok": false, "error": { "kind": kind, "message": message } }).to_string()
+}
+
+/// Envelope the shim answers when the C ABI returned no pointer at all.
+///
+/// Unreachable through [`json_call`] (which always allocates a `CString`), so it is a
+/// tripwire: even that branch answers a real error document instead of `null`.
+#[doc(hidden)]
+pub fn missing_answer_envelope() -> String {
+    envelope(KIND_INTERNAL, MISSING_ANSWER)
+}
+
+/// Envelope the shim answers when the JVM refuses to create a string for the answer.
+///
+/// It names the failure itself, plus — when the shim had to clear one first — the stale
+/// exception that used to make the whole answer disappear, plus the JVM's own reason.
+#[doc(hidden)]
+pub fn answer_refused_envelope(failure: &MarshalFailure) -> String {
+    let mut message = String::from(MARSHALL_REFUSED);
+    if failure.pending_exception_cleared {
+        message.push_str("; ");
+        message.push_str(PENDING_EXCEPTION_CLEARED);
+    }
+    if !failure.reason.is_empty() {
+        message.push_str(": ");
+        message.push_str(&failure.reason);
+    }
+    envelope(KIND_INTERNAL, &message)
+}
+
+/// Envelope the shim answers when the Kotlin argument itself could not be read.
+///
+/// `GetStringUTFChars` failure is an *input* problem of this call (a null or foreign
+/// `jstring`, or a throwable it raised), so it is reported with the ABI's `input` kind and
+/// the cause in the message — never as a misleading "the JSON is empty" parse error.
+#[doc(hidden)]
+pub fn refused_input_envelope(reason: &str) -> String {
+    envelope(
+        KIND_INPUT,
+        &format!("the JVM could not read the call's argument: {reason}"),
+    )
+}
+
+/// Text the shim marshals first for one `gc_*` answer.
+///
+/// `Some(text)` is the C ABI's own answer, forwarded unchanged; `None` means the ABI handed
+/// back a null pointer and the shim answers [`missing_answer_envelope`].
+#[doc(hidden)]
+pub fn primary_answer_text(answer: Option<&str>) -> String {
+    match answer {
+        Some(text) => text.to_string(),
+        None => missing_answer_envelope(),
+    }
+}
+
+/// Read the answer string a `gc_*` call returned and release it, NUL-terminated as the ABI
+/// promises. `None` for a null pointer.
+///
+/// Freeing here (and not in Kotlin) keeps the ownership rule the shim already relies on:
+/// Kotlin receives a *copy* as a `jstring`, so it must never call `gc_free`.
+#[doc(hidden)]
+pub fn take_answer_text(raw: *mut c_char) -> Option<String> {
+    if raw.is_null() {
+        return None;
+    }
+    // SAFETY: `raw` was produced by `CString::into_raw` inside this module and is valid
+    // until it is released below, exactly the contract `gc_free` documents.
+    let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+    // Kotlin received a copy, so the C string is released now: keeping it for a later
+    // `gc_free` would leak one allocation per call. A poisoned drop must not unwind across
+    // the JVM boundary, hence the `catch_unwind`.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+        drop(CString::from_raw(raw));
+    }));
+    Some(text)
+}
+
 /// Borrow one NUL-terminated input string for the duration of the call.
 fn read_str<'a>(ptr: *const c_char) -> Result<&'a str, AbiError> {
     if ptr.is_null() {

@@ -4,7 +4,12 @@
 //! bindings can reach — and they never touch the network: the SSH paths they cover are the
 //! handle registry and the pure value types.
 
-use mobile_core::cabi::split_channel_document;
+use std::ffi::CString;
+
+use mobile_core::cabi::{
+    answer_refused_envelope, missing_answer_envelope, primary_answer_text, refused_input_envelope,
+    split_channel_document, take_answer_text, MarshalFailure,
+};
 use mobile_core::device_key;
 use mobile_core::ffi::{CoreErrorPayload, MobileCore};
 use mobile_core::qr::PairInfo;
@@ -259,3 +264,121 @@ fn malformed_channel_documents_report_which_shape_was_wrong() {
     let not_an_object = split_channel_document("[1,2]").expect_err("not an object");
     assert_eq!(not_an_object.message, "the channel document must be a JSON object");
 }
+
+// ---------------------------------------------------------------------------
+// The JNI marshalling seam (S4, S7)
+//
+// The device defect this covers: `JNIEnv::new_string` fails while a Java exception is
+// pending, the shim answered `null`, and Kotlin reported "El núcleo no devolvió nada para
+// «gc_ssh_connect»" even though the core had answered. Everything decidable without a
+// `JNIEnv` lives in `cabi` and is tested here, through the very functions `jni_shim.rs`
+// calls. What stays device-only is listed in the module report: the two JNI calls
+// themselves and the pending-exception bookkeeping around them.
+// ---------------------------------------------------------------------------
+
+/// Parses one shim text and proves it survives the `CString` hop into the JVM.
+fn shim_text(text: &str) -> serde_json::Value {
+    assert!(
+        CString::new(text).is_ok(),
+        "the shim text must not carry a raw NUL byte: {text}"
+    );
+    serde_json::from_str(text).expect("the shim answers a JSON document")
+}
+
+#[test]
+fn jni_shim_forwards_a_normal_answer_unchanged() {
+    // The normal path must not be rewritten: the app reads the core's own envelope.
+    let answer = r#"{"ok":true,"sessionId":3,"result":{"sessionId":3}}"#;
+    assert_eq!(primary_answer_text(Some(answer)), answer);
+    assert_eq!(shim_text(&primary_answer_text(Some(answer)))["ok"], true);
+}
+
+#[test]
+fn jni_shim_answers_an_internal_envelope_when_the_core_sends_no_pointer() {
+    let text = primary_answer_text(None);
+    assert_eq!(text, missing_answer_envelope());
+    assert_eq!(
+        text,
+        r#"{"error":{"kind":"internal","message":"the native core returned no answer"},"ok":false}"#
+    );
+    let value = shim_text(&text);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["kind"], "internal");
+}
+
+#[test]
+fn jni_shim_reads_and_releases_the_answer_pointer() {
+    // A null pointer is the only input the reader turns into "no answer".
+    assert!(take_answer_text(std::ptr::null_mut()).is_none());
+
+    // A real ABI answer pointer: read by the helper, which also frees it (Kotlin must
+    // never call `gcFree`, so the test must not either).
+    let raw = mobile_core::cabi::gc_pair_from_qr(std::ptr::null());
+    let text = take_answer_text(raw).expect("the ABI answers a null argument with an envelope");
+    let value = shim_text(&text);
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["error"]["kind"], "input");
+}
+
+#[test]
+fn jni_shim_fallback_names_the_cleared_pending_exception() {
+    // The simulated failure the JVM produces: it refused the text and a stale throwable had
+    // to be cleared first. The envelope must say both, instead of swallowing the cause.
+    let failure = MarshalFailure {
+        pending_exception_cleared: true,
+        reason: "JNI call failed: java.lang.OutOfMemoryError".to_string(),
+    };
+    let text = answer_refused_envelope(&failure);
+    assert_eq!(
+        text,
+        concat!(
+            r#"{"error":{"kind":"internal","message":"the JVM could not create a string "#,
+            r#"for the core's answer; a pending JVM exception from an earlier JNI call was "#,
+            r#"cleared first: JNI call failed: java.lang.OutOfMemoryError"},"ok":false}"#
+        )
+    );
+    assert_eq!(shim_text(&text)["ok"], false);
+}
+
+#[test]
+fn jni_shim_fallback_without_detail_says_only_what_failed() {
+    // Contract of the exception-clearing bookkeeping as far as it is host-testable: a clean
+    // attempt (nothing pending, no reason) adds no clause and no dangling separator.
+    let clean = MarshalFailure::default();
+    assert!(!clean.pending_exception_cleared);
+    assert!(clean.reason.is_empty());
+    assert_eq!(
+        answer_refused_envelope(&clean),
+        r#"{"error":{"kind":"internal","message":"the JVM could not create a string for the core's answer"},"ok":false}"#
+    );
+}
+
+#[test]
+fn jni_shim_envelopes_survive_a_c_string() {
+    // The JVM refusal reason is JVM text this crate does not control: quotes, newlines and a
+    // NUL byte must be escaped by the envelope, never truncate it on the way to the JVM.
+    let failure = MarshalFailure {
+        pending_exception_cleared: false,
+        reason: "bad \"text\"\nwith a \u{0} byte".to_string(),
+    };
+    let text = answer_refused_envelope(&failure);
+    let value = shim_text(&text);
+    assert_eq!(
+        value["error"]["message"],
+        "the JVM could not create a string for the core's answer: bad \"text\"\nwith a \u{0} byte"
+    );
+}
+
+#[test]
+fn jni_shim_names_an_unreadable_kotlin_argument_as_input() {
+    // A failed `get_string` is this call's input problem, not a core failure and not a
+    // phantom "the JSON is empty" parse error.
+    let text = refused_input_envelope("JNI call failed: the string is null");
+    assert_eq!(
+        text,
+        r#"{"error":{"kind":"input","message":"the JVM could not read the call's argument: JNI call failed: the string is null"},"ok":false}"#
+    );
+    let value = shim_text(&text);
+    assert_eq!(value["error"]["kind"], "input");
+}
+
