@@ -65,6 +65,10 @@ struct Shared {
     stalled_exec: Mutex<Vec<String>>,
     /// Host key fingerprint the scripted handshake reports (`""` = it saw no key).
     fingerprint: Mutex<String>,
+    /// When set, `disconnect` reports success but the session keeps claiming to be up.
+    stuck_disconnect: Mutex<bool>,
+    /// The last connect request, so a test can assert what credential reached the transport.
+    last_request: Mutex<Option<ConnectRequest>>,
 }
 
 impl Shared {
@@ -122,6 +126,11 @@ impl Shared {
     fn written_sftp(&self) -> Vec<Vec<u8>> {
         self.sftp_writes.lock().expect("writes").clone()
     }
+
+    /// The last connect request the transport received.
+    fn last_request(&self) -> Option<ConnectRequest> {
+        self.last_request.lock().expect("request").clone()
+    }
 }
 
 struct ScriptedTransport {
@@ -131,26 +140,43 @@ struct ScriptedTransport {
 impl Transport for ScriptedTransport {
     fn connect<'a>(
         &'a self,
-        _request: &'a ConnectRequest,
+        request: &'a ConnectRequest,
     ) -> BoxFuture<'a, Result<Box<dyn TransportSession>, mobile_core::CoreError>> {
         let shared = Arc::clone(&self.shared);
-        Box::pin(
-            async move { Ok(Box::new(ScriptedSession { shared }) as Box<dyn TransportSession>) },
-        )
+        if let Ok(mut slot) = shared.last_request.lock() {
+            *slot = Some(request.clone());
+        }
+        Box::pin(async move {
+            Ok(Box::new(ScriptedSession {
+                shared,
+                connected: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            }) as Box<dyn TransportSession>)
+        })
     }
 }
 
 struct ScriptedSession {
     shared: Arc<Shared>,
+    /// Whether this session still holds a connection, as the scripted transport reports it.
+    connected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TransportSession for ScriptedSession {
     fn host_key_fingerprint(&self) -> String {
-        self.shared
-            .fingerprint
-            .lock()
-            .expect("fingerprint")
-            .clone()
+        self.shared.fingerprint.lock().expect("fingerprint").clone()
+    }
+
+    fn disconnect(&self) -> BoxFuture<'_, Result<(), mobile_core::CoreError>> {
+        let stuck = *self.shared.stuck_disconnect.lock().expect("stuck");
+        if !stuck {
+            self.connected
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        Box::pin(async { Ok(()) })
+    }
+
+    fn is_connected(&self) -> Option<bool> {
+        Some(self.connected.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     fn exec_once<'a>(
@@ -163,7 +189,10 @@ impl TransportSession for ScriptedSession {
             .expect("commands")
             .push(command.to_string());
         let stalled = self.shared.stalled_exec.lock().expect("stall");
-        if stalled.iter().any(|needle| command.contains(needle.as_str())) {
+        if stalled
+            .iter()
+            .any(|needle| command.contains(needle.as_str()))
+        {
             return Box::pin(std::future::pending());
         }
         drop(stalled);
@@ -226,12 +255,7 @@ struct TcpChannel {
 }
 
 impl TcpChannel {
-    fn new(
-        shared: Arc<Shared>,
-        events: Vec<ChannelEvent>,
-        park: bool,
-        echo: bool,
-    ) -> Self {
+    fn new(shared: Arc<Shared>, events: Vec<ChannelEvent>, park: bool, echo: bool) -> Self {
         Self {
             shared,
             pending: AsyncMutex::new(events.into()),
@@ -704,7 +728,9 @@ async fn upload_for(script: &Arc<Shared>, path: &str, bytes: &[u8]) -> SshSessio
     script.push_exec(exec_ok("")); // chmod +x
     script.push_sftp(sftp_ok_sequence(1));
     let session = mock_session(script).await;
-    upload_daemon(&session, bytes, path).await.expect("uploaded");
+    upload_daemon(&session, bytes, path)
+        .await
+        .expect("uploaded");
     session
 }
 
@@ -722,7 +748,10 @@ fn assert_unverified(
         message.contains("was not verified by this process"),
         "{message}"
     );
-    assert!(message.contains(path), "the message must name the path: {message}");
+    assert!(
+        message.contains(path),
+        "the message must name the path: {message}"
+    );
     let commands = script.commands();
     assert!(
         !commands.iter().any(|command| command.contains("nohup")),
@@ -889,11 +918,13 @@ async fn start_timeout_terminates_the_exact_pid_it_started() {
     script.push_exec(exec_ok("")); // kill -TERM 700
     script.push_exec(exec_fail(1, "")); // kill -0: the pid is gone
     let session = mock_session(&script).await;
-    let error =
-        start_daemon_with_timeout(&session, REMOTE_PATH, 43722, Duration::from_millis(50))
-            .await
-            .expect_err("never answered");
-    assert!(error.to_string().contains("pid 700 was terminated"), "{error}");
+    let error = start_daemon_with_timeout(&session, REMOTE_PATH, 43722, Duration::from_millis(50))
+        .await
+        .expect_err("never answered");
+    assert!(
+        error.to_string().contains("pid 700 was terminated"),
+        "{error}"
+    );
     assert_eq!(script.commands()[1], posix_command("kill -TERM 700"));
     assert_eq!(script.commands()[2], posix_command("kill -0 700"));
 }
@@ -966,7 +997,8 @@ async fn a_stalled_kill_still_returns_the_timeout_error_bounded() {
     script.stall_exec_containing("kill -TERM"); // the kill itself never completes
     let session = mock_session(&script).await;
     let started = std::time::Instant::now();
-    let stalled = start_daemon_with_timeout(&session, REMOTE_PATH, 43722, Duration::from_millis(60));
+    let stalled =
+        start_daemon_with_timeout(&session, REMOTE_PATH, 43722, Duration::from_millis(60));
     let outcome = tokio::time::timeout(Duration::from_secs(10), stalled)
         .await
         .expect("a stalled kill must not hang the timeout path");
@@ -1257,8 +1289,9 @@ fn call_json(pointer: *mut std::ffi::c_char) -> serde_json::Value {
         .to_str()
         .expect("the ABI returns UTF-8 JSON")
         .to_string();
-    // SAFETY: `pointer` is the live allocation just decoded above and is freed once here.
-    unsafe { cabi::gc_free(pointer) };
+    // `gc_free` is a safe fn; `pointer` is the live allocation just decoded above and is
+    // released exactly once here.
+    cabi::gc_free(pointer);
     serde_json::from_str(&text).unwrap_or_else(|error| panic!("not JSON ({error}): {text}"))
 }
 
@@ -1276,8 +1309,8 @@ fn abi_guard() -> std::sync::MutexGuard<'static, ()> {
 #[test]
 fn abi_version_is_the_documented_constant() {
     let _guard = abi_guard();
-    assert_eq!(cabi::gc_abi_version(), 1);
-    assert_eq!(cabi::ABI_VERSION, 1);
+    assert_eq!(cabi::gc_abi_version(), 2);
+    assert_eq!(cabi::ABI_VERSION, 2);
 }
 
 #[test]
@@ -1556,17 +1589,37 @@ fn connect_normalizes_the_reported_fingerprint_to_lowercase_hex() {
 }
 
 #[test]
-fn connect_omits_the_fingerprint_when_the_handshake_reported_none() {
+fn connect_refuses_a_session_whose_handshake_reported_no_host_key() {
+    // SEC-013: the `result` record promises `fingerprint`. An `ok: true` answer that simply
+    // omitted it was a lie the app could not act on, so a handshake that reports no usable
+    // host key now answers an error and the unverified session is torn down.
     let _guard = abi_guard();
     let script = shared();
     script.fingerprint.lock().expect("fingerprint").clear();
 
     let connected = abi_connect_answer(&script);
-    assert_eq!(connected["ok"], true, "{connected}");
-    assert_eq!(connected["result"]["sessionId"], 1);
+    assert_eq!(connected["ok"], false, "{connected}");
+    assert_eq!(connected["error"]["kind"], "ssh");
+    let message = connected["error"]["message"].as_str().expect("message");
+    assert!(message.starts_with("ssh: "), "{message}");
     assert!(
-        connected["result"].get("fingerprint").is_none(),
-        "no key was reported, so no value may be invented: {connected}"
+        message.contains("host key"),
+        "the failure must name what was missing: {message}"
+    );
+    assert!(
+        connected.get("result").is_none(),
+        "no result record may promise a field it does not carry: {connected}"
+    );
+
+    // The half-open session was closed instead of being kept as a trusted handle.
+    let stale = call_json(cabi::gc_ssh_close(1));
+    assert_eq!(stale["error"]["kind"], "ssh", "{stale}");
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("unknown session id"),
+        "{stale}"
     );
 }
 
@@ -1723,7 +1776,10 @@ fn register_step_without_a_command_or_daemon_fields_is_rejected() {
         message.contains("command") && message.contains("inviteToken"),
         "the rejection must name both accepted shapes: {message}"
     );
-    assert!(script.commands().is_empty(), "nothing may run for a refused step");
+    assert!(
+        script.commands().is_empty(),
+        "nothing may run for a refused step"
+    );
 }
 
 #[test]
@@ -1845,9 +1901,8 @@ fn tunnel_step_rejects_a_payload_with_no_usable_forward() {
 
 /// Standard (padded) base64, spelled here so the tests need no extra crate.
 fn b64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let first = u32::from(chunk[0]);
         let second = u32::from(chunk.get(1).copied().unwrap_or(0));
@@ -1919,8 +1974,8 @@ fn channel_write(session_id: u64, channel_id: u64, bytes: &[u8]) -> serde_json::
 
 /// `gc_ssh_channel_read` bounded by `timeout_ms`.
 fn channel_read(session_id: u64, channel_id: u64, timeout_ms: u64) -> serde_json::Value {
-    let payload = CString::new(serde_json::json!({ "timeoutMs": timeout_ms }).to_string())
-        .expect("no NUL");
+    let payload =
+        CString::new(serde_json::json!({ "timeoutMs": timeout_ms }).to_string()).expect("no NUL");
     call_json(cabi::gc_ssh_channel_read(
         session_id,
         channel_id,
@@ -1999,7 +2054,10 @@ fn channel_read_honours_its_timeout_and_returns_empty_bytes() {
 
     assert_eq!(answer["ok"], true, "{answer}");
     assert_eq!(answer["result"]["bytes"], "");
-    assert_eq!(answer["result"]["eof"], false, "a timeout is not an end of stream");
+    assert_eq!(
+        answer["result"]["eof"], false,
+        "a timeout is not an end of stream"
+    );
     assert!(
         elapsed >= Duration::from_millis(100),
         "the read must wait for the requested window: {elapsed:?}"
@@ -2163,13 +2221,8 @@ fn a_stalled_step_command_returns_the_timeout_error_within_the_deadline() {
     let error = runtime
         .block_on(async {
             let session = mock_session(&script).await;
-            run_step_command_with_timeout(
-                &session,
-                "detect",
-                "sleep 99",
-                Duration::from_millis(80),
-            )
-            .await
+            run_step_command_with_timeout(&session, "detect", "sleep 99", Duration::from_millis(80))
+                .await
         })
         .expect_err("a stalled command must time out");
     let elapsed = started.elapsed();
@@ -2204,5 +2257,566 @@ fn the_step_command_deadline_is_bounded_and_above_the_app_side_timeouts() {
     assert!(
         STEP_COMMAND_TIMEOUT <= Duration::from_secs(120),
         "{STEP_COMMAND_TIMEOUT:?}"
+    );
+}
+
+// --------------------------------------------------------------------------------------
+// T16: device-key reconnect and session teardown over the C ABI
+// --------------------------------------------------------------------------------------
+
+/// Call one `gc_*` JSON symbol with a document and decode the answer.
+fn call_json_doc(
+    call: extern "C" fn(*const std::ffi::c_char) -> *mut std::ffi::c_char,
+    payload: &str,
+) -> serde_json::Value {
+    let c_payload = CString::new(payload).expect("no NUL");
+    call_json(call(c_payload.as_ptr()))
+}
+
+/// The seed of a fresh device identity, as the ABI carries it.
+fn seed_document(seed: &[u8], expected_fp: Option<&str>) -> serde_json::Value {
+    let mut document = serde_json::json!({
+        "host": "host",
+        "port": 22,
+        "user": "reaan",
+        "seed": seed,
+    });
+    if let Some(expected_fp) = expected_fp {
+        document["expectedFp"] = serde_json::Value::String(expected_fp.to_string());
+    }
+    document
+}
+
+#[test]
+fn seed_connect_refuses_a_key_only_connect_without_a_pin() {
+    let _guard = abi_guard();
+    let script = shared();
+    cabi::install_test_transport(Arc::new(ScriptedTransport {
+        shared: Arc::clone(&script),
+    }));
+    let pair = device_key::generate();
+    let seed = pair.secret.secret_seed.clone();
+
+    let answer = call_json_doc(
+        cabi::gc_ssh_connect_seed,
+        &seed_document(&seed, None).to_string(),
+    );
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["kind"], "input");
+    let message = answer["error"]["message"].as_str().expect("message");
+    assert!(message.contains("expectedFp"), "{message}");
+    assert!(
+        message.contains("pinned"),
+        "the rejection must say why a pin is required: {message}"
+    );
+
+    // A blank pin is refused just like a missing one.
+    let answer = call_json_doc(
+        cabi::gc_ssh_connect_seed,
+        &seed_document(&seed, Some("   ")).to_string(),
+    );
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["kind"], "input");
+
+    // Nothing reached the transport: no unpinned key-only connection was attempted.
+    assert!(script.last_request().is_none());
+}
+
+#[test]
+fn seed_connect_pins_the_paired_host_key_and_never_echoes_the_seed() {
+    let _guard = abi_guard();
+    let script = shared();
+    cabi::install_test_transport(Arc::new(ScriptedTransport {
+        shared: Arc::clone(&script),
+    }));
+    let pair = device_key::generate();
+    let seed = pair.secret.secret_seed.clone();
+
+    let connected = call_json_doc(
+        cabi::gc_ssh_connect_seed,
+        &seed_document(&seed, Some(FP)).to_string(),
+    );
+    assert_eq!(connected["ok"], true, "{connected}");
+    assert_eq!(connected["result"]["fingerprint"], FP);
+    let session_id = connected["sessionId"].as_u64().expect("session id");
+    assert_eq!(connected["result"]["sessionId"], session_id);
+
+    // The transport really received the device key, and the request carried the pin, so
+    // the handshake — not a late comparison — enforced it.
+    let request = script
+        .last_request()
+        .expect("the connect reached the transport");
+    assert_eq!(request.expected_fingerprint.as_deref(), Some(FP));
+    match &request.credential {
+        SshCredential::Key {
+            private,
+            passphrase,
+        } => {
+            assert_eq!(*passphrase, None);
+            let text = String::from_utf8(private.clone()).expect("openssh text");
+            assert!(
+                text.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"),
+                "{text}"
+            );
+            // The credential is exactly the key derived from the seed that was handed in
+            // (its public half is proven to be the registered identity in `ffi.rs` and in
+            // the `device_key` unit tests, which round-trip it through `russh`).
+            assert_eq!(
+                text,
+                device_key::private_key_openssh(&pair.secret).expect("private key")
+            );
+        }
+        other => panic!("the seeded connect must use the device key, got {other:?}"),
+    }
+
+    // The seed is in no part of the answer.
+    assert!(!answer_carries_seed(&connected, &seed), "{connected}");
+
+    // ... and a different host key aborts, naming both fingerprints and nothing else.
+    let refused = call_json_doc(
+        cabi::gc_ssh_connect_seed,
+        &seed_document(&seed, Some(&"bb".repeat(32))).to_string(),
+    );
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["error"]["kind"], "ssh");
+    let message = refused["error"]["message"].as_str().expect("message");
+    assert!(message.contains("pinned fingerprint"), "{message}");
+    assert!(message.contains(&"bb".repeat(32)), "{message}");
+    assert!(message.contains(FP), "{message}");
+    assert!(!answer_carries_seed(&refused, &seed), "{refused}");
+}
+
+/// Whether any form of `seed` shows up in an answer document.
+fn answer_carries_seed(answer: &serde_json::Value, seed: &[u8]) -> bool {
+    let rendered = answer.to_string();
+    let hex = mobile_core::fingerprint::hex_lower(seed);
+    let decimal = serde_json::to_string(seed).expect("seed as JSON array");
+    rendered.contains(&hex) || rendered.contains(&decimal) || rendered.contains("secret_seed")
+}
+
+#[test]
+fn seed_connect_reports_a_malformed_seed_without_echoing_it() {
+    let _guard = abi_guard();
+    let script = shared();
+    cabi::install_test_transport(Arc::new(ScriptedTransport {
+        shared: Arc::clone(&script),
+    }));
+
+    let answer = call_json_doc(
+        cabi::gc_ssh_connect_seed,
+        &seed_document(&[0xde, 0xad, 0xbe, 0xef], Some(FP)).to_string(),
+    );
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["kind"], "crypto");
+    assert!(
+        !answer_carries_seed(&answer, &[0xde, 0xad, 0xbe, 0xef]),
+        "{answer}"
+    );
+    assert!(script.last_request().is_none());
+}
+
+#[test]
+fn device_key_public_derives_the_same_identity_and_never_returns_the_seed() {
+    let _guard = abi_guard();
+    let pair = device_key::generate();
+    let seed = pair.secret.secret_seed.clone();
+
+    let answer = call_json_doc(
+        cabi::gc_device_key_public,
+        &serde_json::json!({ "seed": seed }).to_string(),
+    );
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["result"]["publicHex"], pair.public_hex);
+    let fingerprint = answer["result"]["fingerprint"]
+        .as_str()
+        .expect("fingerprint");
+    assert!(fingerprint.starts_with("SHA256:"), "{fingerprint}");
+    assert!(!answer_carries_seed(&answer, &seed), "{answer}");
+
+    // A short seed is a typed crypto failure that names the real length, not the bytes.
+    let bad = call_json_doc(
+        cabi::gc_device_key_public,
+        &serde_json::json!({ "seed": [1, 2, 3] }).to_string(),
+    );
+    assert_eq!(bad["ok"], false, "{bad}");
+    assert_eq!(bad["error"]["kind"], "crypto");
+    assert!(bad["error"]["message"]
+        .as_str()
+        .expect("message")
+        .contains("must be 32 bytes"));
+    assert!(!bad.to_string().contains("\"secret_seed\""), "{bad}");
+}
+
+#[test]
+fn ssh_close_frees_the_session_and_refuses_a_second_close() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+
+    let closed = call_json(cabi::gc_ssh_close(session_id));
+    assert_eq!(closed["ok"], true, "{closed}");
+    assert_eq!(closed["result"]["closed"], true);
+
+    // Closing twice is an honest typed error, and nothing is torn down a second time.
+    let again = call_json(cabi::gc_ssh_close(session_id));
+    assert_eq!(again["ok"], false, "{again}");
+    assert_eq!(again["error"]["kind"], "ssh");
+    assert_eq!(
+        again["error"]["message"],
+        format!("ssh: unknown session id {session_id}")
+    );
+
+    // The freed id is stale for every other call too: the session is really gone.
+    let detect = provision_step(
+        session_id,
+        serde_json::json!({ "sessionId": session_id, "step": "detect" }),
+    );
+    assert_eq!(detect["ok"], false, "{detect}");
+    assert_eq!(
+        detect["error"]["message"],
+        format!("ssh: unknown session id {session_id}")
+    );
+}
+
+#[test]
+fn ssh_close_takes_the_tunnel_channels_of_its_session() {
+    let _guard = abi_guard();
+    let script = shared();
+    let session_id = abi_connect(&script);
+    script.push_tcp(TcpReply::Live(Vec::new()));
+    let channel = open_tunnels(session_id, &[43722])[0];
+
+    assert_eq!(call_json(cabi::gc_ssh_close(session_id))["ok"], true);
+
+    // The channel id died with its session instead of leaking in the registry.
+    let stale = channel_read(session_id, channel, 50);
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert_eq!(stale["error"]["kind"], "ssh");
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("unknown session id"),
+        "{stale}"
+    );
+}
+
+#[test]
+fn ssh_close_reports_an_honest_failure_when_the_transport_never_disconnected() {
+    let _guard = abi_guard();
+    let script = shared();
+    *script.stuck_disconnect.lock().expect("stuck") = true;
+    let session_id = abi_connect(&script);
+
+    let answer = call_json(cabi::gc_ssh_close(session_id));
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["kind"], "ssh");
+    let message = answer["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("still reports an open connection"),
+        "the answer must say the connection is still up: {message}"
+    );
+    assert!(
+        answer.get("result").is_none(),
+        "`closed: true` is only for a real teardown: {answer}"
+    );
+
+    // The handle is gone either way, so a second close is the unknown-id error, not a
+    // second lie about a connection nobody holds any more.
+    let again = call_json(cabi::gc_ssh_close(session_id));
+    assert_eq!(again["ok"], false, "{again}");
+    assert!(
+        again["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("unknown session id"),
+        "{again}"
+    );
+}
+
+#[test]
+fn fs_refuses_a_relative_root_through_the_abi() {
+    // SEC-003: `root: "etc"` canonicalizes against the process working directory, which on
+    // Android is `/`, so it used to read `/etc` instead of anything the app owns.
+    let _guard = abi_guard();
+    for root in ["etc", "./etc", "../etc"] {
+        let read = call_json_doc(
+            cabi::gc_fs_read,
+            &serde_json::json!({ "root": root, "path": "passwd" }).to_string(),
+        );
+        assert_eq!(read["ok"], false, "{root}: {read}");
+        assert_eq!(read["error"]["kind"], "invalid_path", "{root}: {read}");
+        assert!(
+            read["error"]["message"]
+                .as_str()
+                .expect("message")
+                .contains("must be an absolute path"),
+            "{root}: {read}"
+        );
+
+        let listed = call_json_doc(
+            cabi::gc_fs_list,
+            &serde_json::json!({ "root": root, "path": "" }).to_string(),
+        );
+        assert_eq!(listed["error"]["kind"], "invalid_path", "{root}: {listed}");
+    }
+}
+
+#[test]
+fn fs_read_refuses_a_character_device_through_the_abi() {
+    #[cfg(unix)]
+    {
+        if !std::path::Path::new("/dev/null").exists() {
+            return;
+        }
+        let _guard = abi_guard();
+        let answer = call_json_doc(
+            cabi::gc_fs_read,
+            &serde_json::json!({ "root": "/dev", "path": "null" }).to_string(),
+        );
+        assert_eq!(answer["ok"], false, "{answer}");
+        assert_eq!(answer["error"]["kind"], "io");
+        assert_eq!(
+            answer["error"]["message"],
+            "io: null is a character device, not a regular file"
+        );
+    }
+}
+
+// --------------------------------------------------------------------------------------
+// T18: device files over the C ABI (`gc_fs_list` / `gc_fs_read`)
+// --------------------------------------------------------------------------------------
+
+/// A throwaway directory outside the repository, removed when the test ends.
+struct TempTree {
+    root: std::path::PathBuf,
+}
+
+impl TempTree {
+    fn new(tag: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let root = std::env::temp_dir().join(format!(
+            "mobile-core-abi-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&root).expect("temp tree");
+        Self { root }
+    }
+
+    fn file(&self, rel: &str, bytes: &[u8]) {
+        let path = self.root.join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent");
+        }
+        std::fs::write(path, bytes).expect("write");
+    }
+
+    fn dir(&self, rel: &str) {
+        std::fs::create_dir_all(self.root.join(rel)).expect("dir");
+    }
+}
+
+impl Drop for TempTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn fs_list_answers_paths_relative_to_the_root() {
+    let _guard = abi_guard();
+    let tree = TempTree::new("list");
+    tree.dir("src");
+    tree.file("src/main.ts", b"export {};\n");
+    tree.file("README.md", b"# hola\n");
+
+    let answer = call_json_doc(
+        cabi::gc_fs_list,
+        &serde_json::json!({ "root": tree.root, "path": "", "maxEntries": 10 }).to_string(),
+    );
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["result"]["truncated"], false);
+    let entries = answer["result"]["entries"].as_array().expect("entries");
+    let paths: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("path"))
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["src", "README.md"],
+        "directories first: {answer}"
+    );
+    assert_eq!(entries[0]["kind"], "dir");
+    assert_eq!(entries[0]["size"], serde_json::Value::Null);
+    assert_eq!(entries[1]["kind"], "file");
+    assert_eq!(entries[1]["size"], 7);
+
+    // Listing one level down keeps the prefix and never leaks the absolute path.
+    let nested = call_json_doc(
+        cabi::gc_fs_list,
+        &serde_json::json!({ "root": tree.root, "path": "src" }).to_string(),
+    );
+    assert_eq!(nested["result"]["entries"][0]["path"], "src/main.ts");
+    assert!(
+        !nested
+            .to_string()
+            .contains(tree.root.to_string_lossy().as_ref()),
+        "{nested}"
+    );
+}
+
+#[test]
+fn fs_read_answers_the_text_the_real_size_and_the_typed_errors() {
+    let _guard = abi_guard();
+    let tree = TempTree::new("read");
+    tree.file("a.ts", b"const a = 1;\n");
+    tree.file("bin.dat", b"head\x00tail");
+    tree.file("big.txt", &[b'x'; 64]);
+    let outside = TempTree::new("read-outside");
+    outside.file("secret.txt", b"top secret");
+
+    let read = call_json_doc(
+        cabi::gc_fs_read,
+        &serde_json::json!({ "root": tree.root, "path": "a.ts" }).to_string(),
+    );
+    assert_eq!(read["ok"], true, "{read}");
+    assert_eq!(read["result"]["path"], "a.ts");
+    assert_eq!(read["result"]["text"], "const a = 1;\n");
+    assert_eq!(read["result"]["size"], 13);
+    assert_eq!(read["result"]["truncated"], false);
+
+    // The window is honoured and the real size still reported.
+    let capped = call_json_doc(
+        cabi::gc_fs_read,
+        &serde_json::json!({ "root": tree.root, "path": "big.txt", "maxBytes": 8 }).to_string(),
+    );
+    assert_eq!(capped["ok"], true, "{capped}");
+    assert_eq!(capped["result"]["text"], "xxxxxxxx");
+    assert_eq!(capped["result"]["size"], 64);
+    assert_eq!(capped["result"]["truncated"], true);
+
+    // Binary content is refused instead of being lossy-decoded.
+    let binary = call_json_doc(
+        cabi::gc_fs_read,
+        &serde_json::json!({ "root": tree.root, "path": "bin.dat" }).to_string(),
+    );
+    assert_eq!(binary["ok"], false, "{binary}");
+    assert_eq!(binary["error"]["kind"], "binary");
+    assert_eq!(
+        binary["error"]["message"],
+        "binary file: bin.dat is not text"
+    );
+
+    // A missing file, an upward path and an empty root are each typed.
+    let missing = call_json_doc(
+        cabi::gc_fs_read,
+        &serde_json::json!({ "root": tree.root, "path": "nope.ts" }).to_string(),
+    );
+    assert_eq!(missing["error"]["kind"], "not_found");
+    assert_eq!(missing["error"]["message"], "not found: nope.ts");
+
+    let upward = call_json_doc(
+        cabi::gc_fs_read,
+        &serde_json::json!({ "root": tree.root, "path": "../etc/passwd" }).to_string(),
+    );
+    assert_eq!(upward["error"]["kind"], "invalid_path");
+
+    let absolute = call_json_doc(
+        cabi::gc_fs_read,
+        &serde_json::json!({ "root": tree.root, "path": "/etc/passwd" }).to_string(),
+    );
+    assert_eq!(absolute["error"]["kind"], "invalid_path");
+
+    let no_root = call_json_doc(
+        cabi::gc_fs_read,
+        &serde_json::json!({ "root": "  ", "path": "a.ts" }).to_string(),
+    );
+    assert_eq!(no_root["error"]["kind"], "input");
+
+    let no_root_list = call_json_doc(
+        cabi::gc_fs_list,
+        &serde_json::json!({ "root": "", "path": "" }).to_string(),
+    );
+    assert_eq!(no_root_list["error"]["kind"], "input");
+
+    // A symlink that leaves the root is refused, even though the target is readable
+    // through its own root.
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            outside.root.join("secret.txt"),
+            tree.root.join("escape.txt"),
+        )
+        .expect("symlink");
+        let escape = call_json_doc(
+            cabi::gc_fs_read,
+            &serde_json::json!({ "root": tree.root, "path": "escape.txt" }).to_string(),
+        );
+        assert_eq!(escape["ok"], false, "{escape}");
+        assert_eq!(escape["error"]["kind"], "outside_root");
+        assert_eq!(escape["error"]["message"], "path outside root: escape.txt");
+    }
+}
+
+#[test]
+fn fs_read_refuses_a_file_past_the_hard_cap_reporting_its_real_size() {
+    let _guard = abi_guard();
+    let tree = TempTree::new("huge");
+    let path = tree.root.join("huge.txt");
+    let file = std::fs::File::create(&path).expect("create");
+    let size = mobile_core::fs::HARD_MAX_BYTES + 1;
+    file.set_len(size).expect("set_len");
+    drop(file);
+
+    let answer = call_json_doc(
+        cabi::gc_fs_read,
+        &serde_json::json!({ "root": tree.root, "path": "huge.txt" }).to_string(),
+    );
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["kind"], "too_large");
+    assert_eq!(
+        answer["error"]["message"],
+        format!(
+            "file too large: huge.txt is {size} bytes (limit {})",
+            mobile_core::fs::HARD_MAX_BYTES
+        )
+    );
+}
+
+#[test]
+fn a_key_only_connect_through_the_old_symbol_is_refused_by_the_core() {
+    let _guard = abi_guard();
+    let script = shared();
+    cabi::install_test_transport(Arc::new(ScriptedTransport {
+        shared: Arc::clone(&script),
+    }));
+
+    // ABI v1 shape with a key credential and no `expectedFp`: the answer must be the
+    // pinned-connect requirement, not a silent trust-on-first-use session.
+    let config = serde_json::json!({
+        "host": "host",
+        "port": 22,
+        "user": "reaan",
+        "credential": {
+            "kind": "key",
+            "value": { "private": [45, 45, 45], "passphrase": null }
+        }
+    })
+    .to_string();
+    let answer = call_json_doc(cabi::gc_ssh_connect, &config);
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(answer["error"]["kind"], "ssh");
+    assert!(
+        answer["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("must pin the host"),
+        "{answer}"
+    );
+    assert!(
+        script.last_request().is_none(),
+        "nothing may connect unpinned"
     );
 }

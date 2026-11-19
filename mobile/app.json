@@ -20,7 +20,8 @@
       },
       "predictiveBackGestureEnabled": false,
       "package": "com.anonymous.gentlemovil",
-      "usesCleartextTraffic": true
+      "usesCleartextTraffic": true,
+      "allowBackup": false
     },
     "web": {
       "favicon": "./assets/favicon.png",

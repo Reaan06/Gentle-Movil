@@ -18,18 +18,63 @@
 //! | [`gc_abi_version`] | – | `u32` ([`ABI_VERSION`]) |
 //! | [`gc_pair_from_qr`] | URI | `{"ok":true,"pair":{...}}` |
 //! | [`gc_ssh_connect`] | connect config JSON | `{"ok":true,"sessionId":N,"result":{"sessionId":N,"fingerprint":"…"}}` |
+//! | [`gc_ssh_connect_seed`] | connect config + `seed` + `expectedFp` | same envelope as [`gc_ssh_connect`] |
+//! | [`gc_ssh_close`] | session id | `{"ok":true,"result":{"closed":true}}` |
 //! | [`gc_provision_step`] | session id + step JSON | `{"ok":true,"step":"…","result":{…}}` |
 //! | [`gc_ssh_channel_write`] | session id + channel id + `{"bytes":"<base64>"}` | `{"ok":true,"result":{"written":N}}` |
 //! | [`gc_ssh_channel_read`] | session id + channel id + optional `{"timeoutMs":N}` | `{"ok":true,"result":{"bytes":"<base64>","eof":false}}` |
 //! | [`gc_ssh_channel_close`] | session id + channel id | `{"ok":true,"result":{"closed":true}}` |
 //! | [`gc_device_key_generate`] | – | `{"ok":true,"key":{"public_hex":"…","secret":{"secret_seed":[..]}}}` |
+//! | [`gc_device_key_public`] | `{"seed":[..32 bytes]}` | `{"ok":true,"result":{"publicHex":"…","fingerprint":"SHA256:…"}}` |
+//! | [`gc_fs_list`] | `{"root":"…","path":"<rel>","maxEntries":N}` | `{"ok":true,"result":{"entries":[{path,size,kind}],"truncated":false}}` |
+//! | [`gc_fs_read`] | `{"root":"…","path":"<rel>","maxBytes":N}` | `{"ok":true,"result":{"path","text","size","truncated"}}` |
 //! | [`gc_free`] | pointer from any `gc_*` | – |
 //!
 //! Failures always use the same envelope:
 //! `{"ok":false,"error":{"kind":"<kind>","message":"<verbatim UI text>"}}`, where `kind` is
 //! one of the frozen [`crate::error::CoreError`] kinds (`invalid_qr`, `ssh`,
-//! `io`, `crypto`, `unsupported_version`) or one of this layer's two own kinds: `input`
+//! `io`, `crypto`, `unsupported_version`, `not_found`, `permission_denied`, `too_large`,
+//! `binary`, `invalid_path`, `outside_root`) or one of this layer's two own kinds: `input`
 //! (malformed ABI JSON or a null pointer) and `panic` (a caught panic).
+//!
+//! ## Secrets never travel back
+//!
+//! [`gc_device_key_generate`] is the **only** symbol whose answer carries the device seed,
+//! and it exists so the native shell can seal it in the platform keystore; the TypeScript
+//! facade rejects any answer that still carries it. [`gc_ssh_connect_seed`] takes a seed
+//! and answers only the session id and the host fingerprint — the seed appears in no
+//! answer, no error message and no log line produced here.
+//!
+//! ## The seal format the native shell must implement (SEC-011)
+//!
+//! The sealing code is Kotlin (`GcCoreModule` / `DeviceSeedStore`), so this crate cannot
+//! enforce it; the contract below is what that code must do, and the Rust half keeps its
+//! side of it (the seed reaches the shell once, and every Rust copy wipes itself):
+//!
+//! * **AES-256/GCM** with a key generated inside the AndroidKeyStore and marked
+//!   non-exportable. The key never leaves the keystore, so the ciphertext in `filesDir` is
+//!   useless on its own and `allowBackup` does not leak an identity.
+//! * A **random 12-byte nonce per seal**, never reused with the same key; it is stored next
+//!   to the ciphertext. Reusing a nonce with GCM is a total confidentiality and integrity
+//!   break, not a minor defect.
+//! * A **format/version byte** is the first byte of the sealed blob (`0x01` for this
+//!   contract). A blob with an unknown version byte must be refused — never sealed over, and
+//!   never decrypted on a best-effort guess — so a later format can be introduced without
+//!   silently reading old bytes as if they were the new layout.
+//! * **Associated data is mandatory and domain-separated**: GCM must be invoked with AAD
+//!   `b"gentle-movil/device-seed/v1"` (the same string as the version byte, so a blob can
+//!   never be decrypted as another kind of record even if a key is ever reused). Decrypting
+//!   with empty AAD, or with AAD that was not passed at seal time, must fail — that failure
+//!   is the test that this discipline is actually in place.
+//! * The decrypted plaintext is exactly [`crate::device_key::SECRET_SEED_LEN`] bytes and is
+//!   handed to a [`crate::device_key::StoredKey`], which wipes it on drop.
+//!
+//! ## Envelopes never promise a field they do not send (SEC-013)
+//!
+//! `ok: true` means the record under `result`/`key`/`pair` carries every field this module
+//! documents. When a value cannot be produced — a handshake that reported no usable host
+//! key, for instance — the answer is an error envelope, and any session opened on the way is
+//! torn down instead of being handed out as a trusted handle.
 //!
 //! ## Panics never cross the boundary
 //!
@@ -57,6 +102,7 @@
 
 use std::ffi::{c_char, CStr, CString};
 use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -64,7 +110,9 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use zeroize::Zeroize;
 
+use crate::device_key::StoredKey;
 use crate::error::CoreError;
 use crate::ffi::{ChannelId, CoreErrorPayload, MobileCore, SessionId};
 use crate::fingerprint;
@@ -77,7 +125,17 @@ use crate::ssh::{SshCredential, DAEMON_PORT};
 
 /// Version of this C ABI. Bump it whenever an existing function changes shape; Kotlin
 /// compares it with [`gc_abi_version`] before it registers its handlers.
-pub const ABI_VERSION: u32 = 1;
+///
+/// * **1** — pairing, connect, provisioning steps, tunnel channels, device key.
+/// * **2** — the T16/T18 slice: [`gc_ssh_connect_seed`] (device-key reconnect that requires
+///   a pinned host key), [`gc_ssh_close`] (session teardown), [`gc_device_key_public`]
+///   (re-derive the public half of a keystore-sealed seed) and the device file surface
+///   [`gc_fs_list`] / [`gc_fs_read`].
+///
+/// Existing functions keep their v1 shapes; `gc_ssh_connect` only gained an *optional*
+/// `expectedFp`, which old documents omit and which then keeps the trust-on-first-use
+/// behaviour of v1.
+pub const ABI_VERSION: u32 = 2;
 
 /// Kind reported for a malformed ABI input (bad JSON, missing field, null pointer).
 const KIND_INPUT: &str = "input";
@@ -164,15 +222,23 @@ pub extern "C" fn gc_pair_from_qr(uri: *const c_char) -> *mut c_char {
 /// ```
 /// `port` defaults to 22; `credential` is the frozen `SshCredential`
 /// (`{"kind":"password","value":"…"}` or
-/// `{"kind":"key","value":{"private":[..],"passphrase":null}}`).
+/// `{"kind":"key","value":{"private":[..],"passphrase":null}}`). `expectedFp` is
+/// optional: with it the handshake only accepts that host key (the reconnect path), without
+/// it the first pairing keeps the trust-on-first-use behaviour of ABI v1.
 ///
 /// Output: `{"ok":true,"sessionId":N,"result":{"sessionId":N,"fingerprint":"<64 hex>"}}`.
 ///
 /// `result.fingerprint` is the SHA-256 of the host key the handshake actually saw, in
 /// lowercase compact hex — exactly what `mobile/lib/provision.ts` normalizes and compares
-/// with the QR's `fp` (TOFU, §1/§8). It is **omitted** when the transport reported no key,
-/// so the app fails honestly instead of reading an invented value. The top-level
+/// with the QR's `fp` (TOFU, §1/§8). It is **always** present: a handshake that reported no
+/// usable host key used to answer `ok:true` with the field silently missing, which left the
+/// app unable to confirm anything and holding a session nobody verified. That answer is now
+/// an `ssh` error and the session is closed (SEC-013). The top-level
 /// `sessionId` stays for the frozen v1 readers; new readers use the `result` record.
+///
+/// The whole handshake is bounded by [`crate::ffi::CONNECT_TIMEOUT`]: a host that accepts the
+/// TCP connection and then says nothing answers an `ssh` error naming the target and the
+/// window instead of holding the single native queue forever (SEC-010).
 #[no_mangle]
 pub extern "C" fn gc_ssh_connect(cfg_json: *const c_char) -> *mut c_char {
     json_call(|| {
@@ -181,28 +247,209 @@ pub extern "C" fn gc_ssh_connect(cfg_json: *const c_char) -> *mut c_char {
             AbiError::input(format!("ssh connect config is not valid: {error}"))
         })?;
         let core = core_arc()?;
-        let session_id =
-            block_on(core.ssh_connect(config.host, config.port, config.user, config.credential))?
-                .map_err(AbiError::from)?;
-        let host_fingerprint = fingerprint::normalize(
-            &core
-                .session_fingerprint_compact(session_id)
-                .map_err(AbiError::from)?,
-        );
-        let answer = match host_fingerprint {
-            Some(host_fingerprint) => json!({
-                "ok": true,
-                "sessionId": session_id,
-                "result": { "sessionId": session_id, "fingerprint": host_fingerprint },
-            }),
-            // No key was reported: the field is absent, never a placeholder value.
-            None => json!({
-                "ok": true,
-                "sessionId": session_id,
-                "result": { "sessionId": session_id },
-            }),
+        let session_id = match config.expected_fingerprint {
+            Some(expected_fingerprint) => block_on(core.ssh_connect_pinned(
+                config.host,
+                config.port,
+                config.user,
+                config.credential,
+                expected_fingerprint,
+            ))?,
+            None => block_on(core.ssh_connect(
+                config.host,
+                config.port,
+                config.user,
+                config.credential,
+            ))?,
+        }
+        .map_err(AbiError::from)?;
+        session_answer(&core, session_id)
+    })
+}
+
+/// `gc_ssh_connect_seed(cfg_json)`: reconnect with the **device key**, pinned to the host.
+///
+/// Input (`SshConnectSeedConfig`):
+/// ```json
+/// { "host": "192.168.1.42", "port": 22, "user": "reaan",
+///   "seed": [..32 bytes..], "expectedFp": "<64 hex or aa:bb:…>" }
+/// ```
+///
+/// The credential is built **inside** the core (`SshCredential::Key` from
+/// `Ed25519Keypair::from_seed`), so no key text has to travel from JS. `expectedFp` is
+/// **required**: a `{"kind":"key"}` connect without a pin must be refused instead of
+/// silently trusting whatever host key answers, which is the defect this symbol closes.
+/// A missing, blank or unparsable `expectedFp` is an `input` error; a pin that does not
+/// match the handshake is an `ssh` error naming both fingerprints.
+///
+/// Output: the same envelope as [`gc_ssh_connect`]. The seed appears in no answer, no error
+/// message and no log line.
+#[no_mangle]
+pub extern "C" fn gc_ssh_connect_seed(cfg_json: *const c_char) -> *mut c_char {
+    json_call(|| {
+        let config = read_str(cfg_json)?;
+        let config: SshConnectSeedConfig = serde_json::from_str(config).map_err(|error| {
+            AbiError::input(format!("ssh seed connect config is not valid: {error}"))
+        })?;
+        let expected_fingerprint = config.expected_fingerprint.trim().to_string();
+        if expected_fingerprint.is_empty() {
+            return Err(AbiError::input(
+                "the seed connect needs expectedFp: a key-only connection must be pinned to the paired host key",
+            ));
+        }
+        let seed = StoredKey {
+            secret_seed: config.seed,
         };
-        Ok(answer)
+        let core = core_arc()?;
+        let session_id = block_on(core.ssh_connect_seed(
+            config.host,
+            config.port,
+            config.user,
+            seed,
+            expected_fingerprint,
+        ))?
+        .map_err(AbiError::from)?;
+        session_answer(&core, session_id)
+    })
+}
+
+/// `gc_ssh_close(session_id)`: disconnect the session and free its id and channels.
+///
+/// Output: `{"ok":true,"result":{"closed":true}}` **only when the transport really let go**
+/// (SEC-012): the disconnect is awaited and the transport is then asked whether it still
+/// holds the connection. A transport that answers "still connected" gets the `ssh` error
+/// envelope naming that fact, never a clean `closed: true` nobody achieved. The registry
+/// entry is gone before the disconnect is awaited, so the id is stale afterwards and a second
+/// close answers the `ssh` error envelope naming the unknown id — an honest typed error, not
+/// a second "closed".
+#[no_mangle]
+pub extern "C" fn gc_ssh_close(session_id: u64) -> *mut c_char {
+    let session_id = SessionId::from(session_id);
+    json_call(|| {
+        let core = core_arc()?;
+        block_on(core.session_close(session_id))?.map_err(AbiError::from)?;
+        Ok(json!({ "ok": true, "result": { "closed": true } }))
+    })
+}
+
+/// The shared success envelope of the two connect symbols.
+///
+/// The `fingerprint` field is promised by the table above, so it must be there: if the
+/// handshake reported no usable host key the session is closed and the call answers an
+/// `ssh` error instead of an `ok: true` record with a missing field (SEC-013).
+fn session_answer(core: &MobileCore, session_id: SessionId) -> Result<Value, AbiError> {
+    let observed = core
+        .session_fingerprint_compact(session_id)
+        .map_err(AbiError::from)?;
+    let Some(host_fingerprint) = fingerprint::normalize(&observed) else {
+        // Nothing verified this host, so nothing may keep a handle to it.
+        let _ = block_on(core.session_close(session_id));
+        return Err(AbiError::from(CoreError::ssh(
+            "the handshake reported no usable host key fingerprint, so the unverified session was closed instead of being handed out",
+        )));
+    };
+    Ok(json!({
+        "ok": true,
+        "sessionId": session_id,
+        "result": { "sessionId": session_id, "fingerprint": host_fingerprint },
+    }))
+}
+
+/// `gc_device_key_public(payload_json)`: derive the public half of a stored seed.
+///
+/// Input: `{"seed":[..32 bytes..]}` — the seed the native module just decrypted from its
+/// keystore-sealed file. Output:
+/// `{"ok":true,"result":{"publicHex":"<64 hex>","fingerprint":"SHA256:…"}}`.
+///
+/// This is what makes `deviceKeyEnsure` idempotent: the module mints once, seals the seed,
+/// and every later call re-derives the **same** public half instead of generating a second
+/// identity. Neither the seed nor any part of it is echoed back.
+#[no_mangle]
+pub extern "C" fn gc_device_key_public(payload_json: *const c_char) -> *mut c_char {
+    json_call(|| {
+        let payload = read_str(payload_json)?;
+        let payload: DeviceSeed = serde_json::from_str(payload).map_err(|error| {
+            AbiError::input(format!("device seed payload is not valid: {error}"))
+        })?;
+        let seed = StoredKey {
+            secret_seed: payload.seed,
+        };
+        let public_hex =
+            crate::device_key::public_hex_from_secret(&seed).map_err(AbiError::from)?;
+        let fingerprint = crate::device_key::fingerprint_sha256(&seed).map_err(AbiError::from)?;
+        Ok(json!({
+            "ok": true,
+            "result": { "publicHex": public_hex, "fingerprint": fingerprint },
+        }))
+    })
+}
+
+/// `gc_fs_list(payload_json)`: one level of device files inside `root`.
+///
+/// Input: `{"root":"<absolute dir>","path":"<rel>","maxEntries":N}`. `path` defaults to
+/// `""` (the root itself) and `maxEntries` to [`crate::fs::DEFAULT_MAX_ENTRIES`].
+///
+/// `root` is **caller-declared**, so it must be absolute: a blank root is an `input` error and
+/// a relative one is `invalid_path`, because a relative root resolves against the process
+/// working directory (`/` on Android) and `root: "etc"` would read `/etc` (SEC-003). The
+/// Android allowlist of *which* absolute directories are acceptable lives in the native
+/// shell, not here.
+///
+/// Output: `{"ok":true,"result":{"entries":[{"path","size","kind"}],"truncated":bool}}`
+/// with paths **relative to `root`** (the absolute device path never leaks into the UI),
+/// directories first and then by name. `size` is `null` for anything that is not a regular
+/// file. The directory is read only until one entry past the window exists — the rest is
+/// never materialised (SEC-006). Failures are the typed [`crate::fs`] errors: `not_found`,
+/// `permission_denied`, `invalid_path`, `outside_root`, `io`.
+#[no_mangle]
+pub extern "C" fn gc_fs_list(payload_json: *const c_char) -> *mut c_char {
+    json_call(|| {
+        let payload = read_str(payload_json)?;
+        let payload: FsListConfig = serde_json::from_str(payload)
+            .map_err(|error| AbiError::input(format!("fs list payload is not valid: {error}")))?;
+        if payload.root.trim().is_empty() {
+            return Err(AbiError::input(
+                "the fs list payload needs a non-empty root",
+            ));
+        }
+        let max_entries = payload
+            .max_entries
+            .unwrap_or(crate::fs::DEFAULT_MAX_ENTRIES);
+        let listing = crate::fs::list(Path::new(&payload.root), &payload.path, max_entries)
+            .map_err(AbiError::from)?;
+        Ok(json!({ "ok": true, "result": listing }))
+    })
+}
+
+/// `gc_fs_read(payload_json)`: read a device file as UTF-8 text inside `root`.
+///
+/// Input: `{"root":"<absolute dir>","path":"<rel>","maxBytes":N}`. `maxBytes` defaults
+/// to [`crate::fs::DEFAULT_MAX_BYTES`]. `root` follows the same rule as `gc_fs_list`: absolute
+/// or `invalid_path` (SEC-003).
+///
+/// Output: `{"ok":true,"result":{"path","text","size","truncated"}}` where `size` is
+/// the **real** file size and `truncated` says the text is only its first `maxBytes` bytes.
+/// Binary content is `binary` (never lossy-decoded), a file past
+/// [`crate::fs::HARD_MAX_BYTES`] is `too_large` with its real size, and anything that is not a
+/// regular file (a directory, a FIFO, a socket, a device) is `io` naming its kind — a FIFO is
+/// never opened, because opening one with no writer blocks the single native queue (SEC-005).
+/// A file whose path was swapped after the containment check is refused through its opened
+/// descriptor (SEC-007).
+#[no_mangle]
+pub extern "C" fn gc_fs_read(payload_json: *const c_char) -> *mut c_char {
+    json_call(|| {
+        let payload = read_str(payload_json)?;
+        let payload: FsReadConfig = serde_json::from_str(payload)
+            .map_err(|error| AbiError::input(format!("fs read payload is not valid: {error}")))?;
+        if payload.root.trim().is_empty() {
+            return Err(AbiError::input(
+                "the fs read payload needs a non-empty root",
+            ));
+        }
+        let max_bytes = payload.max_bytes.unwrap_or(crate::fs::DEFAULT_MAX_BYTES);
+        let read = crate::fs::read_text(Path::new(&payload.root), &payload.path, max_bytes)
+            .map_err(AbiError::from)?;
+        Ok(json!({ "ok": true, "result": read }))
     })
 }
 
@@ -348,13 +595,23 @@ pub extern "C" fn gc_ssh_channel_close(session_id: u64, channel_id: u64) -> *mut
 ///
 /// Output: `{"ok":true,"key":{"public_hex":"<64 hex>","secret":{"secret_seed":[..32 bytes]}}}`.
 ///
-/// The native shell writes `secret_seed` to the Keystore and never forwards it to JS.
+/// The native shell seals `secret_seed` in the Keystore (see this module's seal-format
+/// contract) and never forwards it to JS. This is the **one** place the seed is serialized:
+/// [`StoredKey`] is neither `Serialize` nor `Clone`, so the bytes are read through
+/// [`StoredKey::expose_seed`](crate::device_key::StoredKey::expose_seed) and the value wipes
+/// itself as soon as this call returns.
 #[no_mangle]
 pub extern "C" fn gc_device_key_generate() -> *mut c_char {
     json_call(|| {
         let core = core_arc()?;
         let pair = core.device_key_generate();
-        Ok(json!({ "ok": true, "key": pair }))
+        Ok(json!({
+            "ok": true,
+            "key": {
+                "public_hex": pair.public_hex,
+                "secret": { "secret_seed": pair.secret.expose_seed() },
+            },
+        }))
     })
 }
 
@@ -363,19 +620,35 @@ pub extern "C" fn gc_device_key_generate() -> *mut c_char {
 /// Passing `null` is a no-op. Calling it twice on the same pointer is undefined behaviour,
 /// exactly like `free`, so the Kotlin wrapper must null its handle after releasing.
 ///
+/// The bytes are **zeroed before the allocation is released** (SEC-009): one of the answers
+/// this frees is the device seed on its way to the keystore, and leaving it in a freed heap
+/// block is exactly the kind of copy that survives a crash dump.
+///
 /// # Safety
 ///
 /// `ptr` must be either null or a pointer returned by one of the `gc_*` functions that has
 /// not been freed yet. Any other value is undefined behaviour.
 #[no_mangle]
+// The pointer contract is Kotlin's to keep; this frozen v1 export cannot spell Rust's unsafe.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn gc_free(ptr: *mut c_char) {
     if ptr.is_null() {
         return;
     }
     // SAFETY: `ptr` came from `CString::into_raw` inside `into_c_string` and owns a
-    // CString allocation; reconstructing and dropping it frees that allocation exactly
-    // once. The null check above keeps the empty-pointer call safe.
-    drop(unsafe { CString::from_raw(ptr) });
+    // CString allocation; reconstructing it reclaims that allocation exactly once. The null
+    // check above keeps the empty-pointer call safe.
+    release_answer(unsafe { CString::from_raw(ptr) });
+}
+
+/// Zero an answer's bytes in place and release its allocation.
+///
+/// `into_bytes_with_nul` hands back the very buffer the `CString` owned, so the wipe lands on
+/// the heap block that held the JSON (which may have carried the device seed) rather than on
+/// a copy of it.
+fn release_answer(answer: CString) {
+    let mut bytes = answer.into_bytes_with_nul();
+    bytes.zeroize();
 }
 
 /// Replace the process-wide facade with a caller-provided transport.
@@ -401,6 +674,62 @@ struct SshConnectConfig {
     user: String,
     /// Credential, in the frozen tagged-JSON encoding.
     credential: SshCredential,
+    /// Host key the handshake must present, for an already-paired connection.
+    #[serde(default, rename = "expectedFp")]
+    expected_fingerprint: Option<String>,
+}
+
+/// The device-key connect config [`gc_ssh_connect_seed`] accepts.
+///
+/// No `Debug` derive on purpose: this record holds the device seed, and a struct that can
+/// be printed is a struct that eventually ends up in a log line (S7).
+#[derive(Deserialize)]
+struct SshConnectSeedConfig {
+    /// Host IP address or hostname.
+    host: String,
+    /// SSH port; defaults to the protocol default of 22.
+    #[serde(default = "default_ssh_port")]
+    port: u16,
+    /// SSH user.
+    user: String,
+    /// The 32-byte ed25519 seed the native module decrypted from the keystore.
+    seed: Vec<u8>,
+    /// Host key the handshake must present (required for a key-only connect).
+    #[serde(default, rename = "expectedFp")]
+    expected_fingerprint: String,
+}
+
+/// The seed payload [`gc_device_key_public`] accepts.
+#[derive(Deserialize)]
+struct DeviceSeed {
+    /// The 32-byte ed25519 seed.
+    seed: Vec<u8>,
+}
+
+/// The payload [`gc_fs_list`] accepts.
+#[derive(Debug, Deserialize)]
+struct FsListConfig {
+    /// Absolute directory the caller allows (the app's private directory, a picked folder).
+    root: String,
+    /// Path relative to `root`; defaults to the root itself.
+    #[serde(default)]
+    path: String,
+    /// Entry window; defaults to [`crate::fs::DEFAULT_MAX_ENTRIES`].
+    #[serde(default, rename = "maxEntries")]
+    max_entries: Option<usize>,
+}
+
+/// The payload [`gc_fs_read`] accepts.
+#[derive(Debug, Deserialize)]
+struct FsReadConfig {
+    /// Absolute directory the caller allows.
+    root: String,
+    /// Path relative to `root`; the root itself is a directory, so it cannot be read.
+    #[serde(default)]
+    path: String,
+    /// Byte window; defaults to [`crate::fs::DEFAULT_MAX_BYTES`].
+    #[serde(default, rename = "maxBytes")]
+    max_bytes: Option<u64>,
 }
 
 /// The SSH port used when the config omits it.
@@ -436,9 +765,8 @@ fn read_channel_timeout(payload_json: *const c_char) -> Result<Duration, AbiErro
     if payload.trim().is_empty() {
         return Ok(default);
     }
-    let options: ChannelReadOptions = serde_json::from_str(payload).map_err(|error| {
-        AbiError::input(format!("channel read payload is not valid: {error}"))
-    })?;
+    let options: ChannelReadOptions = serde_json::from_str(payload)
+        .map_err(|error| AbiError::input(format!("channel read payload is not valid: {error}")))?;
     Ok(Duration::from_millis(
         options.timeout_ms.unwrap_or(DEFAULT_READ_TIMEOUT_MS),
     ))
@@ -501,8 +829,8 @@ pub fn split_channel_document(input: &str) -> Result<ChannelCall, ChannelDocumen
             "the channel document must be a JSON object",
         ));
     };
-    let session_id = take_handle(object, "sessionId")?;
-    let channel_id = take_handle(object, "channelId")?;
+    let session_id = take_handle(object, "sessionId", "channel")?;
+    let channel_id = take_handle(object, "channelId", "channel")?;
     Ok(ChannelCall {
         session_id,
         channel_id,
@@ -510,13 +838,34 @@ pub fn split_channel_document(input: &str) -> Result<ChannelCall, ChannelDocumen
     })
 }
 
+/// Split `{"sessionId":N,…}` into the session handle [`gc_ssh_close`] takes.
+///
+/// [`split_channel_document`] needs both handles; a teardown document carries only the
+/// session, so it gets its own splitter next to the payload it feeds.
+#[doc(hidden)]
+pub fn split_session_document(input: &str) -> Result<u64, ChannelDocumentError> {
+    let document: Value = serde_json::from_str(input).map_err(|error| {
+        ChannelDocumentError::new(format!("the session document is not valid JSON: {error}"))
+    })?;
+    let Value::Object(mut object) = document else {
+        return Err(ChannelDocumentError::new(
+            "the session document must be a JSON object",
+        ));
+    };
+    take_handle(&mut object, "sessionId", "session")
+}
+
 /// Remove `key` from `object` and read it as a handle, or name what was wrong.
+///
+/// `document` is the noun the error uses (`"channel"` or `"session"`), so a caller reads
+/// which of the two document shapes it sent wrong instead of a generic complaint.
 fn take_handle(
     object: &mut serde_json::Map<String, Value>,
     key: &str,
+    document: &str,
 ) -> Result<u64, ChannelDocumentError> {
     let value = object.remove(key).ok_or_else(|| {
-        ChannelDocumentError::new(format!("the channel document needs a numeric {key}"))
+        ChannelDocumentError::new(format!("the {document} document needs a numeric {key}"))
     })?;
     let handle = match &value {
         Value::Number(number) => number.as_u64(),
@@ -525,7 +874,7 @@ fn take_handle(
     };
     handle.ok_or_else(|| {
         ChannelDocumentError::new(format!(
-            "the channel document needs a numeric {key}, not {value}"
+            "the {document} document needs a numeric {key}, not {value}"
         ))
     })
 }
@@ -536,7 +885,7 @@ const BASE64_ALPHABET: &[u8; 64] =
 
 /// Standard (padded) base64 of `bytes`.
 fn base64_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let first = u32::from(chunk[0]);
         let second = u32::from(chunk.get(1).copied().unwrap_or(0));
@@ -950,18 +1299,23 @@ pub fn primary_answer_text(answer: Option<&str>) -> String {
 /// Freeing here (and not in Kotlin) keeps the ownership rule the shim already relies on:
 /// Kotlin receives a *copy* as a `jstring`, so it must never call `gc_free`.
 #[doc(hidden)]
+// Consumes the pointer a gc_* export just produced; the contract is gc_free's, not a Rust API.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn take_answer_text(raw: *mut c_char) -> Option<String> {
     if raw.is_null() {
         return None;
     }
     // SAFETY: `raw` was produced by `CString::into_raw` inside this module and is valid
     // until it is released below, exactly the contract `gc_free` documents.
-    let text = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+    let text = unsafe { CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned();
     // Kotlin received a copy, so the C string is released now: keeping it for a later
     // `gc_free` would leak one allocation per call. A poisoned drop must not unwind across
-    // the JVM boundary, hence the `catch_unwind`.
+    // the JVM boundary, hence the `catch_unwind`. The bytes are zeroed first (SEC-009): the
+    // copy that reaches the JVM is the JVM's to wipe, but this allocation is ours.
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        drop(CString::from_raw(raw));
+        release_answer(CString::from_raw(raw));
     }));
     Some(text)
 }

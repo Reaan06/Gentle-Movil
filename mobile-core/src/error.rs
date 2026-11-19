@@ -22,6 +22,18 @@ pub const KIND_IO: &str = "io";
 pub const KIND_CRYPTO: &str = "crypto";
 /// `UnsupportedVersion` kind: the QR declares a major version this build cannot route.
 pub const KIND_UNSUPPORTED_VERSION: &str = "unsupported_version";
+/// `NotFound` kind: the requested file or directory does not exist.
+pub const KIND_NOT_FOUND: &str = "not_found";
+/// `PermissionDenied` kind: the operating system refused access to the path.
+pub const KIND_PERMISSION_DENIED: &str = "permission_denied";
+/// `TooLarge` kind: the file exceeds the byte cap the caller allowed.
+pub const KIND_TOO_LARGE: &str = "too_large";
+/// `Binary` kind: the file is not UTF-8 text, so it cannot be shown in an editor.
+pub const KIND_BINARY: &str = "binary";
+/// `InvalidPath` kind: the relative path is absolute, empty, or walks upwards.
+pub const KIND_INVALID_PATH: &str = "invalid_path";
+/// `OutsideRoot` kind: the resolved path leaves the root the caller allowed.
+pub const KIND_OUTSIDE_ROOT: &str = "outside_root";
 
 /// Error returned by every fallible operation of the core.
 #[derive(Debug, Error)]
@@ -54,6 +66,55 @@ pub enum CoreError {
         /// Major version found in the URI.
         found: u32,
     },
+
+    /// The requested path does not exist.
+    #[error("not found: {path}")]
+    NotFound {
+        /// Path as the caller named it, safe to show in the UI.
+        path: String,
+    },
+
+    /// The operating system refused access to the path.
+    #[error("permission denied: {path}")]
+    PermissionDenied {
+        /// Path as the caller named it, safe to show in the UI.
+        path: String,
+    },
+
+    /// The file is bigger than the byte cap the caller allowed.
+    ///
+    /// The real size is reported so the UI can say how big the file is instead of
+    /// pretending it was empty.
+    #[error("file too large: {path} is {size} bytes (limit {max})")]
+    TooLarge {
+        /// Path as the caller named it.
+        path: String,
+        /// Real size of the file, in bytes.
+        size: u64,
+        /// Cap the caller allowed, in bytes.
+        max: u64,
+    },
+
+    /// The file is not UTF-8 text (or carries a NUL byte), so it cannot be opened as text.
+    #[error("binary file: {path} is not text")]
+    Binary {
+        /// Path as the caller named it.
+        path: String,
+    },
+
+    /// The relative path the caller sent is not a safe relative path.
+    #[error("invalid path: {reason}")]
+    InvalidPath {
+        /// Human-readable reason, safe to show in the UI.
+        reason: String,
+    },
+
+    /// The resolved path leaves the root the caller allowed (typically a symlink escape).
+    #[error("path outside root: {path}")]
+    OutsideRoot {
+        /// Path as the caller named it.
+        path: String,
+    },
 }
 
 impl CoreError {
@@ -76,6 +137,42 @@ impl CoreError {
         Self::Crypto(reason.into())
     }
 
+    /// Build a [`CoreError::NotFound`].
+    pub fn not_found(path: impl Into<String>) -> Self {
+        Self::NotFound { path: path.into() }
+    }
+
+    /// Build a [`CoreError::PermissionDenied`].
+    pub fn permission_denied(path: impl Into<String>) -> Self {
+        Self::PermissionDenied { path: path.into() }
+    }
+
+    /// Build a [`CoreError::TooLarge`].
+    pub fn too_large(path: impl Into<String>, size: u64, max: u64) -> Self {
+        Self::TooLarge {
+            path: path.into(),
+            size,
+            max,
+        }
+    }
+
+    /// Build a [`CoreError::Binary`].
+    pub fn binary(path: impl Into<String>) -> Self {
+        Self::Binary { path: path.into() }
+    }
+
+    /// Build a [`CoreError::InvalidPath`].
+    pub fn invalid_path(reason: impl Into<String>) -> Self {
+        Self::InvalidPath {
+            reason: reason.into(),
+        }
+    }
+
+    /// Build a [`CoreError::OutsideRoot`].
+    pub fn outside_root(path: impl Into<String>) -> Self {
+        Self::OutsideRoot { path: path.into() }
+    }
+
     /// Stable machine-readable kind, used by the FFI payload and the TS bindings.
     pub fn kind(&self) -> &'static str {
         match self {
@@ -84,6 +181,12 @@ impl CoreError {
             Self::Io(_) => KIND_IO,
             Self::Crypto(_) => KIND_CRYPTO,
             Self::UnsupportedVersion { .. } => KIND_UNSUPPORTED_VERSION,
+            Self::NotFound { .. } => KIND_NOT_FOUND,
+            Self::PermissionDenied { .. } => KIND_PERMISSION_DENIED,
+            Self::TooLarge { .. } => KIND_TOO_LARGE,
+            Self::Binary { .. } => KIND_BINARY,
+            Self::InvalidPath { .. } => KIND_INVALID_PATH,
+            Self::OutsideRoot { .. } => KIND_OUTSIDE_ROOT,
         }
     }
 }
@@ -97,11 +200,46 @@ mod tests {
         assert_eq!(CoreError::invalid_qr("x").kind(), "invalid_qr");
         assert_eq!(CoreError::ssh("x").kind(), "ssh");
         assert_eq!(CoreError::crypto("x").kind(), "crypto");
+        assert_eq!(CoreError::Io(std::io::Error::other("boom")).kind(), "io");
         assert_eq!(
-            CoreError::Io(std::io::Error::other("boom")).kind(),
-            "io"
+            CoreError::UnsupportedVersion { found: 2 }.kind(),
+            "unsupported_version"
         );
-        assert_eq!(CoreError::UnsupportedVersion { found: 2 }.kind(), "unsupported_version");
+    }
+
+    #[test]
+    fn the_file_system_kinds_are_stable() {
+        assert_eq!(CoreError::not_found("a.ts").kind(), "not_found");
+        assert_eq!(
+            CoreError::permission_denied("b").kind(),
+            "permission_denied"
+        );
+        assert_eq!(CoreError::too_large("c", 9, 4).kind(), "too_large");
+        assert_eq!(CoreError::binary("d").kind(), "binary");
+        assert_eq!(CoreError::invalid_path("e").kind(), "invalid_path");
+        assert_eq!(CoreError::outside_root("f").kind(), "outside_root");
+
+        assert_eq!(CoreError::not_found("a.ts").to_string(), "not found: a.ts");
+        assert_eq!(
+            CoreError::permission_denied("a.ts").to_string(),
+            "permission denied: a.ts"
+        );
+        assert_eq!(
+            CoreError::too_large("a.bin", 1_048_576, 1024).to_string(),
+            "file too large: a.bin is 1048576 bytes (limit 1024)"
+        );
+        assert_eq!(
+            CoreError::binary("logo.png").to_string(),
+            "binary file: logo.png is not text"
+        );
+        assert_eq!(
+            CoreError::invalid_path("the path walks upwards").to_string(),
+            "invalid path: the path walks upwards"
+        );
+        assert_eq!(
+            CoreError::outside_root("../etc/passwd").to_string(),
+            "path outside root: ../etc/passwd"
+        );
     }
 
     #[test]
@@ -110,8 +248,14 @@ mod tests {
             CoreError::invalid_qr("missing host").to_string(),
             "invalid pairing QR: missing host"
         );
-        assert_eq!(CoreError::ssh("auth rejected").to_string(), "ssh: auth rejected");
-        assert_eq!(CoreError::crypto("bad seed").to_string(), "crypto: bad seed");
+        assert_eq!(
+            CoreError::ssh("auth rejected").to_string(),
+            "ssh: auth rejected"
+        );
+        assert_eq!(
+            CoreError::crypto("bad seed").to_string(),
+            "crypto: bad seed"
+        );
         assert_eq!(
             CoreError::UnsupportedVersion { found: 2 }.to_string(),
             "unsupported pairing QR major version 2 (this build speaks v1)"

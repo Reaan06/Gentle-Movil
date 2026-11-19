@@ -164,9 +164,9 @@ fn parse_query(query: &str) -> Result<BTreeMap<String, String>, CoreError> {
         if segment.is_empty() {
             continue;
         }
-        let (key, value) = segment.split_once('=').ok_or_else(|| {
-            CoreError::invalid_qr(format!("parameter {segment:?} has no value"))
-        })?;
+        let (key, value) = segment
+            .split_once('=')
+            .ok_or_else(|| CoreError::invalid_qr(format!("parameter {segment:?} has no value")))?;
         if key.is_empty() {
             return Err(CoreError::invalid_qr(format!(
                 "parameter {segment:?} has an empty name"
@@ -185,9 +185,9 @@ fn parse_query(query: &str) -> Result<BTreeMap<String, String>, CoreError> {
 fn required<'a>(params: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str, CoreError> {
     match params.get(key) {
         None => Err(CoreError::invalid_qr(format!("missing {key} parameter"))),
-        Some(value) if value.is_empty() => Err(CoreError::invalid_qr(format!(
-            "{key} must not be empty"
-        ))),
+        Some(value) if value.is_empty() => {
+            Err(CoreError::invalid_qr(format!("{key} must not be empty")))
+        }
         Some(value) => Ok(value),
     }
 }
@@ -252,7 +252,12 @@ mod tests {
     #[test]
     fn unknown_parameters_are_ignored_for_forward_compatibility() {
         let query = format!("v=1&host=h&user=u&token=t&fp={FP}&future=1");
-        assert_eq!(pair_from_qr(&uri(&query)).expect("unknown keys ignored").version, 1);
+        assert_eq!(
+            pair_from_qr(&uri(&query))
+                .expect("unknown keys ignored")
+                .version,
+            1
+        );
     }
 
     #[test]
@@ -264,14 +269,16 @@ mod tests {
 
     #[test]
     fn rejects_a_foreign_scheme() {
-        let err = pair_from_qr(&format!("https://pair?v=1&host=h&user=u&token=t&fp={FP}")).unwrap_err();
+        let err =
+            pair_from_qr(&format!("https://pair?v=1&host=h&user=u&token=t&fp={FP}")).unwrap_err();
         assert_eq!(err.kind(), "invalid_qr");
         assert!(err.to_string().contains("unexpected scheme"), "{err}");
     }
 
     #[test]
     fn rejects_a_foreign_action() {
-        let err = pair_from_qr(&format!("gc://connect?v=1&host=h&user=u&token=t&fp={FP}")).unwrap_err();
+        let err =
+            pair_from_qr(&format!("gc://connect?v=1&host=h&user=u&token=t&fp={FP}")).unwrap_err();
         assert_eq!(err.kind(), "invalid_qr");
         assert!(err.to_string().contains("unexpected action"), "{err}");
     }
@@ -284,20 +291,30 @@ mod tests {
 
     #[test]
     fn rejects_a_missing_or_unparsable_version() {
-        let missing = pair_from_qr(&format!("gc://pair?host=h&user=u&token=t&fp={FP}")).unwrap_err();
+        let missing =
+            pair_from_qr(&format!("gc://pair?host=h&user=u&token=t&fp={FP}")).unwrap_err();
         assert_eq!(missing.kind(), "invalid_qr");
-        assert!(missing.to_string().contains("missing v parameter"), "{missing}");
+        assert!(
+            missing.to_string().contains("missing v parameter"),
+            "{missing}"
+        );
 
-        let broken = pair_from_qr(&format!("gc://pair?v=one&host=h&user=u&token=t&fp={FP}")).unwrap_err();
-        assert!(broken.to_string().contains("invalid v (version)"), "{broken}");
+        let broken =
+            pair_from_qr(&format!("gc://pair?v=one&host=h&user=u&token=t&fp={FP}")).unwrap_err();
+        assert!(
+            broken.to_string().contains("invalid v (version)"),
+            "{broken}"
+        );
 
-        let negative = pair_from_qr(&format!("gc://pair?v=-1&host=h&user=u&token=t&fp={FP}")).unwrap_err();
+        let negative =
+            pair_from_qr(&format!("gc://pair?v=-1&host=h&user=u&token=t&fp={FP}")).unwrap_err();
         assert_eq!(negative.kind(), "invalid_qr");
     }
 
     #[test]
     fn rejects_an_unknown_major_version() {
-        let err = pair_from_qr(&format!("gc://pair?v=2&host=h&user=u&token=t&fp={FP}")).unwrap_err();
+        let err =
+            pair_from_qr(&format!("gc://pair?v=2&host=h&user=u&token=t&fp={FP}")).unwrap_err();
         assert_eq!(err.kind(), "unsupported_version");
         assert_eq!(
             err.to_string(),
@@ -312,12 +329,30 @@ mod tests {
     #[test]
     fn rejects_an_empty_host_or_user_or_token() {
         for (query, expected) in [
-            (format!("v=1&host=&user=u&token=t&fp={FP}"), "host must not be empty"),
-            (format!("v=1&user=u&token=t&fp={FP}"), "missing host parameter"),
-            (format!("v=1&host=h&user=&token=t&fp={FP}"), "user must not be empty"),
-            (format!("v=1&host=h&token=t&fp={FP}"), "missing user parameter"),
-            (format!("v=1&host=h&user=u&token=&fp={FP}"), "token must not be empty"),
-            (format!("v=1&host=h&user=u&fp={FP}"), "missing token parameter"),
+            (
+                format!("v=1&host=&user=u&token=t&fp={FP}"),
+                "host must not be empty",
+            ),
+            (
+                format!("v=1&user=u&token=t&fp={FP}"),
+                "missing host parameter",
+            ),
+            (
+                format!("v=1&host=h&user=&token=t&fp={FP}"),
+                "user must not be empty",
+            ),
+            (
+                format!("v=1&host=h&token=t&fp={FP}"),
+                "missing user parameter",
+            ),
+            (
+                format!("v=1&host=h&user=u&token=&fp={FP}"),
+                "token must not be empty",
+            ),
+            (
+                format!("v=1&host=h&user=u&fp={FP}"),
+                "missing token parameter",
+            ),
         ] {
             let err = pair_from_qr(&uri(&query)).unwrap_err();
             assert_eq!(err.kind(), "invalid_qr");
@@ -344,16 +379,30 @@ mod tests {
 
     #[test]
     fn rejects_bad_fingerprints() {
-        for bad in ["abc", &FP[..63], &format!("{FP}0"), "not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-xyz"] {
+        for bad in [
+            "abc",
+            &FP[..63],
+            &format!("{FP}0"),
+            "not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-not-hex-xyz",
+        ] {
             let query = format!("v=1&host=h&user=u&token=t&fp={bad}");
             let err = pair_from_qr(&uri(&query)).unwrap_err();
             assert_eq!(err.kind(), "invalid_qr");
-            assert!(err.to_string().contains("fp must be 64 hex characters"), "fp {bad}: {err}");
+            assert!(
+                err.to_string().contains("fp must be 64 hex characters"),
+                "fp {bad}: {err}"
+            );
         }
         let empty = pair_from_qr("gc://pair?v=1&host=h&user=u&token=t&fp=").unwrap_err();
-        assert!(empty.to_string().contains("fp must not be empty"), "{empty}");
+        assert!(
+            empty.to_string().contains("fp must not be empty"),
+            "{empty}"
+        );
         let missing = pair_from_qr("gc://pair?v=1&host=h&user=u&token=t").unwrap_err();
-        assert!(missing.to_string().contains("missing fp parameter"), "{missing}");
+        assert!(
+            missing.to_string().contains("missing fp parameter"),
+            "{missing}"
+        );
     }
 
     #[test]
@@ -370,14 +419,21 @@ mod tests {
             "gc://pair?v=1&host=h&host=h2&user=u&token=t&fp={FP}"
         ))
         .unwrap_err();
-        assert!(duplicate.to_string().contains("duplicate parameter"), "{duplicate}");
+        assert!(
+            duplicate.to_string().contains("duplicate parameter"),
+            "{duplicate}"
+        );
 
-        let no_value = pair_from_qr(&format!("gc://pair?v=1&host&user=u&token=t&fp={FP}")).unwrap_err();
+        let no_value =
+            pair_from_qr(&format!("gc://pair?v=1&host&user=u&token=t&fp={FP}")).unwrap_err();
         assert!(no_value.to_string().contains("has no value"), "{no_value}");
 
-        let empty_name = pair_from_qr(&format!("gc://pair?v=1&=x&host=h&user=u&token=t&fp={FP}"))
-            .unwrap_err();
-        assert!(empty_name.to_string().contains("empty name"), "{empty_name}");
+        let empty_name =
+            pair_from_qr(&format!("gc://pair?v=1&=x&host=h&user=u&token=t&fp={FP}")).unwrap_err();
+        assert!(
+            empty_name.to_string().contains("empty name"),
+            "{empty_name}"
+        );
     }
 
     #[test]

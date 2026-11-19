@@ -22,10 +22,12 @@
  *   rotation limit), imported so they can never drift from the writer;
  * - the app/build info is passed in by the caller (`expo-constants` in the
  *   screen);
- * - the device-key fingerprint comes from the real core
- *   (`core.deviceKeyGenerate()`, injected as `DeviceKeySource`): when the core
- *   is not in the build its rejection is shown as `no disponible` **with the
- *   real reason** — this module never invents a fingerprint;
+ * - the device-key fingerprint comes from the real core: `deviceKeyEnsure()`
+ *   (the frozen ABI v2 contract, re-exported by `lib/core.ts` and injected as
+ *   `DeviceKeySource`), which reads the identity whose seed the core keeps
+ *   sealed in the Keystore; when the core is not in the build its rejection is
+ *   shown as `no disponible` **with the real reason** — this module never
+ *   invents a fingerprint and never asks for a fresh keypair;
  * - the paired-device row is the real tunnel host plus the real phone label
  *   (`Constants.deviceName` / `Platform.OS`, passed in): one device, this phone,
  *   and `Sin túnel` when the pairing flow opened none. Revoking edits
@@ -56,9 +58,9 @@
 
 import {
   CoreUnavailableError,
-  type MobileCore,
-  core,
+  deviceKeyEnsure,
   utf8Encode,
+  type DeviceKeyInfo,
 } from './core.ts';
 import {
   LOG_CAPACITY,
@@ -284,7 +286,7 @@ export interface LoadSettingsDeps {
   app: AppInfo;
   /** Real phone info; defaults to the honest unknown (`Este teléfono`). */
   phone?: PhoneInfo;
-  /** Core surface for the device key; defaults to the real `core` binding. */
+  /** Core surface for the device key; defaults to the real `deviceKeyEnsure()` binding. */
   deviceKey?: DeviceKeySource;
   /** Failure sink; defaults to `logger.tag('settings')`. */
   logger?: SettingsLogger;
@@ -374,20 +376,24 @@ export interface PhoneInfo {
 /** Where a device-key result came from, so the row can say the real cause. */
 export type DeviceKeyCause = 'core-unavailable' | 'failure';
 
-/** Outcome of calling the real `core.deviceKeyGenerate()`. */
+/** Outcome of calling the real `deviceKeyEnsure()`. */
 export type DeviceKeyResult =
   | { ok: true; publicKey: string; fingerprint: string }
   | { ok: false; cause: DeviceKeyCause; name: string; reason: string };
 
-/** The only core surface this module calls (injected, so tests stay offline). */
-export type DeviceKeySource = Pick<MobileCore, 'deviceKeyGenerate'>;
+/**
+ * The only core surface this module calls (injected, so tests stay offline):
+ * `deviceKeyEnsure()` of the frozen ABI v2 contract. It answers the **persisted**
+ * identity — `{publicHex, fingerprint}` — and never the seed.
+ */
+export type DeviceKeySource = () => Promise<DeviceKeyInfo>;
 
 /** The device-key row as the screen shows it. */
 export interface DeviceKeyFacts {
   available: boolean;
   /** Real `SHA256:` fingerprint, or null — never invented. */
   fingerprint: string | null;
-  /** Public key the core returned, or null (it is never shown as the fingerprint). */
+  /** Public key the core answered with (lowercase hex), or null — never the fingerprint. */
   publicKey: string | null;
   cause: DeviceKeyCause | null;
   /** Rejection message verbatim, or null when the key was read. */
@@ -634,18 +640,30 @@ export function diagnosticsFacts(): DiagnosticsFacts {
  * T7m builders
  * ------------------------------------------------------------------ */
 
+/** True when a rejection means "there is no native core in this build". */
+function isCoreUnavailable(error: unknown, name: string): boolean {
+  if (error instanceof CoreUnavailableError || name === 'CoreUnavailableError') {
+    return true;
+  }
+  // The ABI layer (`modules/gentle-core/src/abi.ts`) reports the same state as a
+  // `CoreCallError` whose stable kind is `CoreUnavailable`.
+  return (error as { kind?: unknown } | null | undefined)?.kind === 'CoreUnavailable';
+}
+
 /**
- * Calls the real `core.deviceKeyGenerate()` (or an injected source) and turns
- * every outcome into a typed result: a key, or a rejection with its verbatim
- * reason. Nothing here fabricates a fingerprint.
+ * Calls the real `deviceKeyEnsure()` (or an injected source) and turns every
+ * outcome into a typed result: the persisted identity, or a rejection with its
+ * verbatim reason. Nothing here fabricates a fingerprint, and no fresh keypair
+ * is ever asked for.
  */
 export async function resolveDeviceKey(
-  source: DeviceKeySource = core,
+  source: DeviceKeySource = deviceKeyEnsure,
 ): Promise<DeviceKeyResult> {
   try {
-    const pair = await source.deviceKeyGenerate();
-    const fingerprint = typeof pair.fingerprint === 'string' ? pair.fingerprint.trim() : '';
-    const publicKey = typeof pair.publicKey === 'string' ? pair.publicKey.trim() : '';
+    const identity = await source();
+    const fingerprint =
+      typeof identity?.fingerprint === 'string' ? identity.fingerprint.trim() : '';
+    const publicKey = typeof identity?.publicHex === 'string' ? identity.publicHex.trim() : '';
     if (fingerprint === '') {
       // A key without a fingerprint cannot be shown: that is a real failure.
       return {
@@ -658,10 +676,9 @@ export async function resolveDeviceKey(
     return { ok: true, publicKey, fingerprint };
   } catch (error) {
     const described = describeError(error);
-    const cause: DeviceKeyCause =
-      error instanceof CoreUnavailableError || described.name === 'CoreUnavailableError'
-        ? 'core-unavailable'
-        : 'failure';
+    const cause: DeviceKeyCause = isCoreUnavailable(error, described.name)
+      ? 'core-unavailable'
+      : 'failure';
     return { ok: false, cause, name: described.name, reason: described.message };
   }
 }
@@ -909,7 +926,7 @@ export interface BuildSettingsInput {
   app: AppInfo;
   /** Real phone info the caller knows. */
   phone: PhoneInfo;
-  /** Result of `core.deviceKeyGenerate()` (already awaited by the caller). */
+  /** Result of `deviceKeyEnsure()` (already awaited by the caller). */
   deviceKey: DeviceKeyResult;
   /** Parsed preference records, one per persisted key. */
   toggles: Record<ToggleId, ToggleParse>;
@@ -1168,7 +1185,7 @@ export async function loadSettings(
     readKey(read, MODE_STORAGE_KEY),
     readKey(read, SUITE_STORAGE_KEY),
     Promise.all(TOGGLE_IDS.map(async (id) => [id, await readKey(read, TOGGLE_STORAGE_KEYS[id])] as const)),
-    resolveDeviceKey(deps.deviceKey ?? core),
+    resolveDeviceKey(deps.deviceKey ?? deviceKeyEnsure),
   ]);
 
   let mode: AppMode | null = null;

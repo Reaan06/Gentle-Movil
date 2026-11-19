@@ -26,14 +26,27 @@ import {
   runtimeUnavailableEnvelope,
 } from './src/runtime.ts';
 import type { RuntimeMethod } from './src/runtime.ts';
+import { bindCoreNativeBridge } from './src/abi.ts';
+import type { CoreNativeBridge } from './src/abi.ts';
 
-/** Function names of the frozen C ABI (`gc_*` symbols). */
+/**
+ * Function names the JS runtime may reach through `callGc`.
+ *
+ * This union is the **frozen JS-reachable surface** and it is deliberately smaller than the
+ * C ABI: the seed-bearing symbols (`gc_device_key_generate`, `gc_device_key_public`,
+ * `gc_ssh_connect_seed`) are not in it. They are called from Kotlin only — the seed never
+ * enters the JS runtime, which is the whole point of T16 and SEC-001 — and
+ * `GcCoreModule.dispatch` answers `UnknownFunction` for them. `mobile/test/core-abi.test.mjs`
+ * pins the list against the Kotlin source so it cannot silently grow back.
+ */
 export type GcFunction =
   | 'gc_abi_version'
   | 'gc_pair_from_qr'
   | 'gc_ssh_connect'
+  | 'gc_ssh_close'
   | 'gc_provision_step'
-  | 'gc_device_key_generate'
+  | 'gc_fs_list'
+  | 'gc_fs_read'
   | 'gc_ssh_channel_write'
   | 'gc_ssh_channel_read'
   | 'gc_ssh_channel_close';
@@ -51,7 +64,23 @@ export interface GentleCoreNativeModule {
   pairFromQr(uri: string): Promise<string>;
   sshConnect(payloadJson: string): Promise<string>;
   provisionStep(payloadJson: string): Promise<string>;
-  deviceKeyGenerate(payloadJson: string): Promise<string>;
+  /**
+   * Frozen v2 surface (T16/T18). These answer the typed JSON envelopes of the native
+   * module, not the raw `gc_*` strings:
+   *
+   * | method | payload | answer |
+   * |---|---|---|
+   * | `deviceKeyEnsure` | `{}` | `{ok,result:{publicHex,fingerprint}}` — **never** the seed |
+   * | `sshConnectWithDeviceKey` | `{host,port,user,expectedFp}` | `{ok,result:{sessionId,fingerprint}}` |
+   * | `sshClose` | `{sessionId}` | `{ok,result:{closed:true}}` |
+   * | `fsList` | `{root,path,maxEntries?}` | `{ok,result:{entries,truncated}}` |
+   * | `fsRead` | `{root,path,maxBytes?}` | `{ok,result:{path,text,size,truncated}}` |
+   */
+  deviceKeyEnsure(payloadJson: string): Promise<string>;
+  sshConnectWithDeviceKey(payloadJson: string): Promise<string>;
+  sshClose(payloadJson: string): Promise<string>;
+  fsList(payloadJson: string): Promise<string>;
+  fsRead(payloadJson: string): Promise<string>;
   /** Tunnel channel I/O (`gc_ssh_channel_*`); both handles ride inside the document. */
   sshChannelWrite(payloadJson: string): Promise<string>;
   sshChannelRead(payloadJson: string): Promise<string>;
@@ -67,6 +96,57 @@ try {
   // Expo Go / web / a build without the module. Honest reason kept for the UI.
   loadError = error instanceof Error ? error.message : String(error);
 }
+
+/**
+ * Bind the pure ABI layer (`src/abi.ts`) to this Kotlin module.
+ *
+ * The v2 frozen functions (`deviceKeyEnsure`, `sshConnectWithDeviceKey`, `sshClose`,
+ * `fsList`, `fsRead`) live in `src/abi.ts` so they can be tested without a device and
+ * re-exported by `lib/core.ts` without dragging `expo-modules-core` into a node test. When
+ * the module is absent the bridge stays unbound and every one of them fails with
+ * `CoreUnavailable` instead of pretending.
+ */
+const coreBridge: CoreNativeBridge | null =
+  nativeModule === null
+    ? null
+    : {
+        deviceKeyEnsure: (payloadJson) => nativeModule!.deviceKeyEnsure(payloadJson),
+        sshConnectWithDeviceKey: (payloadJson) =>
+          nativeModule!.sshConnectWithDeviceKey(payloadJson),
+        sshClose: (payloadJson) => nativeModule!.sshClose(payloadJson),
+        fsList: (payloadJson) => nativeModule!.fsList(payloadJson),
+        fsRead: (payloadJson) => nativeModule!.fsRead(payloadJson),
+      };
+
+bindCoreNativeBridge(coreBridge);
+
+/* ------------------------------------------------------------------ *
+ * Frozen v2 TS contract (T16/T18)
+ *
+ * Re-exported by `mobile/lib/core.ts`. The names are frozen: screens call exactly these.
+ * ------------------------------------------------------------------ */
+
+export {
+  CoreCallError,
+  bindCoreNativeBridge,
+  compactFingerprint,
+  coreNativeBridgeBound,
+  deviceKeyEnsure,
+  fsList,
+  fsRead,
+  parseEnvelope,
+  sshClose,
+  sshConnectWithDeviceKey,
+} from './src/abi.ts';
+export type {
+  CoreNativeBridge,
+  DeviceKeyInfo,
+  FsEntry,
+  FsListInput,
+  FsReadInput,
+  FsReadResult,
+  SshConnectWithDeviceKeyInput,
+} from './src/abi.ts';
 
 /** Envelope the facade answers with when the native module is missing. */
 function unavailableEnvelope(message: string, kind = 'CoreUnavailable'): string {
@@ -126,10 +206,15 @@ export async function pairFromQr(uri: string): Promise<string> {
   return nativeModule === null ? callGc('gc_pair_from_qr', JSON.stringify({ uri })) : nativeModule.pairFromQr(uri);
 }
 
-/** `gc_device_key_generate` — phone ed25519 identity (kept in the Keystore). */
-export async function deviceKeyGenerate(payloadJson = '{}'): Promise<string> {
-  return callGc('gc_device_key_generate', payloadJson);
-}
+/**
+ * `gc_device_key_generate` is **not** exported here, on purpose.
+ *
+ * It answers the device seed in the clear and it used to be reachable from JS through this
+ * facade (SEC-001); `lib/provision.ts` and `lib/settings.ts` now drive the identity with
+ * `deviceKeyEnsure()` above, which never leaves the Keystore boundary. The mint still runs —
+ * from Kotlin, inside `GcCoreModule.deviceKeyEnsure` — and the seed stays in the native
+ * module. Do not add it back: `mobile/test/core-abi.test.mjs` reads this file and fails.
+ */
 
 /* ------------------------------------------------------------------ *
  * Tunnel channel I/O (S4)

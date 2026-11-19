@@ -56,9 +56,14 @@ fn pair_info_json_field_names_are_stable() {
 fn pair_from_qr_rejections_carry_a_stable_kind() {
     let core = core();
 
-    let malformed = core.pair_from_qr("not-a-uri".to_string()).expect_err("fails");
+    let malformed = core
+        .pair_from_qr("not-a-uri".to_string())
+        .expect_err("fails");
     assert_eq!(malformed.kind, "invalid_qr");
-    assert_eq!(malformed.message, "invalid pairing QR: missing gc:// scheme");
+    assert_eq!(
+        malformed.message,
+        "invalid pairing QR: missing gc:// scheme"
+    );
 
     let version = core
         .pair_from_qr(format!("gc://pair?v=2&host=h&user=u&token=t&fp={FP}"))
@@ -66,7 +71,9 @@ fn pair_from_qr_rejections_carry_a_stable_kind() {
     assert_eq!(version.kind, "unsupported_version");
 
     let port = core
-        .pair_from_qr(format!("gc://pair?v=1&host=h&port=0&user=u&token=t&fp={FP}"))
+        .pair_from_qr(format!(
+            "gc://pair?v=1&host=h&port=0&user=u&token=t&fp={FP}"
+        ))
         .expect_err("fails");
     assert_eq!(port.kind, "invalid_qr");
     assert_eq!(port.message, "invalid pairing QR: port must be 1..=65535");
@@ -91,17 +98,17 @@ fn crypto_verify_gates_a_signed_daemon_descriptor() {
     let payload = b"daemon-descriptor:{\"version\":\"0.6.0\"}";
     let signature = device_key::sign(&release.secret, payload).expect("signable");
 
-    assert!(core.crypto_verify(release.public_hex.clone(), payload.to_vec(), signature.clone()));
+    assert!(core.crypto_verify(
+        release.public_hex.clone(),
+        payload.to_vec(),
+        signature.clone()
+    ));
     assert!(!core.crypto_verify(
         release.public_hex,
         b"daemon-descriptor:{\"version\":\"9.9.9\"}".to_vec(),
         signature.clone()
     ));
-    assert!(!core.crypto_verify(
-        "0".repeat(64),
-        payload.to_vec(),
-        signature
-    ));
+    assert!(!core.crypto_verify("0".repeat(64), payload.to_vec(), signature));
     assert!(!core.crypto_verify("nonsense".to_string(), payload.to_vec(), Vec::new()));
 }
 
@@ -215,20 +222,26 @@ fn channel_close_document_needs_only_the_two_handles() {
 
 #[test]
 fn channel_document_accepts_numeric_handles_sent_as_strings() {
-    let call = split_channel_document(r#"{"sessionId":"7","channelId":"3"}"#).expect("valid document");
+    let call =
+        split_channel_document(r#"{"sessionId":"7","channelId":"3"}"#).expect("valid document");
     assert_eq!(call.session_id, 7);
     assert_eq!(call.channel_id, 3);
 }
 
 #[test]
 fn a_missing_session_id_is_refused_by_name() {
-    let error = split_channel_document(r#"{"channelId":3,"bytes":"aGk="}"#).expect_err("no sessionId");
-    assert_eq!(error.message, "the channel document needs a numeric sessionId");
+    let error =
+        split_channel_document(r#"{"channelId":3,"bytes":"aGk="}"#).expect_err("no sessionId");
+    assert_eq!(
+        error.message,
+        "the channel document needs a numeric sessionId"
+    );
 }
 
 #[test]
 fn a_blank_session_id_is_refused_by_name() {
-    let error = split_channel_document(r#"{"sessionId":"  ","channelId":3}"#).expect_err("blank sessionId");
+    let error =
+        split_channel_document(r#"{"sessionId":"  ","channelId":3}"#).expect_err("blank sessionId");
     assert_eq!(
         error.message,
         "the channel document needs a numeric sessionId, not \"  \""
@@ -237,7 +250,8 @@ fn a_blank_session_id_is_refused_by_name() {
 
 #[test]
 fn a_null_session_id_is_refused_by_name() {
-    let error = split_channel_document(r#"{"sessionId":null,"channelId":3}"#).expect_err("null sessionId");
+    let error =
+        split_channel_document(r#"{"sessionId":null,"channelId":3}"#).expect_err("null sessionId");
     assert_eq!(
         error.message,
         "the channel document needs a numeric sessionId, not null"
@@ -246,8 +260,12 @@ fn a_null_session_id_is_refused_by_name() {
 
 #[test]
 fn a_missing_channel_id_is_refused_by_name() {
-    let error = split_channel_document(r#"{"sessionId":7,"bytes":"aGk="}"#).expect_err("no channelId");
-    assert_eq!(error.message, "the channel document needs a numeric channelId");
+    let error =
+        split_channel_document(r#"{"sessionId":7,"bytes":"aGk="}"#).expect_err("no channelId");
+    assert_eq!(
+        error.message,
+        "the channel document needs a numeric channelId"
+    );
 }
 
 #[test]
@@ -262,7 +280,10 @@ fn malformed_channel_documents_report_which_shape_was_wrong() {
     );
 
     let not_an_object = split_channel_document("[1,2]").expect_err("not an object");
-    assert_eq!(not_an_object.message, "the channel document must be a JSON object");
+    assert_eq!(
+        not_an_object.message,
+        "the channel document must be a JSON object"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -382,3 +403,225 @@ fn jni_shim_names_an_unreadable_kotlin_argument_as_input() {
     assert_eq!(value["error"]["kind"], "input");
 }
 
+// ---------------------------------------------------------------------------
+// ABI v2 surface (T16/T18): the session document, the typed file errors and the
+// device-file records. Everything here is reached through the public API — the same
+// functions the JNI shims and the TypeScript facade call.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_session_document_splits_into_the_handle_the_teardown_needs() {
+    assert_eq!(
+        mobile_core::cabi::split_session_document(r#"{"sessionId":7}"#).expect("valid document"),
+        7
+    );
+    // A bridge that stringifies ids still addresses the session it meant.
+    assert_eq!(
+        mobile_core::cabi::split_session_document(r#"{"sessionId":"7"}"#).expect("numeric string"),
+        7
+    );
+
+    let missing =
+        mobile_core::cabi::split_session_document(r#"{"channelId":3}"#).expect_err("no sessionId");
+    assert_eq!(
+        missing.message,
+        "the session document needs a numeric sessionId"
+    );
+
+    let not_json = mobile_core::cabi::split_session_document("nope").expect_err("not JSON");
+    assert!(
+        not_json
+            .message
+            .starts_with("the session document is not valid JSON: "),
+        "got: {}",
+        not_json.message
+    );
+
+    let not_an_object = mobile_core::cabi::split_session_document("[]").expect_err("array");
+    assert_eq!(
+        not_an_object.message,
+        "the session document must be a JSON object"
+    );
+}
+
+#[test]
+fn the_file_system_errors_cross_the_boundary_as_typed_payloads() {
+    let cases = [
+        (
+            CoreError::not_found("src/a.ts"),
+            "not_found",
+            "not found: src/a.ts",
+        ),
+        (
+            CoreError::permission_denied("locked"),
+            "permission_denied",
+            "permission denied: locked",
+        ),
+        (
+            CoreError::too_large("big.bin", 9_000, 1_024),
+            "too_large",
+            "file too large: big.bin is 9000 bytes (limit 1024)",
+        ),
+        (
+            CoreError::binary("logo.png"),
+            "binary",
+            "binary file: logo.png is not text",
+        ),
+        (
+            CoreError::invalid_path("../outside"),
+            "invalid_path",
+            "invalid path: ../outside",
+        ),
+        (
+            CoreError::outside_root("escape.txt"),
+            "outside_root",
+            "path outside root: escape.txt",
+        ),
+    ];
+    for (error, kind, message) in cases {
+        let payload = CoreErrorPayload::from(error);
+        assert_eq!(payload.kind, kind);
+        assert_eq!(payload.message, message);
+        let json = serde_json::to_string(&payload).expect("serializes");
+        assert!(
+            json.contains(kind) && json.contains(&serde_json::to_string(message).expect("message")),
+            "{json}"
+        );
+    }
+}
+
+#[test]
+fn the_device_file_records_match_the_published_shapes() {
+    // The TypeScript contract (`SsList`/`fsRead` in `mobile/lib/core.ts`) reads exactly
+    // these field names, so they are pinned here.
+    let entry = mobile_core::fs::FsEntry {
+        path: "src/main.ts".to_string(),
+        size: Some(42),
+        kind: mobile_core::fs::FsKind::File,
+    };
+    assert_eq!(
+        serde_json::to_value(&entry).expect("serializes"),
+        serde_json::json!({ "path": "src/main.ts", "size": 42, "kind": "file" })
+    );
+
+    let directory = mobile_core::fs::FsEntry {
+        path: "src".to_string(),
+        size: None,
+        kind: mobile_core::fs::FsKind::Dir,
+    };
+    assert_eq!(
+        serde_json::to_value(&directory).expect("serializes")["size"],
+        serde_json::Value::Null
+    );
+
+    let read = mobile_core::fs::FsRead {
+        path: "src/main.ts".to_string(),
+        text: "export {};\n".to_string(),
+        size: 11,
+        truncated: false,
+    };
+    assert_eq!(
+        serde_json::to_value(&read).expect("serializes"),
+        serde_json::json!({
+            "path": "src/main.ts",
+            "text": "export {};\n",
+            "size": 11,
+            "truncated": false
+        })
+    );
+}
+
+#[test]
+fn the_device_key_derivations_are_part_of_the_public_surface() {
+    // The native shell needs these three, and nothing about them may reach JS as a seed:
+    // the private key stays a `PrivateKey`, and the public form is the OpenSSH one-liner.
+    let pair = core().device_key_generate();
+    let line = mobile_core::device_key::authorized_key_line(&pair.secret, "gentle-movil")
+        .expect("authorized key line");
+    assert!(
+        line.starts_with("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"),
+        "{line}"
+    );
+    assert!(line.ends_with(" gentle-movil"), "{line}");
+    assert!(!line.contains(&mobile_core::fingerprint::hex_lower(
+        &pair.secret.secret_seed
+    )));
+
+    let fingerprint =
+        mobile_core::device_key::fingerprint_sha256(&pair.secret).expect("fingerprint");
+    assert!(fingerprint.starts_with("SHA256:"), "{fingerprint}");
+
+    // The derived key is the registered identity: its public half is the pair's public hex.
+    let public = mobile_core::device_key::public_key_openssh(&pair.secret).expect("public key");
+    assert_eq!(
+        mobile_core::device_key::public_hex_from_secret(&pair.secret).expect("public hex"),
+        pair.public_hex
+    );
+    assert!(public.contains(&line.split(' ').nth(1).expect("blob").to_string()));
+}
+
+#[test]
+fn the_device_seed_is_only_borrowed_and_never_rendered() {
+    // SEC-009 through the public surface: the seed holder hands out a borrow (never a
+    // copy), and neither its `Debug` nor an error message renders the bytes.
+    let pair = core().device_key_generate();
+    assert_eq!(pair.secret.expose_seed().len(), 32);
+    assert_eq!(
+        pair.secret.expose_seed().as_ptr(),
+        pair.secret.secret_seed.as_ptr(),
+        "expose_seed borrows the holder's own buffer"
+    );
+
+    let rendered = format!("{:?}", pair.secret);
+    assert!(rendered.contains("<redacted 32 bytes>"), "{rendered}");
+    assert!(
+        !rendered.contains(&mobile_core::fingerprint::hex_lower(
+            pair.secret.expose_seed()
+        )),
+        "the hex form of the seed must never be rendered: {rendered}"
+    );
+}
+
+#[test]
+fn the_public_file_surface_refuses_a_relative_root_and_a_non_regular_file() {
+    // SEC-003 / SEC-005 through the public API only: a relative root is a typed
+    // `invalid_path` (never resolved against the process working directory), and the root
+    // itself is a directory, so reading it names what it is instead of opening it.
+    let relative = std::path::Path::new("etc");
+    assert_eq!(
+        mobile_core::fs::list(relative, "", 10)
+            .expect_err("a relative root is refused")
+            .kind(),
+        "invalid_path"
+    );
+    let error = mobile_core::fs::read_text(relative, "passwd", 1024)
+        .expect_err("a relative root is refused");
+    assert_eq!(error.kind(), "invalid_path");
+    assert!(
+        error.to_string().contains("must be an absolute path"),
+        "{error}"
+    );
+
+    let root = std::env::temp_dir().join(format!(
+        "mobile-core-surface-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    std::fs::create_dir_all(&root).expect("sandbox");
+    std::fs::write(root.join("a.txt"), b"hi\n").expect("file");
+
+    let read = mobile_core::fs::read_text(&root, "a.txt", 1024).expect("read");
+    assert_eq!(read.text, "hi\n");
+    assert_eq!(read.size, 3);
+
+    let error = mobile_core::fs::read_text(&root, "", 1024).expect_err("a directory is not text");
+    assert_eq!(error.kind(), "io");
+    assert!(
+        error
+            .to_string()
+            .contains("is a directory, not a regular file"),
+        "{error}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
