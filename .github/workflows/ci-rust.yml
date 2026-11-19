@@ -68,7 +68,7 @@ jobs:
         working-directory: mobile-core
     steps:
       - name: Checkout
-        uses: actions/checkout@v4  # v4.x line
+        uses: actions/checkout@v7  # v4.x line
 
       - name: Rust toolchain (stable + rustfmt + clippy)
         # Moving tag on purpose: this runs the same current stable a developer gets
@@ -107,10 +107,10 @@ jobs:
       NDK_API: 26
     steps:
       - name: Checkout
-        uses: actions/checkout@v4  # v4.x line
+        uses: actions/checkout@v7  # v4.x line
 
       - name: Temurin JDK 17 (sdkmanager is a Java tool)
-        uses: actions/setup-java@v4  # v4.x line
+        uses: actions/setup-java@v6  # v4.x line
         with:
           distribution: temurin
           java-version: '17'
@@ -118,7 +118,7 @@ jobs:
       - name: Android SDK cmdline-tools + sdkmanager
         # android-actions/setup-android ships cmdline-tools + sdkmanager and accepts
         # the SDK licenses, which is what `sdkmanager` needs to install the NDK.
-        uses: android-actions/setup-android@v3  # v3.x line
+        uses: android-actions/setup-android@v4  # v3.x line
 
       - name: sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
         run: sdkmanager --install "ndk;${NDK_VERSION}"
