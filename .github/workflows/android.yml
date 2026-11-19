@@ -1,0 +1,292 @@
+# Android release APK — the project's own build, on GitHub's runners.
+#
+# The build is NOT re-implemented here: `bash scripts/build-apk.sh` is the single
+# entry point because it already carries every guard this app depends on:
+#
+#   1. Rust core first (`mobile-core/build-android.sh`): builds
+#      `libmobile_core.so` for arm64-v8a with `--features jni-shim` and refuses to
+#      continue unless the library exports `Java_com_gentlemovil_core_GcNative_*`.
+#      A library built without the shim has no JNI symbol at all and every
+#      GcNative call on the device would throw UnsatisfiedLinkError.
+#   2. `expo prebuild`: `mobile/android/` is generated (gitignored), so it is
+#      recreated from `mobile/app.json` + `mobile/plugins/*` on every run.
+#   3. `android:allowBackup="false"` asserted in the generated manifest — the
+#      value comes from `app.json`, and a stale `android/` tree would silently
+#      keep the old one.
+#   4. Gradle `assembleRelease -PreactNativeArchitectures=arm64-v8a
+#      --max-workers=1` (workers=1 is required: the expo-modules-core C++ build
+#      with -flto gets OOM-killed above that).
+#   5. `lib/arm64-v8a/libmobile_core.so` asserted inside the final APK — a
+#      library-less APK builds green and then fails on device with
+#      `dlopen failed: library "libmobile_core.so" not found`.
+#
+# What CI adds on top (all fail-loud, no `|| true` anywhere):
+#   - `scripts/fetch-runtime.sh`: the bundled Node + gentle-ai payload
+#     (~107 MiB, SHA256-pinned) that ships as `lib*.so` in jniLibs. The APK build
+#     needs it; a release that lacks it has a dead local mode.
+#   - NDK installed explicitly at the version React Native pins, so the Rust
+#     cross-compile and Gradle agree and nothing depends on what the runner
+#     image happens to ship.
+#   - Post-build guards for the `with-legacy-packaging` config plugin effect:
+#     the property must survive prebuild in `android/gradle.properties` and the
+#     release manifest must carry `extractNativeLibs="true"` (that attribute is
+#     what makes the installer extract `lib/<abi>/*.so` into
+#     `ApplicationInfo.nativeLibraryDir`, the only directory Android lets the app
+#     exec from; without extraction `GcRuntimePackage` has nothing to spawn).
+#   - The runtime payload must be in the APK (`libnode.so`, `libgentle_ai.so`).
+#
+# Honest boundary: this workflow proves the release APK compiles from the durable
+# sources, carries the native core, the JNI shim symbols and the phone runtime,
+# and is packaged for extraction. It does NOT prove runtime behaviour on a real
+# device (no emulator, no install-and-exec step) — that remains a manual check.
+
+name: Android
+
+on:
+  workflow_dispatch:
+  pull_request:
+    # Only paths that can change the APK contents. Unit tests and docs do not.
+    paths:
+      - '.github/workflows/android.yml'
+      - 'scripts/build-apk.sh'
+      - 'scripts/fetch-runtime.sh'
+      - 'mobile-core/build-android.sh'
+      - 'mobile-core/Cargo.toml'
+      - 'mobile-core/Cargo.lock'
+      - 'mobile-core/src/**'
+      - 'mobile/app.json'
+      - 'mobile/package.json'
+      - 'mobile/package-lock.json'
+      - 'mobile/tsconfig.json'
+      - 'mobile/plugins/**'
+      - 'mobile/modules/**'
+      - 'mobile/app/**'
+      - 'mobile/assets/**'
+      - 'mobile/components/**'
+      - 'mobile/lib/**'
+      - 'mobile/scripts/**'
+      - 'mobile/App.tsx'
+      - 'mobile/index.ts'
+
+# Least privilege: the job reads the repo and uploads an artifact (artifact upload
+# uses the run-scoped token, not `contents: write`).
+permissions:
+  contents: read
+
+# A superseded PR push has no value: cancel the older build instead of paying for
+# two 30-minute APKs.
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: '1'
+  CI: '1'
+  ABI: arm64-v8a
+
+jobs:
+  release-apk:
+    name: Release APK (arm64-v8a)
+    # Cold caches (npm + Cargo + Gradle + 107 MiB payload + serialized C++ build)
+    # are ~45-60 min; 120 leaves room for a slow first run without hanging a job.
+    timeout-minutes: 120
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2 # actions/checkout v4.2.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Runner environment
+        # Purely diagnostic: if a build dies on disk or a missing tool, the log
+        # says so up front instead of 40 minutes in.
+        run: |
+          set -euo pipefail
+          df -h /
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
+          echo "JAVA_HOME=${JAVA_HOME:-<unset>}"
+
+      - name: Set up JDK 17
+        # Gradle for RN 0.88 / Expo 58 needs 17; build-apk.sh honours JAVA_HOME.
+        uses: actions/setup-java@v4.7.1 # actions/setup-java v4.7.1
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4.4.0 # actions/setup-node v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Install JS dependencies
+        # `expo prebuild` and autolinking read node_modules; --no-install on the
+        # prebuild below means this step is the only place packages come from.
+        working-directory: mobile
+        run: npm ci --no-audit --no-fund
+
+      - name: Resolve and install the NDK
+        # The version comes from React Native's own `libs.versions.toml`, not from
+        # a constant duplicated here, so a RN bump cannot desynchronise Rust
+        # (which needs `aarch64-linux-android<api>-clang`) from Gradle (which
+        # needs the exact ndkVersion or it fails/auto-downloads).
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          [ -d "$SDK" ] || { echo "error: Android SDK not found at $SDK" >&2; exit 1; }
+
+          TOML="mobile/node_modules/react-native/gradle/libs.versions.toml"
+          [ -f "$TOML" ] || { echo "error: $TOML is missing; cannot resolve ndkVersion" >&2; exit 1; }
+          NDK_VERSION="$(grep -m1 '^ndkVersion' "$TOML" | sed -E 's/.*"([^"]+)".*/\1/')"
+          [ -n "$NDK_VERSION" ] || { echo "error: no ndkVersion line found in $TOML" >&2; exit 1; }
+
+          NDK_DIR="$SDK/ndk/$NDK_VERSION"
+          if [ ! -d "$NDK_DIR" ]; then
+            SDKMANAGER="$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -1)"
+            [ -x "$SDKMANAGER" ] || { echo "error: sdkmanager not found under $SDK/cmdline-tools" >&2; exit 1; }
+            echo "installing NDK $NDK_VERSION via $SDKMANAGER"
+            # `yes` feeds the license prompts; pipefail is disabled in this subshell
+            # so yes' SIGPIPE cannot mask sdkmanager's real exit status.
+            ( set +o pipefail; yes | "$SDKMANAGER" --install "ndk;$NDK_VERSION" >/dev/null )
+          fi
+          [ -d "$NDK_DIR" ] || { echo "error: NDK $NDK_VERSION not installed at $NDK_DIR" >&2; exit 1; }
+
+          echo "NDK: $NDK_DIR"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "NDK_VERSION=$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Verify build prerequisites
+        # build-android.sh needs `strings` and build-apk.sh needs `unzip`/`stat`;
+        # without them the guards degrade into confusing errors, so refuse early.
+        run: |
+          set -euo pipefail
+          missing=0
+          for tool in unzip strings python3 curl ar tar xz sha256sum stat awk; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              echo "error: required tool '$tool' is not available on this runner" >&2
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+
+      - name: Rust toolchain (aarch64-linux-android)
+        # The runner ships rustup; only the Android target is missing. The
+        # toolchain stays `stable` on purpose: Cargo.lock resolves dependencies
+        # newer than the crate's declared MSRV (rust-version = 1.75), so pinning an
+        # old minor here would be a guess that breaks on the next dependency bump.
+        run: |
+          set -euo pipefail
+          rustup target add aarch64-linux-android
+          rustc --version
+          cargo --version
+          rustup target list --installed
+
+      - name: Cache Cargo registry and Rust target dir
+        uses: actions/cache@v4.2.3 # actions/cache v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            mobile-core/target
+          key: cargo-android-${{ runner.os }}-${{ env.NDK_VERSION }}-${{ hashFiles('mobile-core/Cargo.lock') }}
+          restore-keys: |
+            cargo-android-${{ runner.os }}-${{ env.NDK_VERSION }}-
+
+      - name: Cache Gradle
+        # Manual cache rather than gradle/actions/setup-gradle: `mobile/android/`
+        # (and its gradlew) only exists after prebuild, which happens inside
+        # build-apk.sh, so the wrapper is not on disk when early steps run.
+        uses: actions/cache@v4.2.3 # actions/cache v4.2.3
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('mobile/package-lock.json', 'mobile/app.json', 'mobile/plugins/**') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Cache bundled phone runtime
+        # ~107 MiB from a rolling Termux pool plus a GitHub release. The payload
+        # dir also receives libmobile_core.so later in the run; that copy is
+        # overwritten by the Rust step before Gradle ever reads it.
+        uses: actions/cache@v4.2.3 # actions/cache v4.2.3
+        with:
+          path: mobile/modules/gentle-core/android/src/main/jniLibs/arm64-v8a
+          key: jniLibs-${{ env.ABI }}-${{ hashFiles('scripts/fetch-runtime.sh') }}
+
+      - name: Fetch bundled phone runtime
+        # Node + gentle-ai + their shared libs as `lib*.so`. Not cached blindly:
+        # the script re-verifies every SHA256 against runtime-manifest.json and
+        # fails on a mismatch, so a poisoned/partial cache surfaces as a real
+        # error. A 404 here means the Termux pin went stale and needs re-pinning.
+        run: bash scripts/fetch-runtime.sh
+
+      - name: Build release APK
+        # Single entry point: Rust core -> jni symbol guard -> expo prebuild ->
+        # allowBackup="false" guard -> gradle assembleRelease --max-workers=1 ->
+        # lib/arm64-v8a/libmobile_core.so guard inside the zip.
+        run: bash scripts/build-apk.sh
+
+      - name: Verify packaging guards on the built APK
+        # Everything here is a consequence the guards inside build-apk.sh do not
+        # cover: the config-plugin effect and the runtime payload. Each failure is
+        # a real defect that the app would hit on device.
+        run: |
+          set -euo pipefail
+          APK="mobile/android/app/build/outputs/apk/release/app-release.apk"
+          GRADLE_PROPS="mobile/android/gradle.properties"
+          MERGED_DIR="mobile/android/app/build/intermediates/merged_manifests"
+
+          fail() { echo "error: $*" >&2; exit 1; }
+
+          [ -f "$APK" ] || fail "APK not found at $APK"
+          [ -f "$GRADLE_PROPS" ] || fail "generated $GRADLE_PROPS is missing"
+
+          # --- with-legacy-packaging: the property survived prebuild, exactly once
+          # (the plugin rewrites in place and collapses duplicates, so >1 means the
+          # plugin was applied twice or a hand edit leaked into the template).
+          occurrences="$(grep -c '^expo.useLegacyPackaging=' "$GRADLE_PROPS" || true)"
+          [ "$occurrences" -eq 1 ] \
+            || fail "expected exactly one expo.useLegacyPackaging line in $GRADLE_PROPS, found $occurrences"
+          grep -qx 'expo.useLegacyPackaging=true' "$GRADLE_PROPS" \
+            || fail "$GRADLE_PROPS does not set expo.useLegacyPackaging=true (plugin ./plugins/with-legacy-packaging did not apply)"
+
+          # --- with-legacy-packaging: the packaged release manifest extracts libs.
+          # This attribute is what lets the installer write the payload into
+          # ApplicationInfo.nativeLibraryDir; without it nativeLibraryDir is the
+          # pseudo path `base.apk!/lib/arm64-v8a` and exec always fails.
+          [ -d "$MERGED_DIR" ] \
+            || fail "merged manifests not found at $MERGED_DIR (AGP output layout changed? update this guard)"
+          merged="$(find "$MERGED_DIR" -name AndroidManifest.xml -type f)"
+          merged_count="$(printf '%s\n' "$merged" | grep -c . || true)"
+          [ "$merged_count" -eq 1 ] \
+            || fail "expected exactly one merged AndroidManifest.xml under $MERGED_DIR, found $merged_count"
+          grep -q 'extractNativeLibs="true"' "$merged" \
+            || fail "merged release manifest ($merged) does not declare extractNativeLibs=\"true\"; the payload would never be extracted to nativeLibraryDir"
+
+          # --- The bundled runtime actually made it into the APK. Without these the
+          # local mode (runNode / runGentleAi) is dead even though the build is green.
+          listing="$(unzip -l "$APK")"
+          for entry in "lib/${ABI}/libnode.so" "lib/${ABI}/libgentle_ai.so"; do
+            printf '%s\n' "$listing" | grep -F "$entry" >/dev/null \
+              || fail "$entry is missing from the APK (did scripts/fetch-runtime.sh run before Gradle?)"
+          done
+
+          echo "ok: expo.useLegacyPackaging=true present once in generated gradle.properties"
+          echo "ok: merged release manifest declares extractNativeLibs=\"true\""
+          echo "ok: bundled runtime present in the APK"
+          echo "--- lib/${ABI}/*.so in the APK ---"
+          printf '%s\n' "$listing" | awk -v p="lib/${ABI}/" '$4 ~ p { print }'
+          echo "--- APK: $APK ($(stat -c%s "$APK") bytes) ---"
+
+      - name: Upload release APK
+        uses: actions/upload-artifact@v4.6.2 # actions/upload-artifact v4.6.2
+        with:
+          name: gentle-movil-release-apk-arm64-v8a
+          path: mobile/android/app/build/outputs/apk/release/app-release.apk
+          if-no-files-found: error
+          retention-days: 14

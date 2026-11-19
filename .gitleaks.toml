@@ -1,0 +1,53 @@
+# Secret scanning configuration for Gentle Movil.
+#
+# Consumed by `.github/workflows/security.yml` (and usable locally with
+# `gitleaks git --config .gitleaks.toml` / `gitleaks dir --config .gitleaks.toml`).
+#
+# Policy: the built-in gitleaks rule set stays fully enabled, and the allowlist below
+# only ever silences generated/third-party trees or *marker text* that provably cannot
+# carry a credential. Never add a path or pattern here that would hide a real key,
+# token, password or credential body.
+title = "gentle-movil"
+
+[extend]
+# Keep every upstream rule: AWS/GCP/Azure keys, SSH/PGP/OpenSSH private key blocks,
+# GitHub/GitLab/Slack/npm tokens, connection strings, generic API keys, etc.
+useDefault = true
+
+# 1. Generated trees and third-party artefacts.
+#
+# `mobile/android/` is produced by `expo prebuild` from `mobile/app.json` +
+# `mobile/plugins/*` and is gitignored; the committed lockfiles are the durable
+# source of truth. `jniLibs` holds the downloaded Termux node/gentle-ai payload and
+# the Rust `.so`. `node_modules/` and Cargo `target/` are dependency/build output.
+# None of them is scanned by CI (they do not exist in a clean checkout), but a local
+# run on a developer machine must not drown in their noise.
+[[allowlists]]
+description = "generated Android tree, bundled runtime payload, dependency and build artefacts"
+paths = [
+  '''(^|/)mobile/android/''',
+  '''(^|/)mobile/.*/jniLibs/''',
+  '''(^|/)mobile-core/target/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)\.git/''',
+]
+
+# 2. OpenSSH key *header literals* inside Rust assertions.
+#
+# `mobile-core/src/device_key.rs` and `mobile-core/src/ffi.rs` assert on the textual
+# envelope of a freshly generated key:
+#
+#     assert!(text.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"), "{text}");
+#
+# The upstream `private-key` rule matches the header/footer markers, so the assertion
+# line is reported even though it contains no base64 body and no key material.
+#
+# The allowance is a line-content regex *only*: in gitleaks 8.30 a single allowlist
+# entry matches when ANY of its `paths`/`regexes` matches, so adding a path here would
+# silence every finding in those files. A genuine PEM/OpenSSH block (a bare
+# `-----BEGIN ... PRIVATE KEY-----` line followed by base64) never matches an
+# `assert!(...)` line and stays flagged, in any file.
+[[allowlists]]
+description = "Rust assertions on the OpenSSH private-key header/footer text carry no key body"
+regexTarget = "line"
+regexes = ['''^\s*assert(?:_eq|_ne)?!\([^\n]*PRIVATE KEY-----''']

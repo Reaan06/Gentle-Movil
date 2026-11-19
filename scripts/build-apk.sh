@@ -41,7 +41,18 @@ fi
 echo "── 1/3  Rust core (${ABI}) ─────────────────────────────────────────"
 "$ROOT/mobile-core/build-android.sh"
 
-echo "── 2/3  Gradle assembleRelease ─────────────────────────────────────"
+echo "── 2/4  expo prebuild (app.json es la fuente durable) ──────────────"
+# Sin este paso el android/ generado queda viejo y los campos de app.json no
+# llegan al manifest: pasó con `android.allowBackup: false` (el manifest seguía
+# en true). Es idempotente y aplica los config plugins declarados en app.json.
+(cd "$ROOT/mobile" && npx --no-install expo prebuild --platform android --no-install >/dev/null)
+MANIFEST="$ANDROID_DIR/app/src/main/AndroidManifest.xml"
+if ! grep -q 'android:allowBackup="false"' "$MANIFEST"; then
+  echo "error: $MANIFEST no declara android:allowBackup=\"false\"" >&2
+  exit 1
+fi
+
+echo "── 3/4  Gradle assembleRelease ─────────────────────────────────────"
 # --max-workers=1 is not cosmetic: this machine has 7 GB of RAM and the
 # expo-modules-core C++ build (with -flto) gets OOM-killed with more parallel
 # workers, which surfaces as a bare "ninja: build stopped" with no diagnostic.
@@ -49,7 +60,7 @@ echo "── 2/3  Gradle assembleRelease ─────────────
   "-PreactNativeArchitectures=${ABI}" \
   --max-workers=1 --console=plain)
 
-echo "── 3/3  Verifying the native core is inside the APK ────────────────"
+echo "── 4/4  Verifying the native core is inside the APK ────────────────"
 if [ ! -f "$APK" ]; then
   echo "error: APK not found at $APK" >&2
   exit 1
