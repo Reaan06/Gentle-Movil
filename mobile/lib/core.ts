@@ -14,12 +14,26 @@
  * those screens land (V3+). Their byte payloads are standard padded base64 on
  * the ABI, which is what `base64Encode`/`base64Decode` below are for.
  *
+ * ABI v2 (T16/T18) adds the five calls at the end of `MobileCore` —
+ * `deviceKeyEnsure`, `sshConnectWithDeviceKey`, `sshClose`, `fsList`, `fsRead` —
+ * whose implementations live in `modules/gentle-core/src/abi.ts` and are
+ * re-exported below.
+ *
  * ---------------------------------------------------------------------------
  * DEV FALLBACK — `coreStub` below is NOT the real core. It never fakes success:
  * every call rejects with `CoreUnavailableError` so the UI shows its honest
  * "core not compiled" state. The real binding (uniFFI) replaces `core` only.
  * ---------------------------------------------------------------------------
  */
+
+import type {
+  DeviceKeyInfo,
+  FsEntry,
+  FsListInput,
+  FsReadInput,
+  FsReadResult,
+  SshConnectWithDeviceKeyInput,
+} from '../modules/gentle-core/src/abi.ts';
 
 /** Parsed QR payload (`gc://pair?…`, spec §1). */
 export interface PairInfo {
@@ -63,18 +77,7 @@ export interface SshSessionHandle {
   close(): Promise<void>;
 }
 
-/**
- * Phone identity generated on the device (spec §2.1). The private half never
- * leaves Keychain/Keystore, so only the public description crosses the FFI.
- */
-export interface DeviceKeyPair {
-  /** ed25519 public key in OpenSSH wire form (`ssh-ed25519 AAAA…`). */
-  publicKey: string;
-  /** OpenSSH SHA256 fingerprint (`SHA256:…`), shown to the user. */
-  fingerprint: string;
-}
-
-/** The native surface frozen in spec §6 (v1 slice + pivot tunnel channels). */
+/** The native surface frozen in spec §6 (v1 slice + pivot tunnel channels + ABI v2). */
 export interface MobileCore {
   /** Parses a scanned `gc://pair?…` string into a `PairInfo`. */
   pairFromQr(uri: string): Promise<PairInfo>;
@@ -85,8 +88,30 @@ export interface MobileCore {
     user: string,
     cred: SshCredential,
   ): Promise<SshSessionHandle>;
-  /** Creates the device ed25519 key pair in secure storage on first use. */
-  deviceKeyGenerate(): Promise<DeviceKeyPair>;
+  /**
+   * ABI v2: the phone identity, minted **once** and sealed in the Android Keystore.
+   *
+   * Resolves with `{publicHex, fingerprint}` only — the seed never reaches JS. Later calls
+   * re-derive the public half of the persisted key, so the fingerprint stays the same. This
+   * is the **only** way to obtain the identity: the old "mint a key and hand the seed back"
+   * call is gone from the native module, the facade and this stub (SEC-001).
+   */
+  deviceKeyEnsure(): Promise<DeviceKeyInfo>;
+  /**
+   * ABI v2: reconnect with the stored device key, **pinned** to the host key that was
+   * paired. A key-only connect without `expectedFingerprint` is refused, never TOFU'd.
+   */
+  sshConnectWithDeviceKey(input: SshConnectWithDeviceKeyInput): Promise<{ sessionId: string }>;
+  /** ABI v2: disconnect the session and free its id and channels (`sessionClose`). */
+  sshClose(sessionId: string): Promise<{ closed: boolean }>;
+  /**
+   * ABI v2: one level of the phone's own files, paths relative to `root`. The root is not
+   * free: the native allowlist (`FsRoots.kt`: `filesDir`, `cacheDir`) decides which roots
+   * exist for the app, and a root outside it is refused with the real root named (SEC-003).
+   */
+  fsList(input: FsListInput): Promise<{ entries: FsEntry[] }>;
+  /** ABI v2: one file as UTF-8 text, with its real size and truncation flag. */
+  fsRead(input: FsReadInput): Promise<FsReadResult>;
   /** Verifies a signature (release checksum, spec §3.2) against a public key. */
   cryptoVerify(
     pubkey: string,
@@ -158,8 +183,21 @@ const coreStub: CoreStub = {
     stubState = 'connecting';
     throw new CoreUnavailableError('sshConnect');
   },
-  async deviceKeyGenerate() {
-    throw new CoreUnavailableError('deviceKeyGenerate');
+  async deviceKeyEnsure() {
+    throw new CoreUnavailableError('deviceKeyEnsure');
+  },
+  async sshConnectWithDeviceKey() {
+    stubState = 'connecting';
+    throw new CoreUnavailableError('sshConnectWithDeviceKey');
+  },
+  async sshClose() {
+    throw new CoreUnavailableError('sshClose');
+  },
+  async fsList() {
+    throw new CoreUnavailableError('fsList');
+  },
+  async fsRead() {
+    throw new CoreUnavailableError('fsRead');
   },
   async cryptoVerify() {
     throw new CoreUnavailableError('cryptoVerify');
@@ -344,3 +382,37 @@ export function utf8Decode(bytes: Uint8Array): string {
  * (typed as `MobileCore`), never the stub.
  */
 export const core: MobileCore = coreStub;
+
+/* ------------------------------------------------------------------ *
+ * Frozen ABI v2 TS contract (T16/T18)
+ *
+ * These are the functions the Rust/Kotlin slice implements. They live in
+ * `mobile/modules/gentle-core/src/abi.ts` (pure, no `expo-modules-core`) so this file can
+ * re-export them for the app without breaking node tests, and so `index.ts` can bind them
+ * to the Kotlin module. `mobile/test/core-abi.test.mjs` covers them with a fake bridge.
+ *
+ * Honest failure: with no native core bound every one of them throws a `CoreCallError`
+ * with kind `CoreUnavailable` — never a fabricated value.
+ * ------------------------------------------------------------------ */
+
+export {
+  CoreCallError,
+  bindCoreNativeBridge,
+  compactFingerprint,
+  coreNativeBridgeBound,
+  deviceKeyEnsure,
+  fsList,
+  fsRead,
+  parseEnvelope,
+  sshClose,
+  sshConnectWithDeviceKey,
+} from '../modules/gentle-core/src/abi.ts';
+export type {
+  CoreNativeBridge,
+  DeviceKeyInfo,
+  FsEntry,
+  FsListInput,
+  FsReadInput,
+  FsReadResult,
+  SshConnectWithDeviceKeyInput,
+} from '../modules/gentle-core/src/abi.ts';

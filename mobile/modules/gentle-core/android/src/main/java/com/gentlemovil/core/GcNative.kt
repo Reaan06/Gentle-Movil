@@ -44,6 +44,50 @@ internal object GcNative {
   /** `char* gc_ssh_connect(const char* json)` — opens the SSH session. */
   external fun gcSshConnect(json: String): String?
 
+  /**
+   * `char* gc_ssh_connect_seed(const char* json)` — reconnect with the device key.
+   *
+   * Document: `{"host","port","user","seed":[..32 bytes..],"expectedFp"}`. The core
+   * builds the `SshCredential::Key` itself and **requires** `expectedFp`: a key-only
+   * connection without a pinned host key is refused, never trusted on first use.
+   */
+  external fun gcSshConnectSeed(json: String): String?
+
+  /**
+   * `char* gc_ssh_close(const char* json)` — disconnect a session and free its handle.
+   *
+   * Document: `{"sessionId":N}`. Answers `{"ok":true,"result":{"closed":true}}`; a
+   * second close is the honest `ssh: unknown session id N` error.
+   */
+  external fun gcSshClose(json: String): String?
+
+  /**
+   * `char* gc_device_key_public(const char* json)` — public half of a sealed seed.
+   *
+   * Document: `{"seed":[..32 bytes..]}`. Answers
+   * `{"ok":true,"result":{"publicHex","fingerprint"}}` and never the seed back.
+   */
+  external fun gcDeviceKeyPublic(json: String): String?
+
+  /**
+   * `char* gc_fs_list(const char* json)` — one level of device files.
+   *
+   * Document: `{"root":"<absolute dir>","path":"<rel>","maxEntries":N}`. Answers
+   * `{"ok":true,"result":{"entries":[{path,size,kind}],"truncated":bool}}` with paths
+   * relative to `root`, or a typed `not_found` / `permission_denied` / `invalid_path` /
+   * `outside_root` error.
+   */
+  external fun gcFsList(json: String): String?
+
+  /**
+   * `char* gc_fs_read(const char* json)` — one device file as text.
+   *
+   * Document: `{"root":"<absolute dir>","path":"<rel>","maxBytes":N}`. Answers
+   * `{"ok":true,"result":{"path","text","size","truncated"}}`, or a typed `binary` /
+   * `too_large` / `not_found` error. Content is never lossy-decoded.
+   */
+  external fun gcFsRead(json: String): String?
+
   /** `char* gc_provision_step(const char* json)` — one daemon-provisioning step. */
   external fun gcProvisionStep(json: String): String?
 

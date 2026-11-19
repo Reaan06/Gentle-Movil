@@ -167,7 +167,84 @@ pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshConnect(
     _class: JClass,
     json: JString,
 ) -> jstring {
-    call_one_string(&mut env, &json, |config| crate::cabi::gc_ssh_connect(config))
+    call_one_string(&mut env, &json, |config| {
+        crate::cabi::gc_ssh_connect(config)
+    })
+}
+
+/// Reconnects with the device key and a **pinned** host key:
+/// `{"host","port","user","seed":[..],"expectedFp"}` → the connect envelope.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshConnectSeed(
+    mut env: JNIEnv,
+    _class: JClass,
+    json: JString,
+) -> jstring {
+    call_one_string(&mut env, &json, |config| {
+        crate::cabi::gc_ssh_connect_seed(config)
+    })
+}
+
+/// Derives the public half of a keystore-sealed seed:
+/// `{"seed":[..32 bytes]} → {"ok":true,"result":{"publicHex","fingerprint"}}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcDeviceKeyPublic(
+    mut env: JNIEnv,
+    _class: JClass,
+    json: JString,
+) -> jstring {
+    call_one_string(&mut env, &json, |payload| {
+        crate::cabi::gc_device_key_public(payload)
+    })
+}
+
+/// Lists one level of device files: `{"root","path","maxEntries"}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcFsList(
+    mut env: JNIEnv,
+    _class: JClass,
+    json: JString,
+) -> jstring {
+    call_one_string(&mut env, &json, |payload| crate::cabi::gc_fs_list(payload))
+}
+
+/// Reads a device file as text: `{"root","path","maxBytes"}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcFsRead(
+    mut env: JNIEnv,
+    _class: JClass,
+    json: JString,
+) -> jstring {
+    call_one_string(&mut env, &json, |payload| crate::cabi::gc_fs_read(payload))
+}
+
+/// Shared body of the session-handle shims: split the document, call the C ABI under
+/// `catch_unwind`, marshal the answer back. Kotlin has no `u64` rule of its own, so the
+/// handle rides inside the JSON document exactly like the channel shims.
+fn session_shim(env: &mut JNIEnv, json: JString, call: impl FnOnce(u64) -> *mut c_char) -> jstring {
+    let input = match from_jstring(env, &json) {
+        Ok(input) => input,
+        Err(reason) => return refuse_input(env, &reason),
+    };
+    let raw = match crate::cabi::split_session_document(&input) {
+        Ok(session_id) => {
+            catch_unwind(AssertUnwindSafe(|| call(session_id))).unwrap_or_else(|_| panic_envelope())
+        }
+        Err(error) => input_envelope(&error.message),
+    };
+    pointer_to_jstring(env, raw)
+}
+
+/// `gc_ssh_close(session_id)` from one Kotlin document `{"sessionId":N}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcSshClose(
+    mut env: JNIEnv,
+    _class: JClass,
+    json: JString,
+) -> jstring {
+    session_shim(&mut env, json, |session_id| {
+        crate::cabi::gc_ssh_close(session_id)
+    })
 }
 
 /// Error envelope for a channel document the split rejects (`input`, like the C ABI's own
@@ -276,8 +353,10 @@ pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcProvisionStep(
             }
             let step_json = value.to_string();
             match CString::new(step_json) {
-                Ok(step) => catch_unwind(AssertUnwindSafe(|| crate::cabi::gc_provision_step(session_id, step.as_ptr())))
-                    .unwrap_or_else(|_| panic_envelope()),
+                Ok(step) => catch_unwind(AssertUnwindSafe(|| {
+                    crate::cabi::gc_provision_step(session_id, step.as_ptr())
+                }))
+                .unwrap_or_else(|_| panic_envelope()),
                 Err(_) => panic_envelope(),
             }
         }
@@ -294,7 +373,8 @@ pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcDeviceKeyGenerate(
     _class: JClass,
     _json: JString,
 ) -> jstring {
-    let raw = catch_unwind(AssertUnwindSafe(|| crate::cabi::gc_device_key_generate())).unwrap_or_else(|_| panic_envelope());
+    let raw = catch_unwind(AssertUnwindSafe(|| crate::cabi::gc_device_key_generate()))
+        .unwrap_or_else(|_| panic_envelope());
     pointer_to_jstring(&mut env, raw)
 }
 
@@ -303,7 +383,7 @@ pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcDeviceKeyGenerate(
 pub extern "system" fn Java_com_gentlemovil_core_GcNative_gcFree(
     _env: JNIEnv,
     _class: JClass,
-    pointer: jlong,
+    _pointer: jlong,
 ) {
     // The shim already frees after each call; gcFree stays a no-op for API
     // compatibility with the Kotlin contract, accepting any value.

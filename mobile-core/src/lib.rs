@@ -44,6 +44,7 @@ pub mod device_key;
 pub mod error;
 pub mod ffi;
 pub mod fingerprint;
+pub mod fs;
 #[cfg(all(target_os = "android", feature = "jni-shim"))]
 pub mod jni_shim;
 pub mod provision;
@@ -53,6 +54,7 @@ pub mod ssh;
 pub use device_key::{DeviceKeyPair, StoredKey};
 pub use error::CoreError;
 pub use ffi::{ChannelId, CoreErrorPayload, MobileCore, SessionId};
+pub use fs::{FsEntry, FsKind, FsListing, FsRead};
 pub use provision::{
     detect_host, register_device, rollback, start_daemon, upload_daemon, verify_manifest,
     verify_release_signature, HostInfo, Registration, ReleaseManifest, RollbackResult, StartResult,

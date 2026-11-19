@@ -158,7 +158,9 @@ fn record_verification(digest: &str) -> Result<(), CoreError> {
 
 /// The §3.2 gate: refuse a path whose uploaded bytes this process never verified.
 fn require_verified(remote_path: &str) -> Result<(), CoreError> {
-    let entry = lock_registry()?.get(remote_path).map(|entry| entry.verified);
+    let entry = lock_registry()?
+        .get(remote_path)
+        .map(|entry| entry.verified);
     if entry == Some(true) {
         return Ok(());
     }
@@ -589,24 +591,23 @@ pub async fn start_daemon_with_timeout(
             return Err(start_failure(session, pid, port, timeout, &last_error).await);
         }
         // The open is bounded by the remaining window so a stalled host cannot stretch it.
-        let pause = match tokio::time::timeout(remaining, session.direct_tcp("127.0.0.1", port))
-            .await
-        {
-            Ok(Ok(channel)) => {
-                let _ = channel.close().await;
-                return Ok(StartResult { pid, port });
-            }
-            Ok(Err(error)) => {
-                last_error = error.to_string();
-                // Recompute instead of reusing the pre-await value, which is now stale.
-                timeout.saturating_sub(started.elapsed())
-            }
-            // The open consumed the whole window: the timeout is now, so never sleep again.
-            Err(_) => {
-                last_error = "the channel open never completed".to_string();
-                return Err(start_failure(session, pid, port, timeout, &last_error).await);
-            }
-        };
+        let pause =
+            match tokio::time::timeout(remaining, session.direct_tcp("127.0.0.1", port)).await {
+                Ok(Ok(channel)) => {
+                    let _ = channel.close().await;
+                    return Ok(StartResult { pid, port });
+                }
+                Ok(Err(error)) => {
+                    last_error = error.to_string();
+                    // Recompute instead of reusing the pre-await value, which is now stale.
+                    timeout.saturating_sub(started.elapsed())
+                }
+                // The open consumed the whole window: the timeout is now, so never sleep again.
+                Err(_) => {
+                    last_error = "the channel open never completed".to_string();
+                    return Err(start_failure(session, pid, port, timeout, &last_error).await);
+                }
+            };
         tokio::time::sleep(START_PROBE_INTERVAL.min(pause)).await;
     }
 }
@@ -616,7 +617,11 @@ pub async fn start_daemon_with_timeout(
 /// §5: a kill that cannot land, stalls or leaves the pid running is named in the message
 /// rather than hidden or turned into a panic (S7).
 async fn start_failure(
-    session: &SshSession, pid: u32, port: u16, timeout: Duration, reason: &str,
+    session: &SshSession,
+    pid: u32,
+    port: u16,
+    timeout: Duration,
+    reason: &str,
 ) -> CoreError {
     let outcome = terminate(session, pid).await;
     CoreError::ssh(format!(
@@ -670,7 +675,9 @@ async fn terminate(session: &SshSession, pid: u32) -> String {
 
 /// Run one `exec` inside the shared termination budget, so a stalled host cannot hang §5.
 async fn bounded_exec(
-    session: &SshSession, script: &str, deadline: std::time::Instant,
+    session: &SshSession,
+    script: &str,
+    deadline: std::time::Instant,
 ) -> Result<ExecOutput, CoreError> {
     let command = posix(script);
     let remaining = deadline.saturating_duration_since(std::time::Instant::now());

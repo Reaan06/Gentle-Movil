@@ -22,15 +22,20 @@
 //! | `deviceKeyGenerate() -> PublicKey` | [`MobileCore::device_key_generate`] |
 //! | `deviceKeyPublic() -> PublicKey` | [`MobileCore::device_key_public`] |
 //! | `cryptoVerify(releasePubkey, payload, signature) -> bool` | [`MobileCore::crypto_verify`] |
+//! | `sessionClose(sessionId)` | [`MobileCore::session_close`] |
+//! | `sshConnect` with the device key + a pinned host key | [`MobileCore::ssh_connect_seed`] |
+//! | `fsList(root, path, maxEntries)` | [`crate::fs::list`] |
+//! | `fsRead(root, path, maxBytes)` | [`crate::fs::read_text`] |
 //!
 //! ## Deferred, on purpose
 //!
 //! * `sftpPut` belongs to the daemon-provisioning task (T7) — it needs a real SFTP client
 //!   implementation, not a stub.
 //! * `sqliteOpen`/`openStore` belongs to the local-mode store task (T9).
-//! * §6 has **no teardown** call, so sessions live as long as the [`MobileCore`] value and
-//!   a channel lives until [`MobileCore::channel_close`] (added with the tunnel client) or
-//!   the end of the process; see `risks` in the task report.
+//! * §6 has **no teardown** call; [`MobileCore::session_close`] / `channelClose` fill that
+//!   hole (the spec text was amended, and the registry really does release the handles) and
+//!   a channel lives until [`MobileCore::channel_close`], its session closing, or the end of
+//!   the process. Before T16 nothing removed a session from the map: that leak is closed.
 //! * [`MobileCore::session_fingerprint`] / [`MobileCore::session_fingerprint_compact`] are
 //!   additive read-only accessors: §8 requires the host key fingerprint to be visible and
 //!   confirmable before the user trusts the host, and §6 forgot a way to read it.
@@ -44,10 +49,14 @@
 //!
 //! [`MobileCore::device_key_generate`] returns the full [`DeviceKeyPair`] because the
 //! **native** shell (Swift/Kotlin) is the only layer allowed to write the platform
-//! keystore. The TypeScript layer must receive `public_hex` only: `secret` is the device
-//! identity (§0.2, §2) and must never cross into the JS runtime or a log. Later sessions
-//! hand the seed back through [`MobileCore::device_key_public`] /
-//! [`crate::ssh::SshCredential::Key`] after reading it from the keystore.
+//! keystore: the Kotlin module seals `secret_seed` with an AndroidKeyStore AES/GCM key and
+//! persists only the ciphertext, so a later call re-derives the same public key instead of
+//! minting a second identity. The TypeScript layer must receive `public_hex` only:
+//! `secret` is the device identity (§0.2, §2) and must never cross into the JS runtime or
+//! a log. Later sessions hand the seed back through [`MobileCore::device_key_public`] /
+//! [`MobileCore::ssh_connect_seed`], and that second one **requires** the pinned host key:
+//! a key-only connection that silently trusted a new host key would be a man-in-the-middle
+//! window on every reconnect.
 //!
 //! ## Errors
 //!
@@ -121,9 +130,29 @@ pub struct ChannelRead {
 pub struct MobileCore {
     transport: Arc<dyn Transport>,
     sessions: Mutex<HashMap<SessionId, Arc<SshSession>>>,
-    channels: Mutex<HashMap<ChannelId, Arc<Channel>>>,
+    channels: Mutex<HashMap<ChannelId, RegisteredChannel>>,
     next_session_id: AtomicU64,
     next_channel_id: AtomicU64,
+    connect_timeout: Duration,
+}
+
+/// How long the whole SSH handshake may take before it is abandoned (SEC-010).
+///
+/// A peer that accepts the TCP connection and then never answers used to hold the caller
+/// forever; because Expo drives this crate from a single `AsyncFunction` thread, one stalled
+/// host wedged the whole bridge. The handshake is therefore bounded: past this window the
+/// future is dropped (which closes the socket) and the call answers a typed `ssh` error
+/// naming the target and the window.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A live channel together with the session that opened it.
+///
+/// The owning session id is what lets [`MobileCore::session_close`] take the session's
+/// channels with it: a channel whose session is gone can never be read or written again,
+/// so keeping the handle registered would be a leak the app cannot even clean up.
+struct RegisteredChannel {
+    session_id: SessionId,
+    channel: Arc<Channel>,
 }
 
 impl MobileCore {
@@ -134,12 +163,24 @@ impl MobileCore {
 
     /// Facade over a caller-provided transport (the offline test seam).
     pub fn with_transport(transport: Arc<dyn Transport>) -> Self {
+        Self::with_transport_and_connect_timeout(transport, CONNECT_TIMEOUT)
+    }
+
+    /// Facade over a caller-provided transport with an explicit handshake window.
+    ///
+    /// Exists so a test can pin the bounded handshake without waiting [`CONNECT_TIMEOUT`];
+    /// production always uses [`MobileCore::with_transport`].
+    pub fn with_transport_and_connect_timeout(
+        transport: Arc<dyn Transport>,
+        connect_timeout: Duration,
+    ) -> Self {
         Self {
             transport,
             sessions: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
             next_session_id: AtomicU64::new(1),
             next_channel_id: AtomicU64::new(1),
+            connect_timeout,
         }
     }
 
@@ -149,6 +190,11 @@ impl MobileCore {
     }
 
     /// `sshConnect`: open an authenticated session and register it under a fresh id.
+    ///
+    /// A **key** credential is refused here: without a pinned host fingerprint a key-only
+    /// connect is trust-on-first-use, which would let anyone answering on that address
+    /// receive the app's traffic. The pinned path ([`Self::ssh_connect_pinned`] /
+    /// [`Self::ssh_connect_seed`]) is the only way to authenticate with a key.
     pub async fn ssh_connect(
         &self,
         host: String,
@@ -156,10 +202,76 @@ impl MobileCore {
         user: String,
         credential: SshCredential,
     ) -> Result<SessionId, CoreErrorPayload> {
+        if matches!(credential, SshCredential::Key { .. }) {
+            return Err(CoreErrorPayload::from(CoreError::ssh(
+                "a key-only connect must pin the host fingerprint; use gc_ssh_connect_seed (or expectedFp) instead of trusting the first key presented",
+            )));
+        }
         let request = ConnectRequest::new(&host, port, &user, credential);
-        let session = SshSession::connect_with(self.transport.as_ref(), request)
+        self.open_session(request).await
+    }
+
+    /// `sshConnect` with a **pinned** host key: every later, already-paired connection.
+    ///
+    /// A different host key aborts the handshake: no session is registered, and the
+    /// observed key is never trusted on first use a second time.
+    pub async fn ssh_connect_pinned(
+        &self,
+        host: String,
+        port: u16,
+        user: String,
+        credential: SshCredential,
+        expected_fingerprint: String,
+    ) -> Result<SessionId, CoreErrorPayload> {
+        let expected_fingerprint = usable_pin(&expected_fingerprint)?;
+        let request =
+            ConnectRequest::new(&host, port, &user, credential).pinned(&expected_fingerprint);
+        self.open_session(request).await
+    }
+
+    /// `gc_ssh_connect_seed`: authenticate with the **device key** derived from `seed`,
+    /// pinned to `expected_fingerprint`.
+    ///
+    /// The credential is built here, so the seed never has to become an
+    /// [`SshCredential`] in JS: a key-only connection cannot be opened without a pin
+    /// either, which is exactly the defect this closes (the pre-T16 `ssh_connect` always
+    /// used trust-on-first-use, even for a key).
+    pub async fn ssh_connect_seed(
+        &self,
+        host: String,
+        port: u16,
+        user: String,
+        seed: StoredKey,
+        expected_fingerprint: String,
+    ) -> Result<SessionId, CoreErrorPayload> {
+        let private = device_key::private_key_openssh(&seed).map_err(CoreErrorPayload::from)?;
+        let credential = SshCredential::Key {
+            private: private.into_bytes(),
+            passphrase: None,
+        };
+        self.ssh_connect_pinned(host, port, user, credential, expected_fingerprint)
             .await
-            .map_err(CoreErrorPayload::from)?;
+    }
+
+    /// Open one session and register it, whatever the credential or policy was.
+    ///
+    /// The **whole handshake is bounded** (SEC-010): a peer that accepts the TCP connection
+    /// and then never answers used to hold this future — and therefore Expo's single native
+    /// queue — forever. Past [`MobileCore::connect_timeout`] the attempt is abandoned (which
+    /// drops the partially opened transport, closing its socket) and the answer is a typed
+    /// `ssh` error naming the target and the window.
+    async fn open_session(&self, request: ConnectRequest) -> Result<SessionId, CoreErrorPayload> {
+        let target = format!("{}:{}", request.host, request.port);
+        let attempt = SshSession::connect_with(self.transport.as_ref(), request);
+        let session = match tokio::time::timeout(self.connect_timeout, attempt).await {
+            Ok(result) => result.map_err(CoreErrorPayload::from)?,
+            Err(_) => {
+                return Err(CoreErrorPayload::from(CoreError::ssh(format!(
+                    "the handshake with {target} did not complete within {} ms; the host did not answer (kept the native queue free)",
+                    self.connect_timeout.as_millis()
+                ))))
+            }
+        };
         let session_id = next_id(&self.next_session_id);
         lock(&self.sessions).insert(session_id, Arc::new(session));
         Ok(session_id)
@@ -178,7 +290,13 @@ impl MobileCore {
             .await
             .map_err(CoreErrorPayload::from)?;
         let channel_id = next_id(&self.next_channel_id);
-        lock(&self.channels).insert(channel_id, Arc::new(channel));
+        lock(&self.channels).insert(
+            channel_id,
+            RegisteredChannel {
+                session_id,
+                channel: Arc::new(channel),
+            },
+        );
         Ok(channel_id)
     }
 
@@ -206,10 +324,7 @@ impl MobileCore {
         bytes: Vec<u8>,
     ) -> Result<(), CoreErrorPayload> {
         let channel = self.channel(channel_id)?;
-        channel
-            .write(&bytes)
-            .await
-            .map_err(CoreErrorPayload::from)
+        channel.write(&bytes).await.map_err(CoreErrorPayload::from)
     }
 
     /// `channelReadWithTimeout`: read the next frame, waiting at most `timeout`.
@@ -236,10 +351,7 @@ impl MobileCore {
                 eof: false,
             }),
             Ok(Err(error)) => Err(CoreErrorPayload::from(error)),
-            Ok(Ok(ChannelEvent::Data(bytes))) => Ok(ChannelRead {
-                bytes,
-                eof: false,
-            }),
+            Ok(Ok(ChannelEvent::Data(bytes))) => Ok(ChannelRead { bytes, eof: false }),
             Ok(Ok(ChannelEvent::Eof)) => Ok(ChannelRead {
                 bytes: Vec::new(),
                 eof: true,
@@ -260,7 +372,64 @@ impl MobileCore {
     pub async fn channel_close(&self, channel_id: ChannelId) -> Result<(), CoreErrorPayload> {
         let channel = lock(&self.channels).remove(&channel_id);
         let channel = channel.ok_or_else(|| CoreErrorPayload::from(unknown_channel(channel_id)))?;
-        channel.close().await.map_err(CoreErrorPayload::from)
+        channel
+            .channel
+            .close()
+            .await
+            .map_err(CoreErrorPayload::from)
+    }
+
+    /// `sessionClose`: disconnect the session and free its id and its channels.
+    ///
+    /// The handle is removed **before** the disconnect is awaited, so the id is stale from
+    /// that moment on: a second close (or any later call naming it) answers the
+    /// unknown-session error instead of touching a dead session. Every channel the session
+    /// opened is dropped with it — a channel of a closed session can never carry bytes
+    /// again, and leaving it in the registry is the leak this closes.
+    ///
+    /// `Ok` means the transport **really** let go (SEC-012): the disconnect is awaited and
+    /// then the transport is asked whether it still holds the connection. A transport that
+    /// says it is still connected gets a typed `ssh` failure, so `closed: true` is never
+    /// reported for a teardown that did not happen. The handle is gone either way.
+    pub async fn session_close(&self, session_id: SessionId) -> Result<(), CoreErrorPayload> {
+        let session = lock(&self.sessions).remove(&session_id);
+        let session = session.ok_or_else(|| CoreErrorPayload::from(unknown_session(session_id)))?;
+
+        let orphaned: Vec<Arc<Channel>> = {
+            let mut channels = lock(&self.channels);
+            let ids: Vec<ChannelId> = channels
+                .iter()
+                .filter(|(_, registered)| registered.session_id == session_id)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| channels.remove(&id).map(|registered| registered.channel))
+                .collect()
+        };
+        for channel in orphaned {
+            // The session is already being torn down: a channel that fails to close must
+            // never keep its id registered or hide the session-level answer below.
+            let _ = channel.close().await;
+        }
+
+        session.disconnect().await.map_err(CoreErrorPayload::from)?;
+
+        if session.is_connected() == Some(true) {
+            return Err(CoreErrorPayload::from(CoreError::ssh(format!(
+                "session {session_id} was removed but the transport still reports an open connection: the teardown did not reach the host"
+            ))));
+        }
+        Ok(())
+    }
+
+    /// Number of live sessions (diagnostics; the registry itself is private).
+    pub fn session_count(&self) -> usize {
+        lock(&self.sessions).len()
+    }
+
+    /// Number of live channels (diagnostics; the registry itself is private).
+    pub fn channel_count(&self) -> usize {
+        lock(&self.channels).len()
     }
 
     /// `execOnce`: run one command and collect its result (daemon detection, `uname -m`,
@@ -297,7 +466,8 @@ impl MobileCore {
     /// `deviceKeyGenerate`: create the phone's ed25519 identity (§2.1).
     ///
     /// Returns both halves because the native shell is the keystore writer; the TS layer
-    /// must only ever see [`DeviceKeyPair::public_hex`].
+    /// must only ever see [`DeviceKeyPair::public_hex`]. The seed is held by a value that
+    /// wipes itself on drop, so this is the only place it ever exists in memory here.
     pub fn device_key_generate(&self) -> DeviceKeyPair {
         device_key::generate()
     }
@@ -326,19 +496,20 @@ impl MobileCore {
     /// `pub(crate)` because [`crate::cabi`] reuses this registry as the single source of
     /// live sessions: the C ABI hands out the same [`SessionId`] values, so the two
     /// surfaces can never disagree about which session an id names.
-    pub(crate) fn session(&self, session_id: SessionId) -> Result<Arc<SshSession>, CoreErrorPayload> {
+    pub(crate) fn session(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Arc<SshSession>, CoreErrorPayload> {
         match lock(&self.sessions).get(&session_id) {
             Some(session) => Ok(Arc::clone(session)),
-            None => Err(CoreErrorPayload::from(CoreError::ssh(format!(
-                "unknown session id {session_id}"
-            )))),
+            None => Err(CoreErrorPayload::from(unknown_session(session_id))),
         }
     }
 
     /// Look up a live channel, or fail with an `ssh` error naming the unknown id.
     fn channel(&self, channel_id: ChannelId) -> Result<Arc<Channel>, CoreErrorPayload> {
         match lock(&self.channels).get(&channel_id) {
-            Some(channel) => Ok(Arc::clone(channel)),
+            Some(registered) => Ok(Arc::clone(&registered.channel)),
             None => Err(CoreErrorPayload::from(unknown_channel(channel_id))),
         }
     }
@@ -347,6 +518,23 @@ impl MobileCore {
 /// The `ssh` error for a channel id this process does not hold (§7: named, never a panic).
 fn unknown_channel(channel_id: ChannelId) -> CoreError {
     CoreError::ssh(format!("unknown channel id {channel_id}"))
+}
+
+/// The `ssh` error for a session id this process does not hold.
+fn unknown_session(session_id: SessionId) -> CoreError {
+    CoreError::ssh(format!("unknown session id {session_id}"))
+}
+
+/// Normalize a pinned host fingerprint, or refuse a value no handshake could match.
+///
+/// An unusable pin must fail loudly: accepting it would either reject every host or (worse,
+/// if it were passed through unchecked) accept any host.
+fn usable_pin(expected_fingerprint: &str) -> Result<String, CoreErrorPayload> {
+    crate::fingerprint::normalize(expected_fingerprint).ok_or_else(|| {
+        CoreErrorPayload::from(CoreError::ssh(format!(
+            "the pinned host fingerprint is not a SHA-256 fingerprint: {expected_fingerprint:?}"
+        )))
+    })
 }
 
 impl Default for MobileCore {
@@ -382,8 +570,14 @@ mod tests {
     use super::*;
     use crate::qr::DEFAULT_PORT;
     use crate::ssh::mock::{MockTransport, FP};
+    use crate::ssh::{BoxFuture, TransportChannel, TransportSession};
 
     fn core() -> (MobileCore, Arc<MockTransport>) {
+        core_fixture()
+    }
+
+    /// The mock-backed facade under a name that reads better inside a mixed test.
+    fn core_fixture() -> (MobileCore, Arc<MockTransport>) {
         let transport = Arc::new(MockTransport::default());
         (
             MobileCore::with_transport(Arc::clone(&transport) as Arc<dyn Transport>),
@@ -426,19 +620,21 @@ mod tests {
     #[test]
     fn pair_from_qr_maps_invalid_uris_to_an_invalid_qr_payload() {
         let (core, _) = core();
-        let payload = core.pair_from_qr("gc://pair?v=1&host=&user=u&token=t".to_string())
+        let payload = core
+            .pair_from_qr("gc://pair?v=1&host=&user=u&token=t".to_string())
             .expect_err("must fail");
         assert_eq!(payload.kind, "invalid_qr");
-        assert_eq!(payload.message, "invalid pairing QR: host must not be empty");
+        assert_eq!(
+            payload.message,
+            "invalid pairing QR: host must not be empty"
+        );
     }
 
     #[test]
     fn pair_from_qr_maps_unknown_versions_to_an_unsupported_version_payload() {
         let (core, _) = core();
         let payload = core
-            .pair_from_qr(format!(
-                "gc://pair?v=9&host=h&user=u&token=t&fp={FP_HEX}"
-            ))
+            .pair_from_qr(format!("gc://pair?v=9&host=h&user=u&token=t&fp={FP_HEX}"))
             .expect_err("must fail");
         assert_eq!(payload.kind, "unsupported_version");
         assert_eq!(
@@ -493,7 +689,10 @@ mod tests {
             .await
             .expect_err("must fail");
         assert_eq!(payload.kind, "ssh");
-        assert!(payload.message.contains("authentication rejected"), "{payload}");
+        assert!(
+            payload.message.contains("authentication rejected"),
+            "{payload}"
+        );
     }
 
     #[tokio::test]
@@ -514,11 +713,17 @@ mod tests {
             .expect("channel");
         assert_eq!(channel, 1);
         // The mock has nothing queued, so the first read is EOF => empty Vec.
-        assert_eq!(core.channel_read(channel).await.expect("read"), Vec::<u8>::new());
+        assert_eq!(
+            core.channel_read(channel).await.expect("read"),
+            Vec::<u8>::new()
+        );
         core.channel_write(channel, b"GET /device/ws".to_vec())
             .await
             .expect("write");
-        assert_eq!(core.channel_read(channel).await.expect("read"), Vec::<u8>::new());
+        assert_eq!(
+            core.channel_read(channel).await.expect("read"),
+            Vec::<u8>::new()
+        );
     }
 
     #[tokio::test]
@@ -548,10 +753,7 @@ mod tests {
         assert_eq!(session.kind, "ssh");
         assert_eq!(session.message, "ssh: unknown session id 42");
 
-        let channel = core
-            .channel_read(7)
-            .await
-            .expect_err("unknown channel");
+        let channel = core.channel_read(7).await.expect_err("unknown channel");
         assert_eq!(channel.kind, "ssh");
         assert_eq!(channel.message, "ssh: unknown channel id 7");
     }
@@ -561,10 +763,14 @@ mod tests {
         let (core, _) = core();
         let pair = core.device_key_generate();
         assert_eq!(pair.public_hex.len(), 64);
-        assert_eq!(
-            core.device_key_public(pair.secret.clone()).expect("derivable"),
-            pair.public_hex
-        );
+        // `StoredKey` is not `Clone` (the seed has no copies), so the check moves a value
+        // built from the borrowed bytes instead.
+        let derived = core
+            .device_key_public(StoredKey {
+                secret_seed: pair.secret.expose_seed().to_vec(),
+            })
+            .expect("derivable");
+        assert_eq!(derived, pair.public_hex);
         assert_eq!(
             core.device_key_public(StoredKey {
                 secret_seed: vec![0, 1]
@@ -609,9 +815,7 @@ mod tests {
         struct StderrChannel;
 
         impl crate::ssh::TransportChannel for StderrChannel {
-            fn read<'a>(
-                &'a self,
-            ) -> crate::ssh::BoxFuture<'a, Result<ChannelEvent, CoreError>> {
+            fn read<'a>(&'a self) -> crate::ssh::BoxFuture<'a, Result<ChannelEvent, CoreError>> {
                 Box::pin(async {
                     Ok(ChannelEvent::ExtendedData {
                         ext: 1,
@@ -658,7 +862,9 @@ mod tests {
                 _target_port: u16,
             ) -> crate::ssh::BoxFuture<'a, Result<Box<dyn crate::ssh::TransportChannel>, CoreError>>
             {
-                Box::pin(async { Ok(Box::new(StderrChannel) as Box<dyn crate::ssh::TransportChannel>) })
+                Box::pin(async {
+                    Ok(Box::new(StderrChannel) as Box<dyn crate::ssh::TransportChannel>)
+                })
             }
         }
 
@@ -670,7 +876,9 @@ mod tests {
                 _request: &'a ConnectRequest,
             ) -> crate::ssh::BoxFuture<'a, Result<Box<dyn crate::ssh::TransportSession>, CoreError>>
             {
-                Box::pin(async { Ok(Box::new(StderrSession) as Box<dyn crate::ssh::TransportSession>) })
+                Box::pin(async {
+                    Ok(Box::new(StderrSession) as Box<dyn crate::ssh::TransportSession>)
+                })
             }
         }
 
@@ -691,5 +899,404 @@ mod tests {
         let payload = core.channel_read(channel).await.expect_err("must fail");
         assert_eq!(payload.kind, "ssh");
         assert!(payload.message.contains("extended data"), "{payload}");
+    }
+
+    // ----------------------------------------------------------------------
+    // Device-key reconnect and teardown (T16)
+    // ----------------------------------------------------------------------
+
+    fn seed_pair() -> DeviceKeyPair {
+        device_key::generate()
+    }
+
+    /// A fresh `StoredKey` for the pair's seed: the holder is deliberately not `Clone`.
+    fn seed_copy(pair: &DeviceKeyPair) -> StoredKey {
+        StoredKey {
+            secret_seed: pair.secret.expose_seed().to_vec(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ssh_connect_seed_authenticates_with_the_device_key_and_requires_the_pin() {
+        let (core, transport) = core();
+        let pair = seed_pair();
+
+        let session = core
+            .ssh_connect_seed(
+                "10.0.0.5".to_string(),
+                2222,
+                "reaan".to_string(),
+                seed_copy(&pair),
+                FP.to_string(),
+            )
+            .await
+            .expect("pinned key session");
+        assert_eq!(session, 1);
+        assert_eq!(
+            core.session_fingerprint_compact(session).expect("known"),
+            FP
+        );
+
+        let request = transport.last_request().expect("request");
+        // The credential really is the device key, in the frozen `key` encoding.
+        match &request.credential {
+            SshCredential::Key {
+                private,
+                passphrase,
+            } => {
+                assert_eq!(*passphrase, None);
+                let text = String::from_utf8(private.clone()).expect("openssh text");
+                assert!(
+                    text.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"),
+                    "{text}"
+                );
+                let seed = seed_copy(&pair);
+                assert_eq!(
+                    device_key::public_key_openssh(&seed).expect("public"),
+                    russh::keys::decode_secret_key(&text, None)
+                        .expect("decodable")
+                        .public_key()
+                        .to_openssh()
+                        .expect("encodable")
+                );
+            }
+            other => panic!("the seeded connect must use the device key, got {other:?}"),
+        }
+        // The pin travelled with the request, so the handshake enforces it.
+        assert_eq!(request.expected_fingerprint.as_deref(), Some(FP));
+    }
+
+    #[tokio::test]
+    async fn a_seeded_connect_without_a_usable_pin_is_refused() {
+        let (core, transport) = core();
+        let pair = seed_pair();
+
+        for pin in ["", "not-a-fingerprint", &"00".repeat(31)] {
+            let payload = core
+                .ssh_connect_seed(
+                    "10.0.0.5".to_string(),
+                    22,
+                    "reaan".to_string(),
+                    seed_copy(&pair),
+                    pin.to_string(),
+                )
+                .await
+                .expect_err("an unusable pin must be refused");
+            assert_eq!(payload.kind, "ssh", "{pin:?}");
+            assert!(
+                payload.message.contains("not a SHA-256 fingerprint"),
+                "{pin:?}: {payload}"
+            );
+        }
+        assert!(transport.last_request().is_none(), "nothing may connect");
+        assert_eq!(core.session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_seeded_connect_against_a_different_host_key_is_refused() {
+        let (core, transport) = core();
+        let pair = seed_pair();
+        let wrong = "bb".repeat(32);
+
+        let payload = core
+            .ssh_connect_seed(
+                "10.0.0.5".to_string(),
+                22,
+                "reaan".to_string(),
+                seed_copy(&pair),
+                wrong.clone(),
+            )
+            .await
+            .expect_err("a different host key must abort");
+        assert_eq!(payload.kind, "ssh");
+        assert!(payload.message.contains("pinned fingerprint"), "{payload}");
+        assert!(payload.message.contains(&wrong), "{payload}");
+        assert!(payload.message.contains(FP), "{payload}");
+        // No session leaked, and the refused session was disconnected.
+        assert_eq!(core.session_count(), 0);
+        assert_eq!(transport.disconnects(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_seeded_connect_with_a_malformed_seed_never_echoes_it() {
+        let (core, _) = core();
+        let payload = core
+            .ssh_connect_seed(
+                "h".to_string(),
+                22,
+                "u".to_string(),
+                StoredKey {
+                    secret_seed: vec![0xde, 0xad, 0xbe, 0xef],
+                },
+                FP.to_string(),
+            )
+            .await
+            .expect_err("a short seed cannot sign");
+        assert_eq!(payload.kind, "crypto");
+        assert!(!payload.message.contains("222, 173"), "{payload}");
+        assert_eq!(core.session_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_key_only_connect_on_the_unpinned_symbol_is_refused() {
+        let (core, transport) = core();
+        let payload = core
+            .ssh_connect(
+                "h".to_string(),
+                22,
+                "u".to_string(),
+                SshCredential::Key {
+                    private: b"-----BEGIN OPENSSH PRIVATE KEY-----\n".to_vec(),
+                    passphrase: None,
+                },
+            )
+            .await
+            .expect_err("a key without a pin must be refused");
+        assert_eq!(payload.kind, "ssh");
+        assert!(payload.message.contains("must pin the host"), "{payload}");
+        // Nothing was dialled and no session was left behind.
+        assert!(transport.last_request().is_none());
+        assert_eq!(core.session_count(), 0);
+
+        // PRESERVE: the password path of the first pairing is untouched.
+        let session = core
+            .ssh_connect(
+                "h".to_string(),
+                22,
+                "u".to_string(),
+                SshCredential::Password("pw".to_string()),
+            )
+            .await
+            .expect("password session");
+        assert!(core.session_fingerprint_compact(session).is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_close_removes_the_session_its_channels_and_refuses_a_second_close() {
+        let (core, transport) = core();
+        let session = core
+            .ssh_connect(
+                "h".to_string(),
+                22,
+                "u".to_string(),
+                SshCredential::Password("p".to_string()),
+            )
+            .await
+            .expect("session");
+        let channel = core
+            .ssh_direct_tcp(session, "127.0.0.1".to_string(), crate::ssh::DAEMON_PORT)
+            .await
+            .expect("channel");
+        assert_eq!(core.session_count(), 1);
+        assert_eq!(core.channel_count(), 1);
+
+        core.session_close(session).await.expect("close");
+        assert_eq!(core.session_count(), 0, "the session must not leak");
+        assert_eq!(core.channel_count(), 0, "its channel must not leak either");
+        assert_eq!(transport.disconnects(), 1);
+
+        // Closing twice is an honest typed error, not a silent success.
+        let second = core.session_close(session).await.expect_err("second close");
+        assert_eq!(second.kind, "ssh");
+        assert_eq!(second.message, format!("ssh: unknown session id {session}"));
+        // The freed channel id is stale too.
+        let stale = core.channel_read(channel).await.expect_err("stale channel");
+        assert_eq!(stale.kind, "ssh");
+        assert_eq!(stale.message, format!("ssh: unknown channel id {channel}"));
+        assert_eq!(
+            transport.disconnects(),
+            1,
+            "a refused close touches nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_close_only_takes_the_channels_of_its_own_session() {
+        let (core, _) = core();
+        let first = core
+            .ssh_connect(
+                "h".to_string(),
+                22,
+                "u".to_string(),
+                SshCredential::Password("p".to_string()),
+            )
+            .await
+            .expect("first session");
+        let second = core
+            .ssh_connect(
+                "h".to_string(),
+                22,
+                "u".to_string(),
+                SshCredential::Password("p".to_string()),
+            )
+            .await
+            .expect("second session");
+        let first_channel = core
+            .ssh_direct_tcp(first, "127.0.0.1".to_string(), 43721)
+            .await
+            .expect("first channel");
+        let second_channel = core
+            .ssh_direct_tcp(second, "127.0.0.1".to_string(), 43722)
+            .await
+            .expect("second channel");
+
+        core.session_close(first).await.expect("close first");
+        assert_eq!(core.session_count(), 1);
+        assert_eq!(core.channel_count(), 1);
+        assert!(core.session_fingerprint_compact(second).is_ok());
+        assert!(core.channel_read(second_channel).await.is_ok());
+        assert!(core.channel_read(first_channel).await.is_err());
+    }
+
+    // ----------------------------------------------------------------------
+    // SEC-010: a hung peer cannot hold the native queue
+    // ----------------------------------------------------------------------
+
+    /// A host that accepts the connection and then says nothing.
+    struct HangingTransport;
+
+    impl Transport for HangingTransport {
+        fn connect<'a>(
+            &'a self,
+            _request: &'a ConnectRequest,
+        ) -> BoxFuture<'a, Result<Box<dyn TransportSession>, CoreError>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handshake_that_never_answers_times_out_and_registers_nothing() {
+        let core = MobileCore::with_transport_and_connect_timeout(
+            Arc::new(HangingTransport),
+            Duration::from_millis(20),
+        );
+        // The outer window is only a tripwire: the core itself must bound the handshake.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            core.ssh_connect(
+                "stalled".to_string(),
+                2222,
+                "reaan".to_string(),
+                SshCredential::Password("pw".to_string()),
+            ),
+        )
+        .await
+        .expect("the core must bound the handshake, not the caller");
+        let payload = outcome.expect_err("a silent host is not a connection");
+        assert_eq!(payload.kind, "ssh");
+        assert!(
+            payload.message.contains("stalled:2222"),
+            "the failure names the target: {}",
+            payload.message
+        );
+        assert!(
+            payload.message.contains("did not complete within 20 ms"),
+            "the failure names the window: {}",
+            payload.message
+        );
+        assert_eq!(
+            core.session_count(),
+            0,
+            "no half-open session may be registered"
+        );
+        assert_eq!(core.channel_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_default_handshake_window_is_the_documented_constant() {
+        let (core, _) = core();
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(core.connect_timeout, CONNECT_TIMEOUT);
+        assert!(CONNECT_TIMEOUT <= Duration::from_secs(60));
+    }
+
+    // ----------------------------------------------------------------------
+    // SEC-012: close reports the real disconnect outcome
+    // ----------------------------------------------------------------------
+
+    /// A transport whose handle keeps reporting an open connection after `disconnect`.
+    struct StickySessionTransport;
+
+    impl Transport for StickySessionTransport {
+        fn connect<'a>(
+            &'a self,
+            _request: &'a ConnectRequest,
+        ) -> BoxFuture<'a, Result<Box<dyn TransportSession>, CoreError>> {
+            Box::pin(async { Ok(Box::new(StickySession) as Box<dyn TransportSession>) })
+        }
+    }
+
+    struct StickySession;
+
+    impl TransportSession for StickySession {
+        fn host_key_fingerprint(&self) -> String {
+            FP.to_string()
+        }
+
+        fn exec_once<'a>(
+            &'a self,
+            _command: &'a str,
+        ) -> BoxFuture<'a, Result<ExecOutput, CoreError>> {
+            Box::pin(async {
+                Ok(ExecOutput {
+                    exit_code: 0,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            })
+        }
+
+        fn direct_tcpip<'a>(
+            &'a self,
+            _target_host: &'a str,
+            _target_port: u16,
+        ) -> BoxFuture<'a, Result<Box<dyn TransportChannel>, CoreError>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn is_connected(&self) -> Option<bool> {
+            // The teardown never reached the connection: the handle is still up.
+            Some(true)
+        }
+    }
+
+    #[tokio::test]
+    async fn session_close_refuses_to_report_closed_while_the_connection_is_up() {
+        let core = MobileCore::with_transport(Arc::new(StickySessionTransport));
+        let session = core
+            .ssh_connect(
+                "h".to_string(),
+                22,
+                "u".to_string(),
+                SshCredential::Password("p".to_string()),
+            )
+            .await
+            .expect("session");
+
+        let payload = core
+            .session_close(session)
+            .await
+            .expect_err("still connected");
+        assert_eq!(payload.kind, "ssh");
+        assert!(
+            payload.message.contains("still reports an open connection"),
+            "the failure must say what is still up: {}",
+            payload.message
+        );
+        assert_eq!(core.session_count(), 0, "the handle is gone either way");
+
+        // A transport that really disconnected keeps answering the clean close.
+        let (clean, transport) = core_fixture();
+        let session = clean
+            .ssh_connect(
+                "h".to_string(),
+                22,
+                "u".to_string(),
+                SshCredential::Password("p".to_string()),
+            )
+            .await
+            .expect("session");
+        clean.session_close(session).await.expect("clean close");
+        assert_eq!(transport.disconnects(), 1);
     }
 }

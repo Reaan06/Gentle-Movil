@@ -27,7 +27,7 @@ import {
   LOG_FILE,
   LOG_ROTATE_BYTES,
 } from '../lib/logger.ts';
-import { core } from '../lib/core.ts';
+import { deviceKeyEnsure } from '../lib/core.ts';
 import {
   MODE_STORAGE_KEY,
   SUITE_ROUTE,
@@ -35,6 +35,7 @@ import {
   serializeSuiteRecord,
 } from '../lib/suite.ts';
 import {
+  DEVICE_KEY_EMPTY_REASON,
   DEVICE_KEY_UNAVAILABLE_LABEL,
   EXPORT_ROUTE,
   INSTALLED_LABEL,
@@ -371,34 +372,53 @@ function rowOf(vm, sectionId, rowId) {
   return vm.sections.find((section) => section.id === sectionId).rows.find((row) => row.id === rowId);
 }
 
-test('(i) core answers with a key → the fingerprint row shows the real one', async () => {
+test('(i) core answers with the persisted identity → the fingerprint row shows the real one', async () => {
   const storage = fakeReader();
   const fingerprint = 'SHA256:9E42C71B053A88F0D6224BA9517EC310';
-  const deviceKey = {
-    async deviceKeyGenerate() {
-      return { publicKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample', fingerprint };
-    },
+  const publicHex = 'ab'.repeat(32);
+  const called = [];
+  // The seam is `deviceKeyEnsure()` of the frozen ABI v2 contract: {publicHex, fingerprint}.
+  const deviceKey = async () => {
+    called.push('deviceKeyEnsure');
+    return { publicHex, fingerprint };
   };
 
   const vm = await loadSettings(storage.read, deps({ deviceKey }));
 
+  assert.deepEqual(called, ['deviceKeyEnsure'], 'the fingerprint comes from the ensure, not a fresh key');
   assert.equal(vm.deviceKey.available, true);
   assert.equal(vm.deviceKey.fingerprint, fingerprint);
   assert.equal(vm.deviceKey.value, fingerprint);
   assert.equal(vm.deviceKey.cause, null);
+  // The public half is the hex key the core answered with, never the fingerprint.
+  assert.equal(vm.deviceKey.publicKey, publicHex);
   const row = rowOf(vm, 'seguridad', 'device-key');
   assert.equal(row.value, fingerprint);
   assert.equal(row.tone, 'ok');
   // The public key is never shown as if it were the fingerprint.
-  assert.notEqual(row.value, 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample');
+  assert.notEqual(row.value, publicHex);
 });
 
-test('(j) real core rejects CoreUnavailableError → no disponible + the real reason', async () => {
+test('(i2) an identity without a fingerprint is a real failure, never a placeholder', async () => {
+  const storage = fakeReader();
+  const deviceKey = async () => ({ publicHex: 'ab'.repeat(32), fingerprint: '' });
+
+  const vm = await loadSettings(storage.read, deps({ deviceKey }));
+
+  assert.equal(vm.deviceKey.available, false);
+  assert.equal(vm.deviceKey.cause, 'failure');
+  assert.equal(vm.deviceKey.fingerprint, null);
+  assert.equal(vm.deviceKey.value, DEVICE_KEY_UNAVAILABLE_LABEL);
+  assert.equal(vm.deviceKey.reason, DEVICE_KEY_EMPTY_REASON);
+});
+
+test('(j) a core without the native build → no disponible + the real reason', async () => {
   const storage = fakeReader();
   const log = fakeLog();
 
-  // `core` is the real binding swap point: today it is the dev fallback.
-  const vm = await loadSettings(storage.read, deps({ deviceKey: core, logger: log }));
+  // The real re-exported `deviceKeyEnsure` with no native bridge bound is exactly
+  // the state of this build: it rejects with kind `CoreUnavailable`.
+  const vm = await loadSettings(storage.read, deps({ deviceKey: deviceKeyEnsure, logger: log }));
 
   assert.equal(vm.deviceKey.available, false);
   assert.equal(vm.deviceKey.value, DEVICE_KEY_UNAVAILABLE_LABEL);
@@ -406,8 +426,8 @@ test('(j) real core rejects CoreUnavailableError → no disponible + the real re
   // No fake fingerprint: the row carries the rejection verbatim.
   assert.equal(vm.deviceKey.fingerprint, null);
   assert.equal(vm.deviceKey.publicKey, null);
-  assert.match(vm.deviceKey.reason, /CoreUnavailableError/);
-  assert.match(vm.deviceKey.reason, /deviceKeyGenerate/);
+  assert.match(vm.deviceKey.reason, /deviceKeyEnsure/);
+  assert.match(vm.deviceKey.reason, /libmobile_core\.so/);
 
   const row = rowOf(vm, 'seguridad', 'device-key');
   assert.equal(row.value, DEVICE_KEY_UNAVAILABLE_LABEL);
@@ -417,6 +437,26 @@ test('(j) real core rejects CoreUnavailableError → no disponible + the real re
   // A core that is not in the build is not a storage failure.
   assert.equal(vm.storageError, null);
   assert.deepEqual(log.failures, []);
+});
+
+test('(j2) a core that rejects for its own reason → no disponible + that reason', async () => {
+  const storage = fakeReader();
+  const log = fakeLog();
+  const deviceKey = async () => {
+    throw new Error('el seed está sellado con una clave del Keystore que ya no existe');
+  };
+
+  const vm = await loadSettings(storage.read, deps({ deviceKey, logger: log }));
+
+  assert.equal(vm.deviceKey.available, false);
+  assert.equal(vm.deviceKey.value, DEVICE_KEY_UNAVAILABLE_LABEL);
+  assert.equal(vm.deviceKey.cause, 'failure');
+  assert.equal(vm.deviceKey.fingerprint, null);
+  assert.equal(vm.deviceKey.reason, 'el seed está sellado con una clave del Keystore que ya no existe');
+  assert.ok(
+    rowOf(vm, 'seguridad', 'device-key').detail.includes(vm.deviceKey.reason),
+    'the real reason is shown verbatim',
+  );
 });
 
 test('(k) paired devices: this phone with the real tunnel host, Sin túnel without one', async () => {

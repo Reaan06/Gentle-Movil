@@ -7,13 +7,31 @@
 //! uses the **private** half as the SSH credential. The private half therefore never
 //! leaves the device:
 //!
-//! * on device it is written to the platform keystore (iOS Keychain / Android Keystore)
-//!   by the native shell and read back through the platform API — see
-//!   [`crate::ffi`] for the exact FFI policy;
+//! * it is minted **once** (see `deviceKeyEnsure` in `mobile-core/src/cabi.rs` and the
+//!   Kotlin `GcCoreModule`): the module seals the seed with an AndroidKeyStore AES/GCM key
+//!   whose bytes never leave the keystore, and writes only the ciphertext into the app's
+//!   private directory. Later calls decrypt it again and derive the public half with
+//!   [`public_hex_from_secret`]; the seed itself never crosses into JS;
 //! * [`StoredKey`] carries the raw 32-byte ed25519 seed so the native bridge and the
 //!   tests can move it around. It is **not** part of the JS-visible FFI surface, it has
-//!   a redacted [`Debug`] implementation, and it must never be logged or serialized
-//!   outside the keystore writer.
+//!   a redacted [`Debug`] implementation, it is neither `Clone` nor `Serialize` (the one
+//!   serialization site is the `gc_device_key_generate` envelope, which reads the bytes
+//!   through [`StoredKey::expose_seed`]) and it **zeroizes itself on drop**: the seed is
+//!   the most valuable secret on the phone, so no copy of it may survive the value that
+//!   owns it. The sealing contract — format byte and AES-GCM associated data — is in the
+//!   [`crate::ffi`] module docs, because the sealing itself is Kotlin's job;
+//! * [`private_key_from_seed`] turns the seed into the SSH [`PrivateKey`] that
+//!   `gc_ssh_connect_seed` authenticates with, and [`authorized_key_line`] is the single
+//!   place that renders the `authorized_keys` line (no hand-rolled base64).
+//!
+//! ## What zeroization here does not cover
+//!
+//! This module wipes every buffer it owns: the seed holder on drop, the seed arrays copied
+//! out of it, and a [`crate::ssh::SshCredential`]'s key and passphrase material on drop.
+//! Three copies are out of reach by construction and are **not** claimed as fixed: the
+//! JavaScript string the app hands over, the Kotlin `String` that crossed JNI, and the key
+//! structure `russh` decodes internally (its `ed25519-dalek` is built without the `zeroize`
+//! feature here). They belong to the Kotlin/TS hardening slice.
 //!
 //! Seed sizes and encodings are fixed: 32-byte seed, 32-byte public key, 64-byte
 //! signature. Public keys and signatures travel as lowercase hex strings.
@@ -22,7 +40,10 @@ use std::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand_core::{CryptoRngCore, OsRng};
-use serde::{Deserialize, Serialize};
+use russh::keys::ssh_key::private::Ed25519Keypair;
+use russh::keys::ssh_key::{HashAlg, LineEnding};
+use russh::keys::PrivateKey;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::error::CoreError;
 use crate::fingerprint;
@@ -34,14 +55,51 @@ pub const PUBLIC_KEY_LEN: usize = 32;
 /// Length of an ed25519 signature, in bytes.
 pub const SIGNATURE_LEN: usize = 64;
 
+/// Comment `authorized_keys` carries when the caller names none.
+pub const DEFAULT_AUTHORIZED_KEY_COMMENT: &str = "gentle-movil";
+
 /// Raw ed25519 secret seed, waiting to be sealed in the platform keystore.
 ///
 /// **Security:** this value is the device identity. The native shell must hand it to
-/// the Keychain/Keystore and drop it; it must never reach JS, logs or a snapshot.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// the Keychain/Keystore and drop it; it must never reach JS, logs or a snapshot. It is
+/// deliberately neither `Clone` nor `Serialize` (see [`StoredKey::expose_seed`] for the one
+/// place the bytes are handed on), and it wipes its bytes when it is dropped.
+#[derive(PartialEq, Eq)]
 pub struct StoredKey {
     /// The 32-byte ed25519 seed, exactly [`SECRET_SEED_LEN`] bytes.
     pub secret_seed: Vec<u8>,
+}
+
+impl Zeroize for StoredKey {
+    fn zeroize(&mut self) {
+        self.secret_seed.zeroize();
+    }
+}
+
+impl Drop for StoredKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+/// The trait `zeroize` uses to mark a type that wipes itself when it is dropped.
+///
+/// Implemented by hand (not derived) because the crate is pinned without the `derive`
+/// feature: the wipe itself is the [`Zeroize`] implementation above, and the `Drop` impl
+/// calls it.
+impl ZeroizeOnDrop for StoredKey {}
+
+impl StoredKey {
+    /// Borrow the raw seed bytes.
+    ///
+    /// This exists for exactly one caller: the `gc_device_key_generate` envelope, which
+    /// hands the seed to the native shell so it can seal it in the keystore. It is a
+    /// **borrow**, never a copy, so nothing new is left in memory for the caller to leak;
+    /// every other reader goes through [`public_hex_from_secret`],
+    /// [`private_key_from_seed`] or [`sign`].
+    pub fn expose_seed(&self) -> &[u8] {
+        &self.secret_seed
+    }
 }
 
 impl fmt::Debug for StoredKey {
@@ -59,7 +117,7 @@ impl fmt::Debug for StoredKey {
 ///
 /// Returned by [`generate`]. The public half is what the app shows and registers; the
 /// private half is the [`StoredKey`] the keystore writer consumes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct DeviceKeyPair {
     /// Lowercase hex (64 chars) ed25519 public key.
     pub public_hex: String,
@@ -73,6 +131,9 @@ impl DeviceKeyPair {
         decode_public_hex(&self.public_hex)
     }
 }
+
+/// The pair zeroizes on drop through its [`StoredKey`], so the marker holds for it too.
+impl ZeroizeOnDrop for DeviceKeyPair {}
 
 /// Generate a new device identity with the operating system RNG.
 pub fn generate() -> DeviceKeyPair {
@@ -148,14 +209,86 @@ fn decode_public_hex(public_hex: &str) -> Result<[u8; PUBLIC_KEY_LEN], CoreError
 }
 
 /// Rebuild the signing key from a stored secret seed.
+///
+/// The seed array is wiped as soon as the key exists; the [`SigningKey`] `ed25519-dalek`
+/// builds is its own copy and is not wipeable in this build (see the module docs).
 fn signing_key_from_secret(secret: &StoredKey) -> Result<SigningKey, CoreError> {
-    let seed: [u8; SECRET_SEED_LEN] = secret.secret_seed.as_slice().try_into().map_err(|_| {
+    let mut seed = seed_bytes(secret)?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    seed.zeroize();
+    Ok(signing_key)
+}
+
+/// The 32 seed bytes of a stored secret, or a `crypto` error naming the real length.
+pub fn seed_bytes(secret: &StoredKey) -> Result<[u8; SECRET_SEED_LEN], CoreError> {
+    secret.secret_seed.as_slice().try_into().map_err(|_| {
         CoreError::crypto(format!(
             "ed25519 secret seed must be {SECRET_SEED_LEN} bytes, found {}",
             secret.secret_seed.len()
         ))
-    })?;
-    Ok(SigningKey::from_bytes(&seed))
+    })
+}
+
+/// The device identity as an SSH private key, derived from the stored seed.
+///
+/// This is the seam the key-only reconnect uses: the seed never leaves the device, and
+/// the SSH layer only ever sees the derived [`PrivateKey`]. `Ed25519Keypair::from_seed`
+/// is the same expansion the device key generator used, so the public half of the
+/// derived key is byte-for-byte the one that was registered on the host.
+pub fn private_key_from_seed(secret: &StoredKey) -> Result<PrivateKey, CoreError> {
+    let mut seed = seed_bytes(secret)?;
+    let private = PrivateKey::from(Ed25519Keypair::from_seed(&seed));
+    seed.zeroize();
+    Ok(private)
+}
+
+/// The device identity as OpenSSH/PEM text, for the frozen `SshCredential::Key` record.
+///
+/// The OpenSSH encoder hands its text back inside a `Zeroizing` buffer and the copy this
+/// returns is owned by the caller: `gc_ssh_connect_seed` moves it straight into an
+/// [`crate::ssh::SshCredential`], which wipes it on drop.
+pub fn private_key_openssh(secret: &StoredKey) -> Result<String, CoreError> {
+    let private = private_key_from_seed(secret)?;
+    private
+        .to_openssh(LineEnding::LF)
+        .map(|text| text.to_string())
+        .map_err(|error| CoreError::crypto(format!("cannot encode the device key: {error}")))
+}
+
+/// The device public key in OpenSSH one-line form (`ssh-ed25519 AAAA…`).
+pub fn public_key_openssh(secret: &StoredKey) -> Result<String, CoreError> {
+    let private = private_key_from_seed(secret)?;
+    private
+        .public_key()
+        .to_openssh()
+        .map_err(|error| CoreError::crypto(format!("cannot encode the device public key: {error}")))
+}
+
+/// The `authorized_keys` line for the device identity.
+///
+/// Replaces the TypeScript base64 hand-roll: the SSH wire encoding comes from the same
+/// `ssh-key` implementation that parses host keys, so the line is the OpenSSH form by
+/// construction. `comment` is trimmed; an empty comment leaves the line without one.
+pub fn authorized_key_line(secret: &StoredKey, comment: &str) -> Result<String, CoreError> {
+    let public = public_key_openssh(secret)?;
+    let comment = comment.trim();
+    Ok(if comment.is_empty() {
+        public
+    } else {
+        format!("{public} {comment}")
+    })
+}
+
+/// OpenSSH-style `SHA256:…` fingerprint of the device public key.
+///
+/// This is the value the settings screen shows; the digest is the SHA-256 of the SSH
+/// wire encoding of the public key, exactly like `ssh-keygen -lf`.
+pub fn fingerprint_sha256(secret: &StoredKey) -> Result<String, CoreError> {
+    let private = private_key_from_seed(secret)?;
+    Ok(private
+        .public_key()
+        .fingerprint(HashAlg::Sha256)
+        .to_string())
 }
 
 #[cfg(test)]
@@ -270,7 +403,11 @@ mod tests {
         let pair = generate_with(&mut FixedRng(4));
         let payload = b"payload";
         let signature = sign(&pair.secret, payload).expect("signable");
-        assert!(verify(&pair.public_hex.to_ascii_uppercase(), payload, &signature));
+        assert!(verify(
+            &pair.public_hex.to_ascii_uppercase(),
+            payload,
+            &signature
+        ));
     }
 
     #[test]
@@ -285,15 +422,68 @@ mod tests {
     }
 
     #[test]
-    fn device_key_pair_round_trips_through_json() {
+    fn the_device_identity_only_reaches_the_sealed_envelope() {
+        // `StoredKey` used to derive `Clone` + `Serialize`, so the seed could be copied and
+        // JSON-encoded by anything holding the value. Both derives are gone: the single
+        // serialization site is now the `gc_device_key_generate` envelope in `cabi`, whose
+        // exact wire shape (`key.secret.secret_seed`) is pinned from the outside by
+        // `provision_tests::device_key_generate_returns_the_pair_through_the_c_abi`.
+        //
+        // What is left to pin here is the derivation the keystore writer relies on: the
+        // same bytes produce the same public half, every time, on a value that wipes them.
         let pair = generate_with(&mut FixedRng(13));
-        let json = serde_json::to_string(&pair).expect("serializes");
-        let back: DeviceKeyPair = serde_json::from_str(&json).expect("deserializes");
-        assert_eq!(back, pair);
-        assert_eq!(back.public_hex, pair.public_hex);
-        // The seed survives the round-trip unchanged (byte-for-byte), which is what the
-        // keystore writer relies on.
-        assert_eq!(back.secret.secret_seed, pair.secret.secret_seed);
+        let again = StoredKey {
+            secret_seed: pair.secret.expose_seed().to_vec(),
+        };
+        assert_eq!(
+            public_hex_from_secret(&again).expect("derivable"),
+            pair.public_hex
+        );
+        assert_eq!(again, pair.secret);
+        assert_eq!(
+            authorized_key_line(&again, "gentle-movil").expect("renderable"),
+            authorized_key_line(&pair.secret, "gentle-movil").expect("renderable")
+        );
+    }
+
+    #[test]
+    fn the_seed_holder_wipes_itself_and_implements_zeroize_on_drop() {
+        // The trait bound is the rule: a seed holder that does not wipe on drop does not
+        // compile into this test.
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<StoredKey>();
+        assert_zeroize_on_drop::<DeviceKeyPair>();
+
+        // The observable half: zeroizing the value zeroes the bytes in place (and `Vec`'s
+        // implementation then resets the length), instead of leaving them behind in the
+        // allocation.
+        let pair = generate_with(&mut FixedRng(31));
+        let mut seed = StoredKey {
+            secret_seed: pair.secret.expose_seed().to_vec(),
+        };
+        assert_eq!(
+            public_hex_from_secret(&seed).expect("derivable"),
+            pair.public_hex
+        );
+        seed.zeroize();
+        assert!(
+            seed.expose_seed().is_empty(),
+            "zeroize must wipe the seed bytes and drop the handle to them"
+        );
+    }
+
+    #[test]
+    fn the_seed_is_borrowed_not_copied_and_never_rendered() {
+        let pair = generate_with(&mut FixedRng(32));
+        // `expose_seed` is a borrow: the address is the holder's own buffer.
+        assert_eq!(
+            pair.secret.expose_seed().as_ptr(),
+            pair.secret.secret_seed.as_ptr()
+        );
+        assert_eq!(pair.secret.expose_seed().len(), SECRET_SEED_LEN);
+        assert_eq!(pair.secret.expose_seed(), &[32u8; SECRET_SEED_LEN][..]);
+        // Neither `Debug` nor an error message renders the bytes.
+        assert!(!format!("{pair:?}").contains("32, 32, 32"));
     }
 
     #[test]
@@ -302,5 +492,146 @@ mod tests {
         assert!(decode_public_hex(&"0".repeat(63)).is_err());
         assert!(decode_public_hex(&format!("{}g", "0".repeat(63))).is_err());
         assert!(decode_public_hex(&"0".repeat(64)).is_ok());
+    }
+
+    // ----------------------------------------------------------------------
+    // Seed → SSH key material (the key-only reconnect path)
+    // ----------------------------------------------------------------------
+
+    /// Raw 32 bytes of the key inside an OpenSSH public key line.
+    fn wire_public_bytes(openssh_line: &str) -> Vec<u8> {
+        let mut fields = openssh_line.split(' ');
+        assert_eq!(fields.next(), Some("ssh-ed25519"), "{openssh_line}");
+        let blob = fields.next().expect("base64 blob");
+        let mut out = Vec::new();
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut buffer = 0u32;
+        let mut bits = 0u32;
+        for byte in blob.bytes().filter(|byte| *byte != b'=') {
+            let value = alphabet
+                .iter()
+                .position(|candidate| *candidate == byte)
+                .expect("base64 digit") as u32;
+            buffer = (buffer << 6) | value;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((buffer >> bits) as u8);
+                buffer &= (1 << bits) - 1;
+            }
+        }
+        // `ssh-ed25519` || pubkey: skip the 4-byte length prefix and the 11 type bytes,
+        // then the 4-byte length prefix of the key itself.
+        let key_len = u32::from_be_bytes([out[15], out[16], out[17], out[18]]) as usize;
+        assert_eq!(key_len, PUBLIC_KEY_LEN);
+        out[19..19 + key_len].to_vec()
+    }
+
+    #[test]
+    fn the_seed_derives_the_public_key_that_was_registered() {
+        let pair = generate_with(&mut FixedRng(21));
+        let private = private_key_from_seed(&pair.secret).expect("derivable");
+        let openssh = public_key_openssh(&pair.secret).expect("encodable");
+
+        // Same identity: the key inside the SSH blob is the public half of the seed.
+        assert_eq!(
+            wire_public_bytes(&openssh),
+            pair.public_bytes().expect("public bytes")
+        );
+        // And the derived `PrivateKey` reports that same public key.
+        assert_eq!(
+            private.public_key().to_openssh().expect("encodable"),
+            openssh
+        );
+        assert_eq!(
+            public_hex_from_secret(&pair.secret).expect("derivable"),
+            pair.public_hex
+        );
+    }
+
+    #[test]
+    fn the_private_key_round_trips_through_openssh_text() {
+        let pair = generate_with(&mut FixedRng(22));
+        let text = private_key_openssh(&pair.secret).expect("encodable");
+        assert!(
+            text.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("-----END OPENSSH PRIVATE KEY-----\n"),
+            "{text}"
+        );
+        // This is exactly what `russh` decodes for `SshCredential::Key`, so a credential
+        // built here really authenticates as the registered identity.
+        let decoded = russh::keys::decode_secret_key(&text, None).expect("decodable");
+        assert_eq!(
+            decoded.public_key().to_openssh().expect("encodable"),
+            public_key_openssh(&pair.secret).expect("encodable")
+        );
+    }
+
+    #[test]
+    fn the_authorized_keys_line_is_the_openssh_form() {
+        let pair = generate_with(&mut FixedRng(23));
+        let line = authorized_key_line(&pair.secret, "gentle-movil").expect("renderable");
+        assert_eq!(
+            line,
+            format!(
+                "{} {DEFAULT_AUTHORIZED_KEY_COMMENT}",
+                public_key_openssh(&pair.secret).expect("encodable")
+            )
+        );
+        // OpenSSH wire prefix for an ed25519 key: `ssh-ed25519` is 11 bytes, then the
+        // length-prefixed key, so the base64 blob always starts like this.
+        assert!(
+            line.starts_with("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"),
+            "{line}"
+        );
+        assert_eq!(line.lines().count(), 1);
+        assert!(!line.ends_with(' '));
+
+        // A comment is trimmed, and an empty one leaves the line without a suffix.
+        assert!(authorized_key_line(&pair.secret, "  phone \n")
+            .expect("renderable")
+            .ends_with(" phone"));
+        let bare = authorized_key_line(&pair.secret, "   ").expect("renderable");
+        assert_eq!(bare, public_key_openssh(&pair.secret).expect("encodable"));
+        assert!(!bare.ends_with(' '));
+    }
+
+    #[test]
+    fn the_device_fingerprint_is_the_openssh_sha256_form() {
+        let pair = generate_with(&mut FixedRng(24));
+        let fingerprint = fingerprint_sha256(&pair.secret).expect("derivable");
+        assert!(fingerprint.starts_with("SHA256:"), "{fingerprint}");
+        // 32 digest bytes, base64 without padding.
+        assert_eq!(fingerprint.len(), "SHA256:".len() + 43, "{fingerprint}");
+        assert_ne!(
+            fingerprint,
+            fingerprint_sha256(&generate_with(&mut FixedRng(25)).secret).expect("derivable")
+        );
+    }
+
+    #[test]
+    fn a_malformed_seed_cannot_derive_key_material_and_never_echoes_it() {
+        let short = StoredKey {
+            secret_seed: vec![9, 8, 7],
+        };
+        for outcome in [
+            private_key_from_seed(&short).err(),
+            private_key_openssh(&short).err(),
+            public_key_openssh(&short).err(),
+            authorized_key_line(&short, "x").err(),
+            fingerprint_sha256(&short).err(),
+        ] {
+            let error = outcome.expect("a short seed cannot derive a key");
+            assert_eq!(error.kind(), "crypto");
+            let message = error.to_string();
+            assert!(message.contains("must be 32 bytes"), "{message}");
+            assert!(
+                !message.contains("9, 8, 7"),
+                "the seed must never be echoed: {message}"
+            );
+        }
     }
 }
