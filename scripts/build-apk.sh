@@ -55,12 +55,16 @@ if [ ! -f "$APK" ]; then
   exit 1
 fi
 SO_ENTRY="lib/${ABI}/libmobile_core.so"
-if ! unzip -l "$APK" | grep -q "$SO_ENTRY"; then
+# Read the listing ONCE instead of piping into grep -q: with `set -o pipefail`,
+# grep -q exits at the first match, unzip dies of SIGPIPE and the pipeline
+# reports failure, which turned this guard into a false negative.
+APK_LISTING="$(unzip -l "$APK")"
+if ! printf '%s\n' "$APK_LISTING" | grep -F "$SO_ENTRY" >/dev/null; then
   echo "error: $SO_ENTRY is missing from the APK." >&2
   echo "       The app would fail at runtime with dlopen failed." >&2
   exit 1
 fi
-echo "ok: $SO_ENTRY present ($(unzip -l "$APK" | awk -v e="$SO_ENTRY" '$4==e {print $1}') bytes in the zip)"
+echo "ok: $SO_ENTRY present ($(printf '%s\n' "$APK_LISTING" | awk -v e="$SO_ENTRY" '$4==e {print $1}') bytes in the zip)"
 echo "ok: $APK ($(stat -c%s "$APK") bytes)"
 
 if [ "$INSTALL" = true ]; then

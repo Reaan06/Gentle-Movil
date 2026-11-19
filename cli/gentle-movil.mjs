@@ -36,6 +36,8 @@ const COMMANDS = {
   status: () => import('./commands/status.mjs'),
   /** Host-side preflight: sshd, host key, LAN IP, extension on loopback. */
   doctor: () => import('./commands/doctor.mjs'),
+  /** Install the bridge as a permanent Pi extension (nothing to start). */
+  bridge: () => import('./commands/bridge.mjs'),
 };
 
 const HELP = `gentle-movil — host-side companion for the Gentle Movil app
@@ -46,11 +48,13 @@ Commands:
   pair       Show a one-time pairing QR in the terminal (gc://pair, spec §1)
   status     Is the Gentle Shell/Pi extension answering on loopback?
   doctor     Preflight checks: sshd, host key, LAN IP, extension on loopback
+  bridge     Install/status/uninstall the bridge as a permanent Pi extension
   help       Show this help
 
 Examples:
   gentle-movil pair            # QR → scan it with the app
   gentle-movil doctor          # why can't the tablet connect?
+  gentle-movil bridge install  # una vez: Pi la carga sola, después escaneás el QR
 
 No daemon, no sudo, no binaries to install on the PC: the bridge is the Gentle
 Shell/Pi extension itself, reached over SSH from the tablet.
