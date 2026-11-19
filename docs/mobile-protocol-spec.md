@@ -39,7 +39,12 @@ de canje se omite (el daemon se instala sin daemon previo).
 
 ## 2. Handshake de claves (primer emparejamiento)
 
-1. La app genera su par ed25519 (Keychain/Keystore; nunca exportada).
+1. La app tiene un par ed25519 persistente (`deviceKeyEnsure()`): el core Rust
+   mintea la semilla UNA vez, Kotlin la sella con una clave AES-256/GCM no
+   exportable del AndroidKeyStore y guarda solo el criptograma (iv‖ciphertext)
+   en `filesDir`; JS nunca ve la semilla — recibe únicamente `publicHex` y la
+   huella `SHA256:…`. La clave autorizada en `authorized_keys` es esta misma
+   identidad, no una minteada por emparejamiento.
 2. Conexión SSH con la credencial del usuario (contraseña, o clave ya
    autorizada si el QR proviene de un host ya configurado).
 3. Sobre el canal autenticado, la app envía `REGISTER_DEVICE`:
@@ -250,7 +255,7 @@ que la app conoce como última estable (descriptor firmado), la app:
 Ventana de fallo: si el reinicio no responde en 10 s, la app revierte al
 binario previo (guardado como `daemon.prev`) y reporta al usuario.
 
-## 6. Superficie del core Rust (FFI — congelada para v1)
+## 6. Superficie del core Rust (FFI — ABI 2, 2026-11-18)
 
 ```
 pairFromQr(uri: string) -> PairInfo
@@ -260,11 +265,34 @@ channelRead(channelId) -> bytes        # async, streaming
 channelWrite(channelId, bytes)
 sftpPut(sessionId, localPath, remotePath)
 execOnce(sessionId, cmd) -> {exitCode, stdout, stderr}
-deviceKeyGenerate() -> PublicKey        # ed25519 del teléfono
-deviceKeyPublic() -> PublicKey
+deviceKeyGenerate() -> PublicKey        # legado: mintea SIEMPRE una clave nueva (no usar para emparejar)
+deviceKeyPublic() -> PublicKey          # derivada de la semilla persistida
+sshConnectSeed(host, port, user, seed, expectedFp) -> SessionId  # solo-llave, pin OBLIGATORIO
+sshClose(sessionId)                     # saca la sesión y sus canales del registro
+fsList(root, path, maxEntries) -> {entries:[{path,size,kind}]}
+fsRead(root, path, maxBytes) -> {path,text,size,truncated}
 cryptoVerify(releasePubkey, payload, signature) -> bool
 sqliteOpen/openStore(...)               # store local-first
 ```
+
+Contrato de §6 que no es obvio:
+
+- **Pin de host key**: `sshConnectSeed` exige `expectedFp` (la huella del QR). El
+  pin se aplica dentro del handshake y se vuelve a verificar después, para todo
+  transporte; la ruta de llave sin pin se rechaza en vez de aceptar TOFU. La
+  conexión con contraseña conserva TOFU y reporta la huella observada.
+- **Errores tipados** de `fs_*`: `not_found | permission_denied | too_large |
+  binary | invalid_path | outside_root`. `path` es relativo a `root`; se rechazan
+  rutas absolutas, segmentos vacíos y `..`; se canonicaliza y se verifica
+  `starts_with(root)` para que un symlink no escape del proyecto.
+- **Topes de lectura**: 512 KiB por defecto, 8 MiB duro (espeja el tope del
+  puente). Nunca se decodifica un binario con pérdida: se responde `binary`.
+- **Alcance de archivos**: `fs_*` lee lo que el proceso de la app puede leer. El
+  sandbox de la app (documentos/proyectos) siempre; el almacenamiento compartido
+  requiere el permiso del sistema o el picker SAF, que **no** está implementado
+  todavía — la UI lo dice con el path real en vez de mostrar una lista vacía.
+- **`fsList` lista archivos y directorios**; sockets, dispositivos y symlinks
+  colgantes se omiten a propósito (el contrato no inventa un `kind`).
 
 Todo lo demás (UI, parsing del protocolo del daemon, automatizaciones,
 lógica de modos) vive en TS — regla de oro OTA.
@@ -433,3 +461,4 @@ en el host, ya tiene la sesión del usuario.
   git, `500` automatizaciones ilegibles con el error de parseo, `403` exec sin
   opt-in, `413`/`415` de fs). Se agrega el header `x-gentle-bridge` a toda
   respuesta JSON. Tests: `node --test pi-extension/test/` 32 verdes.
+- L2 (2026-11-18, ABI 2): §6 quedaba en v1 y describía una superficie que no era la real. Se documenta ABI 2: identidad ed25519 persistente sellada por el AndroidKeyStore (§2.1 reescrito), `sshConnectSeed` con pin obligatorio, `sshClose` (el teardown que L1 daba por hecho pero que no existía en el crate), `fsList`/`fsRead` con errores tipados, reglas de path/symlink, topes de lectura y el límite honesto de permisos (sin SAF todavía). Tests del core: 113 lib + 31 ffi_surface + 66 provision = 210 verdes.

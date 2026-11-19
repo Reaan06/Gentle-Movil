@@ -491,10 +491,10 @@ Reactions:
 
 | Tap | Reaction | Call | Error copy |
 |---|---|---|---|
-| project card | push V15, restored tabs | `fs_*` open | `No pudimos leer los archivos.` |
+| project card | push V15, restored tabs, **passing the project path** | `fs_*` open (local) / `/api/fs/tree` (conectado) | `No pudimos leer los archivos.` |
 | **Crear proyecto** | name dialog → wait | `git init` (gitoxide) | `Ya existe un proyecto con ese nombre.` |
 | **Clonar** | form sheet → wait, cancellable | `git clone` via gitoxide | `Repositorio privado: faltan credenciales.` |
-| overflow **Eliminar** | confirm `Se borrará del dispositivo.` | sandbox delete | — |
+| **Eliminar** (confirmación de dos pasos) | wait → pop; solo se borra el registro: `Se quita de la lista. Los archivos del teléfono no se tocan.` (el borrado físico del sandbox es una acción aparte, explícita, fuera de V14) | remove from `gentle-movil:local-projects` | `No se pudo quitar el proyecto.` |
 | pull | rescan sandbox | `fs_*` | — |
 
 ### V15 — Local editor
