@@ -298,6 +298,15 @@ export function parseMode(raw: string | null): AppMode {
   return raw === 'local' || raw === 'conectado' || raw === 'ambos' ? raw : 'ambos';
 }
 
+/**
+ * Parses a stored mode strictly: the three real choices, or `null` when nothing
+ * valid was ever stored. It never guesses — the boot gate must be able to say
+ * "this phone never chose a mode", which `parseMode`'s `ambos` fallback hides.
+ */
+export function parseChosenMode(raw: string | null): AppMode | null {
+  return raw === 'local' || raw === 'conectado' || raw === 'ambos' ? raw : null;
+}
+
 /** Parses the stored suite record; anything unusable means "not installed". */
 export function parseSuiteRecord(raw: string | null): SuiteRecord {
   if (raw === null) {
@@ -334,6 +343,36 @@ export async function readMode(storage: SuiteStorage, log?: SuiteLog): Promise<A
     log?.failure('read-mode', error, null);
     return 'ambos';
   }
+}
+
+/**
+ * Reads the mode V4 persisted, strictly: `null` when the phone never chose one
+ * (a fresh install) or when the stored value is not a mode at all. The strict
+ * read is what the boot gate needs (`bootDecision` in `lib/onboarding.ts`):
+ * `readMode`'s `ambos` fallback would silently answer a choice the person never
+ * made. A corrupt value and an unreadable store are both logged and read as
+ * `null`, so the gate can say the choice is missing instead of assuming one.
+ */
+export async function readChosenMode(
+  storage: SuiteStorage,
+  log?: SuiteLog,
+): Promise<AppMode | null> {
+  let raw: string | null;
+  try {
+    raw = await storage.getItem(MODE_STORAGE_KEY);
+  } catch (error) {
+    log?.failure('read-chosen-mode', error, null);
+    return null;
+  }
+
+  const mode = parseChosenMode(raw);
+  if (mode === null && raw !== null) {
+    log?.failure('read-chosen-mode', new Error('el modo guardado no es un modo válido'), {
+      key: MODE_STORAGE_KEY,
+      raw,
+    });
+  }
+  return mode;
 }
 
 /** Reads the persisted suite record; a broken store means "not installed". */

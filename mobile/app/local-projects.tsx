@@ -16,11 +16,16 @@ import { GhostButton } from '../components/GhostButton';
 import { PrimaryButton } from '../components/PrimaryButton';
 import {
   type LocalProject,
+  type ProjectDiskFact,
   type ProjectRow,
   type ProjectsState,
   type ProjectsViewModel,
+  activeProjectId,
   buildProjectsView,
   createProjectIntent,
+  deleteConfirmMessage,
+  deleteProjectIntent,
+  loadProjectDisk,
   loadProjects,
   saveProjects,
 } from '../lib/local-projects';
@@ -45,14 +50,40 @@ import { colors, elevation, radius, spacing, typography } from '../lib/theme';
  * - git facts do not exist yet (the core Rust does not expose gitoxide), so
  *   each row carries the `sin datos de git` badge with its reason — never a
  *   branch chip, a dirty dot or a `0 cambios` badge;
+ * - what the device really has in each project folder (T18) comes from the
+ *   core's `fsList` through `loadProjectDisk`: `N entradas`, `carpeta vacía`, or
+ *   the honest reason — never an invented count;
  * - `+ Nuevo proyecto` opens a minimal inline name form that really validates
  *   and really persists the record; `git init` is gitoxide work and waits for
  *   the core, which the form says out loud;
- * - tapping a project opens `/local-editor` with the project id and name
- *   id, because the editor is the next slice and navigating would be a lie.
+ * - deleting a project (T15) is a two-step action: the row's `Eliminar` only
+ *   opens the confirmation, and the copy states plainly that the phone's files
+ *   are not touched (physical deletion is a separate action, not implemented);
+ * - tapping a project opens `/local-editor` with the **path** the editor needs
+ *   to resolve its real device root.
  */
 
 const log = logger.tag('local-projects');
+
+/** Why the app cannot resolve its own folder on the phone. */
+const DOCUMENTS_MISSING_REASON =
+  'la app no pudo resolver su carpeta en el teléfono, así que no hay raíz que leer.';
+
+/** The app's documents dir, resolved at runtime (never guessed). */
+async function resolveDocumentsDir(): Promise<string | null> {
+  try {
+    const { Paths } = await import('expo-file-system');
+    const uri = Paths.document?.uri;
+    if (typeof uri === 'string' && uri.trim() !== '') {
+      return uri.trim();
+    }
+    log.failure('documents-dir', new Error(DOCUMENTS_MISSING_REASON), { uri });
+    return null;
+  } catch (error) {
+    log.failure('documents-dir', error, { step: 'resolve-documents' });
+    return null;
+  }
+}
 
 /** Storage surface of the app (AsyncStorage satisfies the injected types). */
 const readKey = (key: string): Promise<string | null> => AsyncStorage.getItem(key);
@@ -79,34 +110,58 @@ function SkeletonCard() {
 function ProjectCard({
   row,
   onOpen,
+  onDelete,
 }: {
   row: ProjectRow;
   onOpen: (row: ProjectRow) => void;
+  onDelete: (row: ProjectRow) => void;
 }) {
   return (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={`${row.name}. ${row.path}. ${row.lastOpenedLabel}. ${row.gitFactsReason}`}
-      accessibilityHint={row.open.note}
-      onPress={() => onOpen(row)}
-      style={({ pressed }) => [styles.card, pressed && styles.cardPressed]}
-      testID={`local-project-${row.id}`}>
-      <View style={styles.cardHead}>
-        <Text style={styles.projectName} numberOfLines={1}>
-          {row.name}
-        </Text>
-        {/* Honest arc: the git facts do not exist on the device yet. */}
-        <View style={styles.gitBadge} testID={`local-project-${row.id}-git`}>
-          <Text style={styles.gitBadgeText}>{row.gitFactsReason}</Text>
+    <View style={styles.card} testID={`local-project-${row.id}`}>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${row.name}. ${row.path}. ${row.lastOpenedLabel}. ${row.disk.label}. ${row.gitFactsReason}`}
+        accessibilityHint={row.open.note}
+        onPress={() => onOpen(row)}
+        style={({ pressed }) => [styles.cardBody, pressed && styles.cardPressed]}>
+        <View style={styles.cardHead}>
+          <Text style={styles.projectName} numberOfLines={1}>
+            {row.name}
+          </Text>
+          {/* Honest arc: the git facts do not exist on the device yet. */}
+          <View style={styles.gitBadge} testID={`local-project-${row.id}-git`}>
+            <Text style={styles.gitBadgeText}>{row.gitFactsReason}</Text>
+          </View>
         </View>
+
+        <Text style={styles.projectPath} numberOfLines={1}>
+          {row.path}
+        </Text>
+        <Text style={styles.meta}>{row.lastOpenedLabel}</Text>
+        <Text style={styles.gitDetail}>{row.gitFactsDetail}</Text>
+      </Pressable>
+
+      {/* T18: what the device really has, or the honest reason. */}
+      <View style={styles.diskRow} testID={`local-project-${row.id}-disk`}>
+        <Text style={styles.diskLabel}>{row.disk.label}</Text>
+        {row.disk.reason !== null && (
+          <Text style={styles.diskReason} numberOfLines={3}>
+            {row.disk.reason}
+          </Text>
+        )}
       </View>
 
-      <Text style={styles.projectPath} numberOfLines={1}>
-        {row.path}
-      </Text>
-      <Text style={styles.meta}>{row.lastOpenedLabel}</Text>
-      <Text style={styles.gitDetail}>{row.gitFactsDetail}</Text>
-    </Pressable>
+      {/* T15: the tap opens the confirmation — it never deletes by itself. */}
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`Eliminar ${row.name} de la lista`}
+        accessibilityHint="Abre una confirmación. Los archivos del teléfono no se tocan."
+        onPress={() => onDelete(row)}
+        style={({ pressed }) => [styles.deleteButton, pressed && styles.deleteButtonPressed]}
+        testID={`local-project-${row.id}-delete`}>
+        <Text style={styles.deleteLabel}>Eliminar</Text>
+      </Pressable>
+    </View>
   );
 }
 
@@ -119,18 +174,39 @@ export default function LocalProjectsScreen() {
   const [fieldError, setFieldError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  /** What each project folder really has on the device (T18). */
+  const [disk, setDisk] = useState<Record<string, ProjectDiskFact>>({});
+  /** Active project: the last one opened/read from this screen. */
+  const [activeId, setActiveId] = useState<string | null>(null);
+  /** Row waiting for the delete confirmation (never deleted on one tap). */
+  const [pendingDelete, setPendingDelete] = useState<ProjectRow | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  /** Reads the real device facts of every project folder, never invented ones. */
+  const loadDisk = useCallback(async (projects: readonly LocalProject[]) => {
+    if (projects.length === 0) {
+      setDisk({});
+      return;
+    }
+    const documentsDir = await resolveDocumentsDir();
+    const facts = await loadProjectDisk(projects, { documentsDir, logger: log });
+    setDisk(facts);
+  }, []);
 
   const load = useCallback(async () => {
     setState({ kind: 'loading' });
     setSaveError(null);
-    setState(await loadProjects(readKey));
-  }, []);
+    const next = await loadProjects(readKey);
+    setState(next);
+    setActiveId(activeProjectId(loadedProjects(next)));
+    await loadDisk(loadedProjects(next));
+  }, [loadDisk]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
-  const vm: ProjectsViewModel = useMemo(() => buildProjectsView(state), [state]);
+  const vm: ProjectsViewModel = useMemo(() => buildProjectsView(state, { disk }), [state, disk]);
 
   const goBack = useCallback(() => {
     if (router.canGoBack()) {
@@ -142,15 +218,74 @@ export default function LocalProjectsScreen() {
 
   const openProject = useCallback(
     (row: ProjectRow) => {
-      log.info('project tap', { projectId: row.id, route: row.open.route });
+      log.info('project tap', { projectId: row.id, route: row.open.route, path: row.path });
+      setActiveId(row.id);
       try {
-        router.push({ pathname: row.open.route, params: { project: row.id, name: row.name } });
+        router.push({
+          pathname: row.open.route,
+          // `path` is what the editor resolves its real device root from.
+          params: { project: row.id, name: row.name, path: row.path },
+        });
       } catch (error) {
         log.failure('navigate', error, { route: row.open.route, projectId: row.id });
       }
     },
-    [log, router],
+    [router],
   );
+
+  /** First step of the delete: only opens the confirmation. */
+  const requestDelete = useCallback((row: ProjectRow) => {
+    log.info('delete tap', { projectId: row.id, path: row.path });
+    setDeleteError(null);
+    setPendingDelete(row);
+  }, []);
+
+  const cancelDelete = useCallback(() => {
+    log.info('delete cancelled', { projectId: pendingDelete?.id ?? null });
+    setPendingDelete(null);
+    setDeleteError(null);
+  }, [pendingDelete]);
+
+  const confirmDelete = useCallback(async () => {
+    const row = pendingDelete;
+    if (row === null) {
+      return;
+    }
+    const result = deleteProjectIntent(row.id, loadedProjects(state), {
+      confirm: true,
+      activeId,
+    });
+    if (!result.ok) {
+      log.failure('delete-project', new Error(result.message), {
+        projectId: row.id,
+        needsConfirm: result.needsConfirm,
+      });
+      setDeleteError(result.message);
+      return;
+    }
+
+    setSaving(true);
+    const saved = await saveProjects(writeKey, result.projects);
+    setSaving(false);
+
+    if (!saved.ok) {
+      log.failure('delete-project-save', new Error(saved.message), { projectId: row.id });
+      setDeleteError(saved.message);
+      return;
+    }
+
+    log.info('project deleted', {
+      projectId: row.id,
+      path: row.path,
+      activeCleared: result.activeCleared,
+      filesTouched: false,
+    });
+    setState({ kind: 'loaded', projects: result.projects });
+    setActiveId(result.activeId);
+    setPendingDelete(null);
+    setDeleteError(null);
+    await loadDisk(result.projects);
+  }, [activeId, loadDisk, pendingDelete, state]);
 
   const submit = useCallback(async () => {
     const result = createProjectIntent(name, loadedProjects(state));
@@ -178,7 +313,8 @@ export default function LocalProjectsScreen() {
     setName('');
     setFormOpen(false);
     setSaveError(null);
-  }, [name, state]);
+    await loadDisk(next);
+  }, [loadDisk, name, state]);
 
   return (
     <View style={styles.screen}>
@@ -256,9 +392,16 @@ export default function LocalProjectsScreen() {
             <Text style={styles.legend}>Proyectos</Text>
             <View style={styles.list}>
               {vm.rows.map((row) => (
-                <ProjectCard key={row.id} row={row} onOpen={openProject} />
+                <ProjectCard key={row.id} row={row} onOpen={openProject} onDelete={requestDelete} />
               ))}
             </View>
+          </View>
+        )}
+
+        {deleteError !== null && (
+          <View style={styles.errorCard} accessibilityRole="alert" testID="local-projects-delete-error">
+            <Text style={styles.errorTitle}>No pudimos eliminar el proyecto</Text>
+            <Text style={styles.errorDetail}>{deleteError}</Text>
           </View>
         )}
 
@@ -315,6 +458,29 @@ export default function LocalProjectsScreen() {
           </Text>
         )}
       </ScrollView>
+
+      {/* T15: the confirmation step. The phone's files are not touched. */}
+      {pendingDelete !== null && (
+        <View style={styles.overlay}>
+          <View style={styles.confirmCard} accessibilityRole="alert" testID="local-projects-delete-confirm">
+            <Text style={styles.confirmTitle}>{vm.delete.confirmTitle}</Text>
+            <Text style={styles.errorMessage}>{deleteConfirmMessage(pendingDelete.name)}</Text>
+            <Text style={styles.errorDetail}>{vm.delete.filesNote}</Text>
+            <View style={styles.confirmActions}>
+              <GhostButton
+                label={vm.delete.cancelLabel}
+                onPress={cancelDelete}
+                disabled={saving}
+              />
+              <GhostButton
+                label={vm.delete.confirmLabel}
+                onPress={() => void confirmDelete()}
+                disabled={saving}
+              />
+            </View>
+          </View>
+        </View>
+      )}
     </View>
   );
 }
@@ -436,8 +602,76 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surface,
     ...elevation.card,
   },
+  cardBody: {
+    gap: 8,
+  },
   cardPressed: {
     borderColor: colors.borderStrong,
+  },
+  diskRow: {
+    gap: 2,
+    paddingTop: spacing.sm,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+  },
+  diskLabel: {
+    ...typography.chip,
+    color: colors.muted,
+  },
+  diskReason: {
+    ...typography.fine,
+    color: colors.faint,
+  },
+  deleteButton: {
+    alignSelf: 'flex-start',
+    minHeight: 32,
+    justifyContent: 'center',
+    paddingHorizontal: spacing.md,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    borderColor: colors.danger,
+    backgroundColor: colors.dangerSoft,
+  },
+  deleteButtonPressed: {
+    borderColor: colors.danger,
+    opacity: 0.8,
+  },
+  deleteLabel: {
+    ...typography.chip,
+    color: colors.danger,
+  },
+  overlay: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    backgroundColor: colors.overlay,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: spacing.xl,
+  },
+  confirmCard: {
+    width: '100%',
+    gap: spacing.sm,
+    padding: spacing.lg,
+    borderRadius: radius.bento,
+    borderWidth: 1,
+    borderColor: colors.borderStrong,
+    backgroundColor: colors.surface,
+    ...elevation.card,
+  },
+  confirmTitle: {
+    ...typography.label,
+    fontSize: 15,
+    lineHeight: 21,
+    color: colors.text,
+  },
+  confirmActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: spacing.sm,
   },
   cardHead: {
     flexDirection: 'row',

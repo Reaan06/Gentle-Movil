@@ -37,16 +37,18 @@ import {
   TREE_EMPTY_COPY,
   TREE_EMPTY_NOTE,
   TreeCache,
-  bridgeEditorSource,
   breadcrumb,
   closeBuffer,
   editBuffer,
+  editorLog,
+  editorSourceFor,
   loadTree,
   readFile,
   renderCode,
   saveIntent,
   treeRows,
 } from '../lib/local-editor';
+import { projectRootFor } from '../lib/local-projects';
 import { logger } from '../lib/logger';
 import { bridgeChannel } from '../lib/tunnel-store';
 import { colors, elevation, radius, spacing, typography } from '../lib/theme';
@@ -64,11 +66,15 @@ import { colors, elevation, radius, spacing, typography } from '../lib/theme';
  *
  * Only real facts are drawn:
  *
- * - content comes from the injected source: `bridgeEditorSource(bridgeChannel())`
- *   asks the bridge when a tunnel is open. A `404`/`501` is an error card with
+ * - content comes from the source the mode composes (T18):
+ *   `bridgeEditorSource` over a live tunnel (the files are on the PC), and
+ *   `localFsEditorSource` over the core's frozen `fsList`/`fsRead` rooted at the
+ *   project's **real** folder on the phone (app documents dir + the recorded
+ *   relative path) when there is no tunnel. A `404`/`501` is an error card with
  *   the failure, never an empty file;
- * - with no tunnel the screen is `no-fs` and says why out loud (`sin acceso a
- *   archivos`: the Rust core has no fs FFI yet) — no blank buffer, no fake list;
+ * - local mode without a resolvable root, or with a core that has no symbols,
+ *   is `no-fs` and says why out loud with the real path and the real cause — no
+ *   blank buffer, no fake list;
  * - there is no syntax highlighting: the pane paints the real text on
  *   `colors.codeBg` with line numbers, and nothing else;
  * - save is not wired: the button logs `route pending` for `/api/fs/write` and
@@ -81,6 +87,10 @@ import { colors, elevation, radius, spacing, typography } from '../lib/theme';
  */
 
 const log = logger.tag('local-editor');
+
+/** Why the app could not resolve its own folder on the phone. */
+const DOCUMENTS_MISSING_REASON =
+  'la app no pudo resolver su carpeta en el teléfono, así que no hay raíz que leer.';
 
 /** Width from which the file list sits next to the pane instead of collapsing. */
 const WIDE_LAYOUT = 720;
@@ -195,9 +205,72 @@ export default function LocalEditorScreen() {
     const raw = typeof params.name === 'string' ? params.name.trim() : '';
     return raw === '' ? EDITOR_TITLE : raw;
   }, [params.name]);
-  const projectPath = typeof params.path === 'string' ? params.path.trim() : '';
+  const projectPath = useMemo(
+    () => (typeof params.path === 'string' ? params.path.trim() : ''),
+    [params.path],
+  );
 
-  const [source, setSource] = useState<EditorSource>(() => bridgeEditorSource(bridgeChannel()));
+  /** `undefined` while the app documents dir is being resolved, then a value or null. */
+  const [documentsDir, setDocumentsDir] = useState<string | null | undefined>(undefined);
+  const [rootReason, setRootReason] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        // Same module the logger writes with: the app documents dir, resolved
+        // at runtime so a build without it says so instead of guessing a root.
+        const { Paths } = await import('expo-file-system');
+        const uri = Paths.document?.uri;
+        if (cancelled) {
+          return;
+        }
+        if (typeof uri === 'string' && uri.trim() !== '') {
+          setDocumentsDir(uri.trim());
+        } else {
+          log.failure('documents-dir', new Error(DOCUMENTS_MISSING_REASON), { uri });
+          setRootReason(DOCUMENTS_MISSING_REASON);
+          setDocumentsDir(null);
+        }
+      } catch (error) {
+        log.failure('documents-dir', error, { step: 'resolve-documents' });
+        if (!cancelled) {
+          setRootReason(DOCUMENTS_MISSING_REASON);
+          setDocumentsDir(null);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * Source of the mode: the tunnel when it is open (files on the PC), the real
+   * device root otherwise. Without a root the composition itself reports `no-fs`
+   * with the reason — never an empty project.
+   */
+  const buildSource = useCallback(
+    (dir: string | null): EditorSource => {
+      const channel = bridgeChannel();
+      if (channel !== null) {
+        return editorSourceFor({ channel, root: null, logger: editorLog });
+      }
+      const rooted =
+        dir === null
+          ? ({ ok: false, message: rootReason ?? DOCUMENTS_MISSING_REASON } as const)
+          : projectRootFor(projectPath, dir);
+      return editorSourceFor({
+        channel: null,
+        root: rooted.ok ? rooted.root : null,
+        rootReason: rooted.ok ? null : rooted.message,
+        logger: editorLog,
+      });
+    },
+    [projectPath, rootReason],
+  );
+
+  const [source, setSource] = useState<EditorSource | null>(null);
   const [tree, setTree] = useState<TreeState>({ kind: 'loading' });
   const [bufferState, setBufferState] = useState<BufferState | null>(null);
   const [openingPath, setOpeningPath] = useState<string | null>(null);
@@ -221,7 +294,16 @@ export default function LocalEditorScreen() {
   );
 
   useEffect(() => {
-    void load(source);
+    if (documentsDir === undefined) {
+      return;
+    }
+    setSource(buildSource(documentsDir));
+  }, [buildSource, documentsDir]);
+
+  useEffect(() => {
+    if (source !== null) {
+      void load(source);
+    }
   }, [load, source]);
 
   const rows = useMemo(() => {
@@ -333,14 +415,16 @@ export default function LocalEditorScreen() {
   const retry = useCallback(() => {
     log.info('retry read', { route: '/local-editor', note: RETRY_NOTE });
     setSaveNote(null);
-    const next = bridgeEditorSource(bridgeChannel());
-    setSource(next);
+    if (documentsDir === undefined) {
+      return;
+    }
+    setSource(buildSource(documentsDir));
     // A retry never throws away typed text: it only re-asks when the buffer is
     // closed or untouched.
     if (lastReadPath !== null && (buffer === null || !buffer.dirty)) {
       void readPath(lastReadPath);
     }
-  }, [buffer, lastReadPath, readPath]);
+  }, [buffer, buildSource, documentsDir, lastReadPath, readPath]);
 
   // On a narrow phone the list collapses unless it is the only thing there is
   // (no rows: loading, empty, no-fs, error), so a capability gap is never
@@ -479,7 +563,7 @@ export default function LocalEditorScreen() {
                   tone="warning"
                   title={NO_FS_COPY}
                   message={tree.message}
-                  detail="En modo local los archivos saldrían del core del teléfono, que todavía no expone fs_read."
+                  detail={tree.raw}
                   testID="local-editor-no-fs"
                 />
               )}
@@ -530,8 +614,8 @@ export default function LocalEditorScreen() {
               <View style={styles.welcome}>
                 <Text style={styles.welcomeTitle}>{NO_FILE_COPY}</Text>
                 <Text style={styles.meta}>
-                  El árbol sale de la PC cuando hay túnel. Sin túnel, este editor no puede leer
-                  archivos todavía.
+                  Con túnel, el árbol sale de la PC. En modo local sale de la carpeta del proyecto en
+                  el teléfono.
                 </Text>
               </View>
             )}

@@ -81,8 +81,10 @@ export function parseOnboarded(raw: string | null): boolean {
 }
 
 /**
- * Which entry route the app takes for the given flag: `/overview` when the
- * onboarding already finished, `/scan-qr` otherwise (the first step of V1).
+ * The route a flag state maps to: `/overview` when the onboarding already
+ * finished, `/scan-qr` otherwise (the first step of V1). `bootDecision` below is
+ * what the entry really uses (a saved pairing wins over the flag, S12), and it
+ * takes its routes from here so there is one place that names them.
  */
 export function initialRouteFor(onboarded: boolean): string {
   return onboarded ? APP_HOME_ROUTE : ONBOARDING_START_ROUTE;
@@ -228,4 +230,137 @@ export async function rePair(
   const cleared = await clearOnboarded(storage, log);
   log?.info('volver al onboarding', { route: ONBOARDING_START_ROUTE, cleared });
   return { route: ONBOARDING_START_ROUTE, cleared };
+}
+
+/* ------------------------------------------------------------------ *
+ * Boot gate (T17, S11/S12)
+ * ------------------------------------------------------------------ */
+
+/** One saved device, as the boot gate reads it (`ConnectionRecord` satisfies it). */
+export interface BootConnection {
+  id: string;
+}
+
+/** Everything the entry is allowed to decide on. */
+export interface BootGateInput {
+  /** `gentle-movil:onboarded` as `readOnboarded` reported it. */
+  onboarded: boolean;
+  /** The active saved connection, or `null` when there is none. */
+  connection: BootConnection | null;
+  /** How many connections are saved (defaults to 0; `connection` implies one). */
+  saved?: number;
+  /**
+   * `gentle-movil:mode` as the person chose it in V4 (`readChosenMode`), or
+   * `null` when the phone has never chosen one. Local mode needs no PC at all,
+   * so this input is what keeps those people out of the QR onboarding.
+   */
+  mode: AppMode | null;
+}
+
+/** Why a local-mode boot with no saved connection goes home instead of pairing. */
+export const LOCAL_MODE_NO_PC_REASON =
+  'modo local: este teléfono no necesita ninguna PC para trabajar; podés agregar una conexión cuando quieras desde el menú de conexión';
+
+/**
+ * Appended to the pairing reason when the phone never chose a mode: the gate
+ * must not read a missing choice as "local", so it says so out loud.
+ */
+export const UNKNOWN_MODE_NO_CONNECTION_NOTE =
+  'no hay ningún modo elegido, así que no podemos asumir el modo local';
+
+/** The reason a `conectado`/`ambos` phone with nothing saved pairs again. */
+export const PAIRING_LOST_REASON =
+  'el onboarding terminó pero no queda ninguna conexión guardada: hay que emparejar de nuevo';
+
+/** The reason a fresh install (or a phone with no mode) starts at V1. */
+export const FIRST_LAUNCH_REASON = 'primer arranque sin ninguna conexión guardada';
+
+/** What the entry does next and why. */
+export interface BootDecision {
+  /** `onboarding` shows V1 again; `home` enters the app. */
+  kind: 'onboarding' | 'home';
+  /** Route to redirect to (`/scan-qr` or `/overview`). */
+  route: string;
+  /** True when the app must reconnect with the saved device key (S12). */
+  reconnect: boolean;
+  /** The saved connection the reconnect will use, when there is one. */
+  connection: BootConnection | null;
+  /** Honest explanation, logged by the entry. */
+  reason: string;
+}
+
+/**
+ * The boot decision table of S11/S12/S6, mode-aware.
+ *
+ * S12 is the rule that wins: the onboarding is shown **only** when there is no
+ * saved connection at all. A saved pairing sends the app to the home screen and
+ * to a real reconnect, with or without the legacy `onboarded` flag — and a flag
+ * without any saved pairing is not a connection (it would reconnect to
+ * nothing), so it goes back to the onboarding and says why.
+ *
+ * S6 is the other half: local mode is a real mode of the product, and it needs
+ * no PC at all. So a `local` phone with nothing saved enters the app and does
+ * **not** reconnect — it must never be locked out of its own local projects by
+ * a QR screen. `conectado`/`ambos` still pair (that half of the product needs a
+ * PC), and a phone that never chose a mode is not read as local: it pairs and
+ * the reason says the choice is missing.
+ *
+ * | mode | saved connection | decision |
+ * | --- | --- | --- |
+ * | any | active connection | `/overview`, reconnect (the pairing wins) |
+ * | any | records, none active | `/overview`, no reconnect, pick one in the menu |
+ * | `local` | none | `/overview`, no reconnect, `LOCAL_MODE_NO_PC_REASON` |
+ * | `conectado` | none | `/scan-qr`, no reconnect, the existing reason |
+ * | `ambos` | none | `/scan-qr`, no reconnect, the existing reason |
+ * | `null` | none | `/scan-qr`, no reconnect, the existing reason + `UNKNOWN_MODE_NO_CONNECTION_NOTE` |
+ */
+export function bootDecision(input: BootGateInput): BootDecision {
+  const saved = input.saved ?? (input.connection === null ? 0 : 1);
+
+  if (input.connection !== null) {
+    return {
+      kind: 'home',
+      route: initialRouteFor(true),
+      reconnect: true,
+      connection: input.connection,
+      reason: input.onboarded
+        ? 'el onboarding ya terminó y hay una conexión guardada: la app reconecta sola'
+        : 'hay una conexión guardada aunque el flag del onboarding no esté: reconecta sin repetir el onboarding',
+    };
+  }
+
+  if (saved > 0) {
+    return {
+      kind: 'home',
+      route: initialRouteFor(true),
+      reconnect: false,
+      connection: null,
+      reason:
+        'hay conexiones guardadas pero ninguna está marcada como activa: elegí una desde el menú de conexión',
+    };
+  }
+
+  // No saved connection. Local mode is the one that works without a PC.
+  if (input.mode === 'local') {
+    return {
+      kind: 'home',
+      route: initialRouteFor(true),
+      reconnect: false,
+      connection: null,
+      reason: LOCAL_MODE_NO_PC_REASON,
+    };
+  }
+
+  const pairingReason = input.onboarded ? PAIRING_LOST_REASON : FIRST_LAUNCH_REASON;
+  return {
+    kind: 'onboarding',
+    route: initialRouteFor(false),
+    reconnect: false,
+    connection: null,
+    // A missing mode is never read as `local`: say that the choice is missing.
+    reason:
+      input.mode === null
+        ? `${pairingReason}; ${UNKNOWN_MODE_NO_CONNECTION_NOTE}`
+        : pairingReason,
+  };
 }

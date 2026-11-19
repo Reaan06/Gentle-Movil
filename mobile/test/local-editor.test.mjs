@@ -16,7 +16,12 @@
  * - saving is a `pending: true` intent for `POST /api/fs/write` with the honest
  *   note, so the buffer stays dirty after the tap;
  * - seven honest states: `loading | empty | success | stale | offline | error`
- *   plus `no-fs`, whose copy names the real cause (no fs FFI in the core).
+ *   plus `no-fs`, whose copy names the real cause (the core fs symbols missing,
+ *   or no device root: T18 wired local mode to the real device files).
+ *
+ * T18 cases (`(g2)` below) pin the per-mode composition: connected keeps the
+ * tunnel source, local mode reads the device root through the core surface, and
+ * a build without `fsList`/`fsRead` stays an honest `no-fs` naming that root.
  *
  * No channel and no device are needed: the source is injected, and the two
  * cases that do speak to the bridge use a fake channel carrying the real
@@ -42,6 +47,7 @@ import {
   bridgeEditorSource,
   closeBuffer,
   editBuffer,
+  editorSourceFor,
   expandTabs,
   formatSize,
   loadTree,
@@ -315,8 +321,9 @@ test('(g) local mode (no source) is no-fs, naming the missing core fs FFI', asyn
   assert.equal(state.kind, 'no-fs');
   assert.match(state.message, /sin acceso a archivos/i);
   assert.match(state.message, /core/i);
-  assert.match(state.message, /ffi/i);
-  assert.match(state.message, /fs_read/);
+  // T18: the copy names the two frozen symbols the core must expose.
+  assert.match(state.message, /fsList/);
+  assert.match(state.message, /fsRead/);
   assert.equal('entries' in state, false, 'no blank tree that looks like an empty project');
 
   // The real default source with no tunnel says exactly the same thing.
@@ -432,6 +439,87 @@ test('the bridge entry shape (type + content) parses, and a symlink is refused b
   );
   assert.equal(symlink.kind, 'error');
   assert.match(symlink.message, /\.bin/);
+});
+
+/* ------------------------------------------------------------------ *
+ * (g2) T18: the source is composed per mode — tunnel when connected, device
+ * files in local mode, and an honest no-fs when there is no root or no symbols
+ * ------------------------------------------------------------------ */
+
+test('(g2) connected mode keeps the tunnel source', async () => {
+  const log = silentLogger();
+  const channel = httpChannel({ entries: [ENTRY('a.ts', { size: 1 })] });
+
+  const tree = await loadTree(editorSourceFor({ channel, root: null }), { logger: log });
+
+  assert.equal(tree.kind, 'success');
+  assert.match(channel.writes[0], new RegExp(`^GET ${FS_TREE_PATH} `), 'the bridge is the source');
+});
+
+test('(g2) local mode reads the device files through the injected core surface', async () => {
+  const log = silentLogger();
+  const root = '/data/user/0/ai.gentle.movil/files/proyectos/vita-app';
+  const calls = [];
+  const fsApi = {
+    async fsList(input) {
+      calls.push(['list', input]);
+      return { entries: [ENTRY('a.ts', { size: 3 })] };
+    },
+    async fsRead(input) {
+      calls.push(['read', input]);
+      return { path: input.path, text: 'ok\n', size: 3, truncated: false };
+    },
+  };
+
+  const source = editorSourceFor({ channel: null, root, fsApi, logger: log });
+  const tree = await loadTree(source, { logger: log });
+  assert.equal(tree.kind, 'success');
+  assert.deepEqual(calls[0], ['list', { root, path: '', maxEntries: 2_000 }]);
+
+  const read = await readFile(source, 'a.ts', { logger: log });
+  assert.equal(read.kind, 'success');
+  assert.equal(read.buffer.text, 'ok\n');
+  assert.equal(calls[1][0], 'read');
+});
+
+test('(g2) a local mode without a device root is no-fs with the real reason', async () => {
+  const log = silentLogger();
+
+  const noRoot = await loadTree(editorSourceFor({ channel: null, root: null, logger: log }), {
+    logger: log,
+  });
+  assert.equal(noRoot.kind, 'no-fs');
+  assert.match(noRoot.message, /sin acceso a archivos/i);
+  assert.match(noRoot.message, /carpeta de la app/i);
+  assert.equal('entries' in noRoot, false);
+
+  // The reason the caller knows wins, so the copy names the real cause.
+  const withReason = await loadTree(
+    editorSourceFor({ channel: null, root: null, rootReason: 'el proyecto no tiene ruta', logger: log }),
+    { logger: log },
+  );
+  assert.equal(withReason.kind, 'no-fs');
+  assert.match(withReason.message, /el proyecto no tiene ruta/);
+
+  // A blank root is not a root either.
+  const blank = await loadTree(editorSourceFor({ channel: null, root: '   ', logger: log }), {
+    logger: log,
+  });
+  assert.equal(blank.kind, 'no-fs');
+});
+
+test('(g2) a core build without the fs symbols is no-fs naming the real root', async () => {
+  const log = silentLogger();
+  const root = '/data/user/0/ai.gentle.movil/files/proyectos/vita-app';
+
+  const state = await loadTree(editorSourceFor({ channel: null, root, fsApi: null, logger: log }), {
+    logger: log,
+  });
+
+  assert.equal(state.kind, 'no-fs');
+  assert.ok(state.message.includes(root), 'the copy names the real root');
+  assert.match(state.message, /fsList/);
+  assert.equal('entries' in state, false, 'never an empty project');
 });
 
 /* ------------------------------------------------------------------ *

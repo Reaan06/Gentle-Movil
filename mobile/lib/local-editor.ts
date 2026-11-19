@@ -38,6 +38,7 @@
 
 import { type TunnelChannel, bridgeRequest } from './bridge.ts';
 import { logger } from './logger.ts';
+import { type LocalFsApi, type LocalFsDeps, localFsEditorSource } from './local-fs.ts';
 
 /* ------------------------------------------------------------------ *
  * Routes, endpoints and copy (es-AR)
@@ -73,9 +74,9 @@ export const DISPLAY_CHAR_CAP = 20_000;
 /** Copy of the `no-fs` state: what happens, in the person's words. */
 export const NO_FS_COPY = 'Sin acceso a archivos';
 
-/** The real cause: there is no filesystem FFI in the core yet. */
+/** The real cause: this build's core has no fs FFI to read the device with. */
 export const NO_FS_REASON =
-  'el core Rust todavía no expone fs_read/fs_list: no hay FFI de archivos en el teléfono.';
+  'esta build del core Rust no expone fsList/fsRead, así que no hay FFI de archivos en el teléfono.';
 
 /** Full `no-fs` sentence (title + real cause). */
 export const NO_FS_MESSAGE = `${NO_FS_COPY}: ${NO_FS_REASON}`;
@@ -510,6 +511,28 @@ export interface EditorLogger {
   failure(step: string, error: unknown, raw?: unknown): void;
 }
 
+/** Input of `editorSourceFor` (everything injected: no device, no tunnel). */
+export interface EditorSourceInput {
+  /** Live tunnel channel in connected mode; `null` is local mode. */
+  channel: TunnelChannel | null;
+  /**
+   * Absolute project root on the device (local mode), or `null` when unknown. It may still
+   * arrive as the `file://` URI `expo-file-system` answers: `localFsEditorSource` reduces it
+   * to the canonical path before the core sees it.
+   */
+  root: string | null;
+  /**
+   * Core fs surface. Omitted → resolved from the real ABI layer
+   * (`modules/gentle-core/src/abi.ts`); `null` → the caller knows this build has no
+   * `fsList`/`fsRead`.
+   */
+  fsApi?: LocalFsApi | null;
+  /** Failure sink; defaults to `editorLog`. */
+  logger?: EditorLogger;
+  /** Why `root` is unknown, when the caller knows the real reason. */
+  rootReason?: string | null;
+}
+
 /** Default failure sink for the app (one tag, one ring buffer, one log). */
 export const editorLog: EditorLogger = logger.tag('local-editor');
 
@@ -543,6 +566,50 @@ export function bridgeEditorSource(channel: TunnelChannel | null): EditorSource 
     list: () => request(channel, FS_TREE_PATH),
     read: (path: string) => request(channel, `${FS_READ_PATH}?path=${encodeURIComponent(path)}`),
   };
+}
+
+/** Reason used when local mode has no device root to read from. */
+export const LOCAL_ROOT_MISSING_REASON =
+  'no pudimos resolver la carpeta de la app en el teléfono, así que no hay raíz que leer.';
+
+/**
+ * Compose the source for the mode the app is in (T18).
+ *
+ * - a live tunnel (connected mode) keeps the bridge over SSH: the files are on
+ *   the PC and `bridgeEditorSource` is the only thing that can read them;
+ * - local mode reads the phone through `localFsEditorSource` with the project's
+ *   **real** root (the core's frozen `fsList`/`fsRead`);
+ * - local mode without a resolvable root, or with a core that has no symbols,
+ *   stays `no-fs` with the real reason — never an empty project.
+ */
+export function editorSourceFor(input: EditorSourceInput): EditorSource {
+  if (input.channel !== null) {
+    return bridgeEditorSource(input.channel);
+  }
+
+  const root = typeof input.root === 'string' ? input.root.trim() : '';
+  if (root === '') {
+    const message = `${NO_FS_COPY}: ${input.rootReason ?? LOCAL_ROOT_MISSING_REASON}`;
+    const missing: EditorFailure = { kind: 'no-fs', message, raw: 'root=null' };
+    (input.logger ?? editorLog).failure('source', new Error(message), missing.raw);
+    return {
+      async list() {
+        return { ok: false, failure: missing };
+      },
+      async read() {
+        return { ok: false, failure: missing };
+      },
+    };
+  }
+
+  const deps: LocalFsDeps = { logger: input.logger ?? editorLog };
+  // `undefined` lets local-fs resolve the surface from the real ABI layer
+  // (`modules/gentle-core/src/abi.ts`); `null` is a caller that already knows this build
+  // has no symbols.
+  if (input.fsApi !== undefined) {
+    deps.api = input.fsApi;
+  }
+  return localFsEditorSource(root, deps);
 }
 
 /** Bridge failure kind → this module's kind (there is no `protocol-status` here). */
