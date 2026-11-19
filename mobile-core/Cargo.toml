@@ -13,7 +13,7 @@ crate-type = ["rlib", "staticlib", "cdylib"]
 
 [dependencies]
 # JNI shim (android only): marshalling between Kotlin GcNative extern funs and the C ABI.
-jni = { version = "=0.21.1", optional = true }
+jni = { version = "=0.22.4", optional = true }
 # SSH transport. `ring` backend instead of the default `aws-lc-rs` so the crate
 # builds without a C toolchain-capable cmake/nasm setup and stays on rust 1.75.
 # 0.54.1 is the newest russh release whose MSRV is 1.75. Note that russh 0.54 has
@@ -21,10 +21,10 @@ jni = { version = "=0.21.1", optional = true }
 # `russh::Channel`, which cannot be reached through the object-safe transport traits
 # this crate tests offline. `provision` therefore speaks the small SFTP v3 subset it
 # needs over the mockable channel (see `provision`'s module docs).
-russh = { version = "=0.54.1", default-features = false, features = ["ring", "flate2"] }
+russh = { version = "=0.60.3", default-features = false, features = ["ring", "flate2"] }
 # ed25519 device identity + release-signature verification. 2.1.1 is the newest
 # 2.x line that still builds on rust 1.75.
-ed25519-dalek = { version = "=2.1.1", features = ["rand_core"] }
+ed25519-dalek = { version = "=3.0.0-pre", features = ["rand_core"] }
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
 tokio = { version = "=1.42.0", features = ["io-util", "net", "sync", "rt", "rt-multi-thread", "time", "macros"] }
 # Checksum of the daemon binary before its release signature is checked (§3.2).
