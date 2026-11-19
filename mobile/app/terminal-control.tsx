@@ -211,7 +211,7 @@ function HistoryRowView({
 /** A command typed here that never left the phone (`no enviado`). */
 function NotSentRowView({ row }: { row: HistoryRow }) {
   return (
-    <View style={styles.notSent} accessibilityRole="status">
+    <View style={styles.notSent} accessibilityRole="summary">
       <View style={styles.rowTop}>
         <Text style={styles.notSentCommand} numberOfLines={1}>
           {`$ ${row.command}`}
@@ -348,7 +348,7 @@ function TranscriptSection({ vm }: { vm: TerminalViewModel }) {
         </View>
       </View>
 
-      <View style={styles.agentNote} accessibilityRole="status">
+      <View style={styles.agentNote} accessibilityRole="summary">
         <Text style={styles.agentNoteTitle}>{AGENT_NOTE}</Text>
         <Text style={styles.agentNoteReason}>{transcript.agentReason}</Text>
       </View>
@@ -591,7 +591,7 @@ export default function TerminalControlScreen() {
         )}
 
         {banner === null && vm.banner !== null && (
-          <View style={styles.offlineStrip} accessibilityRole="status">
+          <View style={styles.offlineStrip} accessibilityRole="summary">
             <ActivityIndicator size="small" color={colors.warning} />
             <View style={styles.offlineText}>
               <Text style={styles.offlineTitle}>{vm.banner}</Text>
@@ -645,7 +645,7 @@ export default function TerminalControlScreen() {
         )}
 
         {note !== null && (
-          <View style={styles.noteCard} accessibilityRole="status">
+          <View style={styles.noteCard} accessibilityRole="summary">
             <Text style={styles.noteText}>{note}</Text>
           </View>
         )}

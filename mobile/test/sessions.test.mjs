@@ -84,45 +84,54 @@ const session = (id, status, title, updatedAt, hint = 'gentle-movil') => ({
   updatedAt,
 });
 
+// The three statuses §9.3 publishes: busy, idle, unknown.
 const FOUR = [
-  session('s1', 'working', 'feat/auth-login', '2026-11-18T15:00:00Z'),
-  session('s2', 'waiting', 'fix/daemon-retry', '2026-11-18T14:58:00Z'),
-  session('s3', 'done', 'chore/ota-config', '2026-11-18T14:12:00Z'),
-  session('s4', 'done', 'docs/mobile-protocol', '2026-11-17T21:40:00Z'),
+  session('s1', 'busy', 'feat/auth-login', '2026-11-18T15:00:00Z'),
+  session('s2', 'idle', 'fix/daemon-retry', '2026-11-18T14:58:00Z'),
+  session('s3', 'idle', 'chore/ota-config', '2026-11-18T14:12:00Z'),
+  session('s4', 'unknown', 'docs/mobile-protocol', '2026-11-17T21:40:00Z'),
 ];
 
-test('(a) 4 sessions → one count per §V6 filter, counts sum to All', () => {
+test('(a) 4 sessions → one count per real state, counts sum to All', () => {
   const counts = filterCounts(FOUR);
-  assert.deepEqual(counts, { all: 4, working: 1, waiting: 1, done: 2 });
-  assert.equal(counts.working + counts.waiting + counts.done, counts.all);
+  assert.deepEqual(counts, { all: 4, busy: 1, idle: 2, unknown: 1 });
+  assert.equal(counts.busy + counts.idle + counts.unknown, counts.all);
 });
 
-test('(a) filter chips carry the artboard labels, counts and the active flag', () => {
-  const chips = filterChips(FOUR, 'working');
+test('(a) filter chips carry the real state labels, counts and the active flag', () => {
+  const chips = filterChips(FOUR, 'busy');
   assert.deepEqual(
     chips.map((chip) => [chip.id, chip.label, chip.count, chip.active]),
     [
       ['all', 'Todas', 4, false],
-      ['working', 'Trabajando', 1, true],
-      ['waiting', 'Esperando', 1, false],
-      ['done', 'Terminadas', 2, false],
+      ['busy', 'Trabajando', 1, true],
+      ['idle', 'Listas', 2, false],
+      ['unknown', 'Sin estado', 1, false],
     ],
   );
 });
 
-test('(g) All filter includes every visible status', () => {
+test('(g) All filter includes every status the bridge reports', () => {
   const ids = filterSessions(FOUR, 'all').map((s) => s.id);
   assert.deepEqual(ids.sort(), ['s1', 's2', 's3', 's4']);
-  assert.equal(filterSessions(FOUR, 'working').length, 1);
-  assert.equal(filterSessions(FOUR, 'waiting').length, 1);
-  assert.equal(filterSessions(FOUR, 'done').length, 2);
+  assert.equal(filterSessions(FOUR, 'busy').length, 1);
+  assert.equal(filterSessions(FOUR, 'idle').length, 2);
+  assert.equal(filterSessions(FOUR, 'unknown').length, 1);
 });
 
-test('(g) archived sessions leave the list, so All equals the status sum', () => {
-  const withArchived = [...FOUR, session('s9', 'archived', 'chore/old', '2026-11-16T10:00:00Z')];
-  const counts = filterCounts(withArchived);
-  assert.deepEqual(counts, { all: 4, working: 1, waiting: 1, done: 2 });
-  assert.equal(filterSessions(withArchived, 'all').some((s) => s.id === 's9'), false);
+test('(g) a status outside the contract lands in "unknown", never dropped', async () => {
+  // `queued` is not a state of §9.3: the parser maps it to `unknown` and the
+  // row stays visible, so nothing the PC sent disappears from the list.
+  const state = await loadSessions(
+    okChannel([...FOUR, session('s9', 'queued', 'chore/old', '2026-11-16T10:00:00Z')]),
+    { logger: recordingLogger() },
+  );
+  assert.equal(state.kind, 'success');
+  const counts = filterCounts(state.sessions);
+  assert.deepEqual(counts, { all: 5, busy: 1, idle: 2, unknown: 2 });
+  const vm = buildSessionsView(state, 'unknown');
+  assert.deepEqual(vm.rows.map((row) => row.id).sort(), ['s4', 's9']);
+  assert.equal(vm.rows.every((row) => row.pill.label === 'Sin estado'), true);
 });
 
 test('(b) most recently updated first, ISO parsed as instants', () => {
@@ -152,7 +161,7 @@ test('(c) relative copy: singular and plural in minutes, hours and days', () => 
 
 test('(d) an empty PC is the empty state, never success with zeros', async () => {
   const log = recordingLogger();
-  const state = await loadSessions(okChannel({ sessions: [] }), { logger: log });
+  const state = await loadSessions(okChannel([]), { logger: log });
   assert.deepEqual(state, { kind: 'empty' });
   assert.equal(log.failures.length, 0);
 
@@ -247,7 +256,7 @@ test('timeout with no previous answer is offline (nothing truthful to show)', as
 test('timeout after a good answer is stale with the cached rows and minutes', async () => {
   const cache = new SessionsCache();
   const log = recordingLogger();
-  const good = await loadSessions(okChannel({ sessions: FOUR }), { cache, logger: log });
+  const good = await loadSessions(okChannel(FOUR), { cache, logger: log });
   assert.equal(good.kind, 'success');
 
   const state = await loadSessions(silentChannel(), { cache, logger: log, timeoutMs: 20 });
@@ -263,7 +272,7 @@ test('timeout after a good answer is stale with the cached rows and minutes', as
 
 test('offline after a good answer keeps the rows readable and frozen', async () => {
   const cache = new SessionsCache();
-  await loadSessions(okChannel({ sessions: FOUR }), { cache, logger: recordingLogger() });
+  await loadSessions(okChannel(FOUR), { cache, logger: recordingLogger() });
   const state = await loadSessions(null, { cache, logger: recordingLogger() });
   assert.equal(state.kind, 'offline');
   assert.equal(state.sessions.length, 4);
@@ -276,9 +285,17 @@ test('offline after a good answer keeps the rows readable and frozen', async () 
   assert.equal(vm.rows.every((row) => row.frozen), true);
 });
 
-test('success maps real rows onto the §V6 row view model, newest first', async () => {
+test('a documented bare array and a {sessions} envelope both parse', async () => {
+  const bare = await loadSessions(okChannel(FOUR), { logger: recordingLogger() });
+  const wrapped = await loadSessions(okChannel({ sessions: FOUR }), { logger: recordingLogger() });
+  assert.equal(bare.kind, 'success');
+  assert.equal(wrapped.kind, 'success');
+  assert.deepEqual(bare.sessions.map((s) => s.id), wrapped.sessions.map((s) => s.id));
+});
+
+test('success maps real rows onto the row view model, newest first', async () => {
   const log = recordingLogger();
-  const state = await loadSessions(okChannel({ sessions: [FOUR[3], FOUR[0], FOUR[1], FOUR[2]] }), {
+  const state = await loadSessions(okChannel([FOUR[3], FOUR[0], FOUR[1], FOUR[2]]), {
     logger: log,
   });
   assert.equal(state.kind, 'success');
@@ -286,47 +303,48 @@ test('success maps real rows onto the §V6 row view model, newest first', async 
 
   const vm = buildSessionsView(state, 'all');
   assert.equal(vm.state, 'success');
-  assert.equal(vm.summary, '1 trabajando · 1 esperando · 2 terminadas');
+  assert.equal(vm.summary, '1 trabajando · 2 listas · 1 sin estado');
   assert.deepEqual(
     vm.rows.map((row) => row.id),
     ['s1', 's2', 's3', 's4'],
   );
-  const [working, waiting, done] = vm.rows;
-  assert.equal(working.pill.label, 'Trabajando');
-  assert.equal(working.pill.tone, 'working');
-  assert.equal(working.hint, 'gentle-movil');
-  assert.match(working.relative, /^hace /);
-  assert.equal(working.route, '/session/s1');
-  assert.equal(working.attention, false);
-  assert.equal(waiting.pill.label, 'Esperando');
-  assert.equal(waiting.pill.tone, 'waiting');
-  assert.equal(waiting.attention, true);
-  assert.equal(done.pill.label, 'Terminada');
-  assert.equal(done.pill.tone, 'ok');
+  const [busy, idle, , unknown] = vm.rows;
+  assert.equal(busy.pill.label, 'Trabajando');
+  assert.equal(busy.pill.tone, 'working');
+  assert.equal(busy.hint, 'gentle-movil');
+  assert.match(busy.relative, /^hace /);
+  assert.equal(busy.route, '/session/s1');
+  assert.equal(busy.attention, false);
+  assert.equal(idle.pill.label, 'Lista');
+  assert.equal(idle.pill.tone, 'ok');
+  assert.equal(idle.attention, false);
+  assert.equal(unknown.pill.label, 'Sin estado');
+  assert.equal(unknown.pill.tone, 'muted');
 });
 
 test('a session with no hint falls back to the title, never an empty line', async () => {
-  const payload = { sessions: [{ ...FOUR[0], hint: null }] };
+  const payload = [{ ...FOUR[0], hint: null }];
   const state = await loadSessions(okChannel(payload), { logger: recordingLogger() });
   const vm = buildSessionsView(state);
   assert.equal(vm.rows[0].hint, 'feat/auth-login');
 });
 
-test('an unknown status shows its raw value on a muted pill, not a made-up one', () => {
-  assert.deepEqual(pillFor('working'), { label: 'Trabajando', tone: 'working' });
-  assert.deepEqual(pillFor('queued'), { label: 'queued', tone: 'muted' });
+test('a status outside the contract shows "Sin estado", never a made-up one', () => {
+  assert.deepEqual(pillFor('busy'), { label: 'Trabajando', tone: 'working' });
+  assert.deepEqual(pillFor('idle'), { label: 'Lista', tone: 'ok' });
+  assert.deepEqual(pillFor('queued'), { label: 'Sin estado', tone: 'muted' });
 });
 
 test('an empty filter says why it is empty without claiming the PC is empty', async () => {
-  const state = await loadSessions(okChannel({ sessions: FOUR }), { logger: recordingLogger() });
-  const vm = buildSessionsView(state, 'waiting');
-  assert.equal(vm.rows.length, 1);
+  const state = await loadSessions(okChannel(FOUR), { logger: recordingLogger() });
+  const vm = buildSessionsView(state, 'idle');
+  assert.equal(vm.rows.length, 2);
   const workingOnly = buildSessionsView(
     { kind: 'success', sessions: [FOUR[0]] },
-    'done',
+    'idle',
   );
   assert.equal(workingOnly.rows.length, 0);
-  assert.equal(workingOnly.emptyMessage, 'No hay sesiones terminadas.');
+  assert.equal(workingOnly.emptyMessage, 'No hay sesiones listas.');
   assert.equal(workingOnly.creatable, false);
 });
 
@@ -349,4 +367,70 @@ test('error state exposes the card copy and raw evidence', async () => {
   assert.match(vm.error.raw, /\{"sessions"/);
   assert.deepEqual(vm.rows, []);
   assert.equal(vm.creatable, false);
+});
+
+/* ------------------------------------------------------------------ *
+ * The real wire the PC serves (hardware: empty bodies)
+ *
+ * `/api/sessions` answers 200 with ~10 KB and `Connection: keep-alive`, so the
+ * response ends where its `Content-Length` says — not where the peer closes.
+ * ------------------------------------------------------------------ */
+
+/** Keep-alive peer: one framed answer, then the connection stays open. */
+function keepAliveChannel(wire) {
+  let answered = false;
+  return {
+    async write() {
+      return 1;
+    },
+    async read() {
+      if (!answered) {
+        answered = true;
+        return { bytes: encoder.encode(wire), eof: false };
+      }
+      return { bytes: new Uint8Array(), eof: false };
+    },
+    async close() {},
+  };
+}
+
+/** Exactly the §9.3 shape: a bare array with busy/idle/unknown. */
+const REAL_BARE_ARRAY = [
+  {
+    id: 'sess-1',
+    title: 'feat/tunnel-framing',
+    status: 'busy',
+    cwd: '/home/reaan/Contrib/gentle-movil',
+    updatedAt: '2026-11-18T15:00:00Z',
+    current: true,
+  },
+  {
+    id: 'sess-2',
+    title: null,
+    status: 'unknown',
+    cwd: null,
+    updatedAt: null,
+    current: false,
+  },
+];
+
+test('keep-alive: the real bare session array parses by Content-Length, not by eof', async () => {
+  const body = JSON.stringify(REAL_BARE_ARRAY);
+  const wire =
+    'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n' +
+    `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: keep-alive\r\n\r\n${body}`;
+
+  const state = await loadSessions(keepAliveChannel(wire), {
+    timeoutMs: 300,
+    logger: recordingLogger(),
+  });
+
+  assert.equal(state.kind, 'success');
+  assert.deepEqual(
+    state.sessions.map((row) => [row.id, row.status]),
+    [
+      ['sess-1', 'busy'],
+      ['sess-2', 'unknown'],
+    ],
+  );
 });

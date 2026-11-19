@@ -12,14 +12,22 @@
  * 3. `detect`      — the Gentle Shell/Pi extension must be listening on the
  *                    host's loopback 43721/43722, found with a probe command
  *                    over the existing session (no new ABI).
- * 4. `register`    — the phone's ed25519 public key is installed in the user's
- *                    `~/.ssh/authorized_keys` (idempotent append), so every
- *                    later connection is key-only.
+ * 4. `register`    — the **persisted** phone identity (`deviceKeyEnsure`, the
+ *                    ed25519 key whose seed the core seals in the Keystore) is
+ *                    installed in the user's `~/.ssh/authorized_keys`
+ *                    (idempotent append), so every later connection is
+ *                    key-only. This step never mints a key: a throwaway
+ *                    pair would put a line on the host that nobody keeps, and
+ *                    T17's reconnect compares against the persisted one.
  * 5. `tunnel`      — the SSH local forward to the extension's loopback ports,
  *                    which is the channel the app talks to the agent through.
  *                    The step's result is **kept**: one `channel_id` per port,
  *                    which `httpOverTunnel`/`channelWrite`/`channelRead`/
  *                    `closeTunnel` below speak HTTP/WS through (S4).
+ *                    One HTTP answer consumes one channel (`Connection: close`),
+ *                    so `mobile/lib/tunnel-bridge.ts` calls `openTunnelForwards`
+ *                    again for every later request instead of reusing a
+ *                    consumed handle.
  *
  * There is **no** binary upload, no release checksum, no daemon start and no
  * rollback in this flow (S5): those were the SFTP provisioning of the rejected
@@ -43,7 +51,7 @@
  * error}`; it never throws and never pretends a step passed.
  */
 
-import type { PairInfo, SshCredential } from './core';
+import type { DeviceKeyInfo, PairInfo, SshCredential } from './core';
 
 /** Steps of the pivot flow, in execution order. */
 export type ProvisionStep = 'connect' | 'fingerprint' | 'detect' | 'register' | 'tunnel';
@@ -142,6 +150,8 @@ export interface DeviceRegistration {
   deviceId?: string;
   /** `authorized_keys` line that was installed. */
   authorizedKey?: string;
+  /** `SHA256:…` of the phone identity that owns that line, when known. */
+  deviceKeyFingerprint?: string;
   /** Anything else the core returned. */
   [key: string]: unknown;
 }
@@ -177,8 +187,19 @@ export interface ProvisionDeps {
   channelGuardMarginMs?: number;
   /** Failure sink; defaults to the app logger. */
   logger?: ProvisionLogger;
-  /** Phone ed25519 public key (hex) when the app already holds it. */
+  /**
+   * Phone ed25519 public key (hex) when the caller already holds it (tests pin
+   * a known key). When it is empty, `deviceKeyEnsure` is the only source.
+   */
   devicePubkeyHex?: string;
+  /**
+   * The **persisted** phone identity (`deviceKeyEnsure` of the frozen ABI v2
+   * contract, re-exported by `lib/core.ts`). The flow installs exactly this
+   * public key on the host; with no source it stops at `register` instead of
+   * minting a throwaway keypair. The seed never leaves the native layer, so
+   * nothing here can log it.
+   */
+  deviceKeyEnsure?: () => Promise<DeviceKeyInfo>;
 }
 
 /** One tunnel channel: a loopback port of the extension, reached over SSH (S4). */
@@ -236,7 +257,6 @@ export const GC_FUNCTIONS = {
   pairFromQr: 'gc_pair_from_qr',
   sshConnect: 'gc_ssh_connect',
   provisionStep: 'gc_provision_step',
-  deviceKeyGenerate: 'gc_device_key_generate',
   channelWrite: 'gc_ssh_channel_write',
   channelRead: 'gc_ssh_channel_read',
   channelClose: 'gc_ssh_channel_close',
@@ -336,7 +356,7 @@ async function resolveLogger(injected?: ProvisionLogger): Promise<ProvisionLogge
     return injected;
   }
   if (cachedLogger === null) {
-    const module = await import('./logger');
+    const module = await import('./logger.ts');
     cachedLogger = module.logger;
   }
   return cachedLogger;
@@ -548,8 +568,45 @@ export function verifyHostFingerprint(expected: string, observed: string | undef
 
 /** Result of `connectPair`. */
 export type ConnectResult =
-  | { ok: true; sessionId: string; fingerprint?: string }
+  | {
+      ok: true;
+      sessionId: string;
+      /**
+       * Host key the handshake really verified, compact lowercase hex.
+       *
+       * Required by the contract (SEC-013): the core answers `result.fingerprint` on every
+       * `ok` connect, and a session without it is not a pinned session — so there is no
+       * success value that can omit it.
+       */
+      fingerprint: string;
+    }
   | { ok: false; error: ProvisionFailure; raw?: unknown };
+
+/**
+ * The host fingerprint a connect answer really proved, or the typed refusal naming what came.
+ *
+ * `FINGERPRINT_COPY.unreported` keeps its meaning ("the session did not report the host
+ * key"), and an answer that carried something unusable says what it carried: the caller
+ * must be able to tell an old core build from a broken one.
+ */
+function requiredHostFingerprint(
+  fingerprint: unknown,
+): { ok: true; fingerprint: string } | { ok: false; error: ProvisionFailure } {
+  if (typeof fingerprint !== 'string' || fingerprint.trim() === '') {
+    return { ok: false, error: { kind: 'Fingerprint', message: FINGERPRINT_COPY.unreported } };
+  }
+  const normalized = normalizeHostFingerprint(fingerprint);
+  if (normalized === null) {
+    return {
+      ok: false,
+      error: {
+        kind: 'Fingerprint',
+        message: `${FINGERPRINT_COPY.unreported} Llegó «${fingerprint.trim()}».`,
+      },
+    };
+  }
+  return { ok: true, fingerprint: normalized };
+}
 
 /**
  * Step 1: the SSH session the rest of the flow reuses. Honest failure when the
@@ -567,11 +624,17 @@ export async function connectPair(
     // connection fields go on the wire. A null credential (QR-only flow) becomes
     // a password-less placeholder the core rejects with a typed error, which is
     // surfaced verbatim instead of guessed.
+    // SEC-008: the QR already carries the host fingerprint, so the credential is
+    // never offered to an unverified host — the pin is applied inside the
+    // handshake, before authentication, not one step later in JS.
     const config = {
       host: pair.host,
       port: pair.port,
       user: pair.user,
       credential,
+      ...(typeof pair.fp === 'string' && pair.fp.trim() !== ''
+        ? { expectedFp: pair.fp }
+        : {}),
     };
     const response = await withTimeout(
       call(GC_FUNCTIONS.sshConnect, JSON.stringify(config)),
@@ -588,10 +651,17 @@ export async function connectPair(
     if (sessionId === undefined || sessionId === null || String(sessionId) === '') {
       return { ok: false, error: { kind: 'BadResponse', message: 'El núcleo no devolvió una sesión.' } };
     }
+    // SEC-013: the connect record promises the host key the handshake verified. A session
+    // whose fingerprint is missing or unusable is refused here instead of being reported as
+    // a success the fingerprint step could later rediscover.
+    const verified = requiredHostFingerprint(result?.fingerprint);
+    if (!verified.ok) {
+      return { ok: false, error: verified.error, raw: result ?? null };
+    }
     return {
       ok: true,
       sessionId: String(sessionId),
-      fingerprint: typeof result?.fingerprint === 'string' ? result.fingerprint : undefined,
+      fingerprint: verified.fingerprint,
     };
   } catch (error) {
     return { ok: false, error: toFailure(error) };
@@ -1115,6 +1185,67 @@ export interface TunnelCloseReport {
   errors: { port: number; error: ProvisionFailure }[];
 }
 
+/** One forward the `tunnel` step opens (`{host, port}` of the core's payload). */
+export interface TunnelForward {
+  host: string;
+  port: number;
+}
+
+/** Outcome of opening forwards on an existing session. */
+export type TunnelOpenResult =
+  | {
+      ok: true;
+      /** Handles the core reported, in the order they were requested. */
+      channels: TunnelChannel[];
+      /** The core's own `tunnel` result, for the step callbacks/log. */
+      result: unknown;
+    }
+  | { ok: false; error: ProvisionFailure; raw: unknown };
+
+/**
+ * Opens SSH `direct-tcpip` channels on `sessionId`: the `tunnel` step of the
+ * flow, reusable on its own.
+ *
+ * The flow calls it for the two extension ports and keeps the handles in
+ * `TunnelHandles`. The bridge client calls it again whenever the channel it
+ * holds has already served its response: one HTTP answer consumes one channel
+ * (`Connection: close`), so the next request needs its own forward rather than
+ * the consumed handle. A result without handles is a typed `BadResponse`, never
+ * an empty tunnel that looks open.
+ */
+export async function openTunnelForwards(
+  sessionId: string,
+  forwards: readonly TunnelForward[],
+  deps: ProvisionDeps = {},
+): Promise<TunnelOpenResult> {
+  if (forwards.length === 0) {
+    return {
+      ok: false,
+      error: { kind: 'Input', message: 'El túnel necesita al menos un forward.' },
+      raw: null,
+    };
+  }
+  const payload = JSON.stringify({
+    sessionId: Number(sessionId) || 0,
+    step: 'tunnel',
+    forwards: forwards.map((forward) => ({ host: forward.host, port: forward.port })),
+  });
+  const outcome = await callChannel(
+    GC_FUNCTIONS.provisionStep,
+    payload,
+    timeoutFor('tunnel', deps.timeouts),
+    deps,
+  );
+  if (!outcome.ok) {
+    return { ok: false, error: outcome.error, raw: outcome.raw };
+  }
+  try {
+    return { ok: true, channels: parseTunnelChannels(outcome.result), result: outcome.result };
+  } catch (error) {
+    return { ok: false, error: toChannelFailure(error), raw: outcome.result ?? null };
+  }
+}
+
 /**
  * Closes every channel of the tunnel, best effort and honest (S4/S7): one
  * failing close does not skip the rest and never throws; a channel that is
@@ -1138,8 +1269,8 @@ export async function closeTunnel(tunnel: TunnelHandles, deps: ProvisionDeps = {
  * The flow
  * ------------------------------------------------------------------ */
 
-/** One step that goes through `gc_provision_step`. */
-type ComposedStep = 'detect' | 'register' | 'tunnel';
+/** One step that goes through `gc_provision_step` with a composed command. */
+type ComposedStep = 'detect' | 'register';
 
 /** Outcome of one `gc_provision_step` call. */
 type StepOutcome =
@@ -1246,39 +1377,48 @@ export async function provisionFlow(
 
   // 4) register ------------------------------------------------------------
   callbacks.onStepStart?.('register');
-  let devicePubkeyHex = deps.devicePubkeyHex ?? '';
+  // The host must accept the identity the app keeps. `deviceKeyEnsure` mints the seed
+  // once (sealed in the Keystore) and answers the same public key on every call, so the
+  // line installed here is the one T17's reconnect will authenticate with.
+  let devicePubkeyHex = (deps.devicePubkeyHex ?? '').trim();
+  // Fingerprint of the identity that will own the authorized_keys line: reconnect
+  // compares it against the sealed key to say "this phone no longer has the key it
+  // paired with". Empty when the caller injected a bare public key.
+  let deviceKeyFingerprint = '';
   if (devicePubkeyHex === '') {
-    let deviceKeyRaw: unknown;
-    try {
-      const keyResponse = await withTimeout(
-        call(GC_FUNCTIONS.deviceKeyGenerate, '{}'),
-        timeoutFor('register', timeouts),
+    const ensure = deps.deviceKeyEnsure;
+    if (typeof ensure !== 'function') {
+      return stop(
+        'register',
+        {
+          kind: 'DeviceKey',
+          message:
+            'El emparejamiento necesita la identidad persistida del teléfono (`deviceKeyEnsure`) y este flujo no recibió ninguna fuente: no se genera una llave descartable.',
+        },
+        { source: 'deviceKeyEnsure' },
       );
-      deviceKeyRaw = JSON.parse(keyResponse);
+    }
+    let identity: DeviceKeyInfo | null = null;
+    try {
+      identity = await withTimeout(ensure(), timeoutFor('register', timeouts));
     } catch (error) {
       return stop('register', toFailure(error), null);
     }
-    // An explicit failure envelope keeps its kind (Crypto, Ssh, …) instead of
-    // degrading to BadResponse.
-    const failure = deviceKeyRaw as { ok?: unknown; error?: unknown } | null;
-    if (failure && failure.ok === false) {
-      return stop('register', toFailure(failure.error), deviceKeyRaw ?? null);
-    }
-    // The core documents `gc_device_key_generate` as {"ok":true,"key":{...}} but some
-    // builds answer the bare {"key":{...}}; the key may also ride under `result`.
-    // Accept both placements so the step fails only when there is genuinely no key.
-    const container = (
-      deviceKeyRaw as { key?: unknown; result?: { key?: unknown } } | null
-    );
-    const key =
-      (container?.key as { public_hex?: unknown } | undefined) ??
-      (container?.result?.key as { public_hex?: undefined } | undefined);
-    devicePubkeyHex = typeof key?.public_hex === 'string' ? key.public_hex : '';
+    // Only the public half is read: the seed never crosses this boundary, so there is
+    // nothing secret to keep out of the {step, error, raw} log.
+    devicePubkeyHex =
+      typeof identity?.publicHex === 'string' ? identity.publicHex.trim() : '';
+    deviceKeyFingerprint =
+      typeof identity?.fingerprint === 'string' ? identity.fingerprint.trim() : '';
     if (devicePubkeyHex === '') {
       return stop(
         'register',
-        { kind: 'BadResponse', message: 'El núcleo no devolvió la clave pública ed25519 del teléfono.' },
-        deviceKeyRaw ?? null,
+        {
+          kind: 'DeviceKey',
+          message:
+            'La identidad persistida del teléfono no trajo su clave pública ed25519: no se instala una línea vacía en authorized_keys.',
+        },
+        { publicHex: null },
       );
     }
   }
@@ -1306,31 +1446,29 @@ export async function provisionFlow(
       ? (registered.result as DeviceRegistration)
       : {}),
     authorizedKey,
+    ...(deviceKeyFingerprint !== '' ? { deviceKeyFingerprint } : {}),
   };
   callbacks.onStepDone?.('register', registration);
 
   // 5) tunnel --------------------------------------------------------------
   callbacks.onStepStart?.('tunnel');
-  const tunneled = await runComposed(
-    'tunnel',
-    {
-      forwards: EXTENSION_LOOPBACK_PORTS.map((port) => ({ host: EXTENSION_LOOPBACK_HOST, port })),
-    },
+  // The handles are the whole point of the step: keep them instead of dropping
+  // the result, or fail honestly when the core reported no channel (S4/S7).
+  const tunneled = await openTunnelForwards(
     sessionId,
+    EXTENSION_LOOPBACK_PORTS.map((port) => ({ host: EXTENSION_LOOPBACK_HOST, port })),
+    deps,
   );
   if (!tunneled.ok) {
     return stop('tunnel', tunneled.error, tunneled.raw);
   }
-  // The handles are the whole point of the step: keep them instead of dropping
-  // the result, or fail honestly when the core reported no channel (S4/S7).
-  let channels: TunnelChannel[];
-  try {
-    channels = parseTunnelChannels(tunneled.result);
-  } catch (error) {
-    return stop('tunnel', toChannelFailure(error), tunneled.result ?? null);
-  }
   callbacks.onStepDone?.('tunnel', tunneled.result);
-  log.info?.('túnel SSH abierto', { channels });
+  log.info?.('túnel SSH abierto', { channels: tunneled.channels });
 
-  return { ok: true, sessionId, registration, tunnel: { sessionId, channels } };
+  return {
+    ok: true,
+    sessionId,
+    registration,
+    tunnel: { sessionId, channels: tunneled.channels },
+  };
 }

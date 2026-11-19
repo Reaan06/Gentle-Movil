@@ -227,7 +227,7 @@ export default function GitChangesScreen() {
           />
         }>
         {vm.banner !== null && (
-          <View style={styles.banner} accessibilityRole="status">
+          <View style={styles.banner} accessibilityRole="summary">
             <ActivityIndicator size="small" color={colors.warning} />
             <View style={styles.bannerText}>
               <Text style={styles.bannerTitle}>{vm.banner}</Text>

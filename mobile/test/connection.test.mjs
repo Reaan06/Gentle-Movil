@@ -409,3 +409,12 @@ test('the host is copied as given and defaults to tu-pc when absent', () => {
   assert.match(connectionCopy(model).text, /tu-pc/);
   assert.match(connectionCopy(model, { host: '   ' }).text, /tu-pc/);
 });
+
+test('a channel that died mid-exchange reads as offline, not as unknown', () => {
+  const model = deriveConnection({
+    tunnel: true,
+    failure: { kind: 'channel-closed', message: 'el canal se cortó a mitad del intercambio', raw: 'recibidos 0B de 74B', error: null },
+    now: 1_700_000_000_000,
+  });
+  assert.equal(model.status, 'offline');
+});

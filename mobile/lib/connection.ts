@@ -255,6 +255,11 @@ export function deriveConnection(evidence: ConnectionEvidence): ConnectionModel 
     switch (failure.kind) {
       case 'offline':
         return makeConnection({ ...evidenceFields, status: 'offline' });
+      // A channel that died mid-exchange (or a forward that could not be
+      // reopened) means the PC is not reachable right now: honest `offline`,
+      // not an unknown status that hides the real problem behind "sin estado".
+      case 'channel-closed':
+        return makeConnection({ ...evidenceFields, status: 'offline' });
       case 'timeout': {
         const minutes = staleMinutes(evidence.lastGoodAt, now);
         return minutes === null

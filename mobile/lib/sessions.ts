@@ -6,9 +6,12 @@
  * network of its own. `mobile/app/sessions-list.tsx` is the rendering shell and
  * `mobile/test/sessions.test.mjs` pins these rules:
  *
- * - the four §V6 filters (`Todas` / `Trabajando` / `Esperando` / `Terminadas`)
- *   with the counts that stay stable while filtering (a local filter never
- *   refetches);
+ * - the four filters (`Todas` / `Trabajando` / `Listas` / `Sin estado`) with
+ *   the counts that stay stable while filtering (a local filter never
+ *   refetches). These are the three states §9.3 really publishes (`busy`,
+ *   `idle`, `unknown`); the artboard's `Esperando` / `Terminadas` have no
+ *   source in the extension and were replaced by the owner's decision of
+ *   2026-11-18 — showing them would mean inventing a status;
  * - the row view model built from a real `BridgeSession` (status pill, hint,
  *   relative `hace N min` copy);
  * - most recently updated first (`updatedAt`, ISO);
@@ -40,23 +43,23 @@ import { logger } from './logger.ts';
  * Filters (§V6 segmented control)
  * ------------------------------------------------------------------ */
 
-/** §V6 filter chips, artboard order. */
-export type SessionFilter = 'all' | 'working' | 'waiting' | 'done';
+/** Filter chips: the three real bridge states plus `all`. */
+export type SessionFilter = 'all' | 'busy' | 'idle' | 'unknown';
 
-/** Chip order of the artboard (`Todas` first). */
-export const SESSION_FILTERS: readonly SessionFilter[] = ['all', 'working', 'waiting', 'done'];
+/** Chip order (`Todas` first). */
+export const SESSION_FILTERS: readonly SessionFilter[] = ['all', 'busy', 'idle', 'unknown'];
 
-/** §V6 chip copy. */
+/** Chip copy: the state the PC actually reports. */
 export const FILTER_LABELS: Record<SessionFilter, string> = {
   all: 'Todas',
-  working: 'Trabajando',
-  waiting: 'Esperando',
-  done: 'Terminadas',
+  busy: 'Trabajando',
+  idle: 'Listas',
+  unknown: 'Sin estado',
 };
 
-/** Sessions shown in the list: archived ones were removed by `Archivar`. */
+/** Sessions the list shows (the bridge publishes every session it knows). */
 export function visibleSessions(sessions: readonly BridgeSession[]): BridgeSession[] {
-  return sessions.filter((session) => session.status !== 'archived');
+  return [...sessions];
 }
 
 /** Counts per filter. `all` is the sum of the three statuses, by construction. */
@@ -66,16 +69,16 @@ export function filterCounts(
   const visible = visibleSessions(sessions);
   return {
     all: visible.length,
-    working: visible.filter((session) => session.status === 'working').length,
-    waiting: visible.filter((session) => session.status === 'waiting').length,
-    done: visible.filter((session) => session.status === 'done').length,
+    busy: visible.filter((session) => session.status === 'busy').length,
+    idle: visible.filter((session) => session.status === 'idle').length,
+    unknown: visible.filter((session) => session.status === 'unknown').length,
   };
 }
 
 /** One chip of the segmented control (counts stay visible on every chip). */
 export interface FilterChip {
   id: SessionFilter;
-  /** §V6 copy: `Todas` / `Trabajando` / `Esperando` / `Terminadas`. */
+  /** Copy: `Todas` / `Trabajando` / `Listas` / `Sin estado`. */
   label: string;
   count: number;
   active: boolean;
@@ -151,8 +154,8 @@ export function relativeTime(iso: string, now: number = Date.now()): string {
   return days === 1 ? 'hace 1 día' : `hace ${days} días`;
 }
 
-/** Visual tone of the status pill (artboard chip variants). */
-export type SessionTone = 'working' | 'waiting' | 'ok' | 'muted';
+/** Visual tone of the status pill. */
+export type SessionTone = 'working' | 'ok' | 'muted';
 
 /** One row of the §V6 list. */
 export interface SessionRowViewModel {
@@ -160,7 +163,7 @@ export interface SessionRowViewModel {
   /** Workspace / branch name, the row's headline. */
   title: string;
   status: BridgeSession['status'];
-  /** Status pill copy + tone (`Trabajando` / `Esperando` / `Terminada`). */
+  /** Status pill copy + tone (`Trabajando` / `Lista` / `Sin estado`). */
   pill: { label: string; tone: SessionTone };
   /** Branch or project hint; falls back to the title when the PC sent none. */
   hint: string;
@@ -170,27 +173,25 @@ export interface SessionRowViewModel {
   updatedAt: string;
   /** Where the row goes once V7 has a screen. */
   route: string;
-  /** A waiting session asks something: the row gets the amber treatment. */
+  /** Nothing to flag yet: the bridge publishes no pending question. */
   attention: boolean;
   /** Rows read from the cache (offline/stale): the dots are frozen. */
   frozen: boolean;
 }
 
 const PILLS: Record<BridgeSession['status'], { label: string; tone: SessionTone }> = {
-  working: { label: 'Trabajando', tone: 'working' },
-  waiting: { label: 'Esperando', tone: 'waiting' },
-  done: { label: 'Terminada', tone: 'ok' },
-  archived: { label: 'Archivada', tone: 'muted' },
+  busy: { label: 'Trabajando', tone: 'working' },
+  idle: { label: 'Lista', tone: 'ok' },
+  unknown: { label: 'Sin estado', tone: 'muted' },
 };
 
 /**
- * Pill for a status the protocol defines. An unknown status (a newer
- * extension) shows its raw value on a muted pill instead of pretending to be
- * one of the four known states.
+ * Pill for a status the protocol defines. Anything else is `Sin estado` on a
+ * muted pill: the PC did not publish that state, so the UI does not invent one.
  */
 export function pillFor(status: string): { label: string; tone: SessionTone } {
   const known = PILLS[status as BridgeSession['status']];
-  return known ?? { label: status, tone: 'muted' };
+  return known ?? PILLS.unknown;
 }
 
 /** One `BridgeSession` → one row; `frozen` marks cached rows. */
@@ -209,15 +210,15 @@ export function sessionRow(
     relative: relativeTime(session.updatedAt, options.now),
     updatedAt: session.updatedAt,
     route: `/session/${session.id}`,
-    attention: session.status === 'waiting',
+    attention: false,
     frozen: options.frozen ?? false,
   };
 }
 
-/** Artboard meta line: `2 trabajando · 1 esperando · 11 terminadas`. */
+/** Meta line: `2 trabajando · 1 lista · 3 sin estado`. */
 export function summaryLine(counts: Record<SessionFilter, number>): string {
-  const done = counts.done === 1 ? 'terminada' : 'terminadas';
-  return `${counts.working} trabajando · ${counts.waiting} esperando · ${counts.done} ${done}`;
+  const listas = counts.idle === 1 ? 'lista' : 'listas';
+  return `${counts.busy} trabajando · ${counts.idle} ${listas} · ${counts.unknown} sin estado`;
 }
 
 /* ------------------------------------------------------------------ *
@@ -366,15 +367,9 @@ export async function loadSessions(
     return { kind: 'error', message: `La PC respondió ${result.status}.`, raw };
   }
 
-  const body = result.body as { sessions?: unknown } | null;
-  const sessions = body === null || body === undefined ? undefined : body.sessions;
-  if (!Array.isArray(sessions)) {
-    const raw = JSON.stringify(body).slice(0, 120);
-    const message = 'La PC devolvió una lista de sesiones inválida.';
-    log.failure('sessions-parse', new Error(message), raw);
-    return { kind: 'error', message, raw };
-  }
-
+  // `bridgeSessions` already normalized the payload; a bad body arrived as a
+  // typed failure above, so this list is the real one.
+  const sessions = result.body.sessions;
   if (sessions.length === 0) {
     // A real empty PC: no rows, no zeros pretending to be data, no cache to
     // fall back to on the next timeout.
@@ -398,7 +393,7 @@ export interface SessionsViewModel {
   /** Rows of the active filter, newest first. */
   rows: SessionRowViewModel[];
   counts: Record<SessionFilter, number>;
-  /** `2 trabajando · 1 esperando · 11 terminadas`, when there is data. */
+  /** `2 trabajando · 1 lista · 3 sin estado`, when there is data. */
   summary: string | null;
   /** Amber chip over cached rows (`Datos de hace N min` / `Última vez hace N min`). */
   staleChip: string | null;
@@ -414,14 +409,14 @@ export interface SessionsViewModel {
   loading: boolean;
 }
 
-const NO_COUNTS: Record<SessionFilter, number> = { all: 0, working: 0, waiting: 0, done: 0 };
+const NO_COUNTS: Record<SessionFilter, number> = { all: 0, busy: 0, idle: 0, unknown: 0 };
 
-/** Copy of the per-filter empty state (§V6). */
+/** Copy of the per-filter empty state. */
 const FILTER_EMPTY: Record<SessionFilter, string> = {
   all: 'Aún no hay sesiones.',
-  working: 'No hay sesiones trabajando.',
-  waiting: 'No hay sesiones esperando.',
-  done: 'No hay sesiones terminadas.',
+  busy: 'No hay sesiones trabajando.',
+  idle: 'No hay sesiones listas.',
+  unknown: 'No hay sesiones sin estado.',
 };
 
 /** Build the render model from a §V6 state + the active filter. */

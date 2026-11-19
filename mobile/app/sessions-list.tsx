@@ -52,7 +52,6 @@ function openSession(row: SessionRowViewModel): void {
 
 const TONE_STYLES = {
   working: { background: colors.accentSoft, border: colors.accent, text: colors.accentText },
-  waiting: { background: colors.warningSoft, border: colors.warning, text: colors.warning },
   ok: { background: colors.okSoft, border: colors.ok, text: colors.ok },
   muted: { background: colors.bgSunken, border: colors.border, text: colors.muted },
 } as const;
@@ -94,7 +93,7 @@ function StatusPill({ row }: { row: SessionRowViewModel }) {
   return (
     <View style={[styles.pill, { backgroundColor: tone.background, borderColor: tone.border }]}>
       <Text style={[styles.pillText, { color: tone.text }]}>{row.pill.label}</Text>
-      {row.status === 'working' && (
+      {row.status === 'busy' && (
         <View style={styles.dots} accessibilityElementsHidden>
           <View style={[styles.dot, { backgroundColor: tone.text }]} />
           <View style={[styles.dot, { backgroundColor: tone.text }]} />
@@ -222,7 +221,7 @@ export default function SessionsListScreen() {
           />
         }>
         {vm.banner !== null && (
-          <View style={styles.banner} accessibilityRole="status">
+          <View style={styles.banner} accessibilityRole="summary">
             <ActivityIndicator size="small" color={colors.warning} />
             <View style={styles.bannerText}>
               <Text style={styles.bannerTitle}>Túnel SSH reconectando…</Text>

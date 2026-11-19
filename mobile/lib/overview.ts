@@ -35,11 +35,14 @@ export interface TokenDay {
 
 /** Dataset the Overview renders. */
 export interface OverviewData {
+  /** Real: sessions the bridge reports as `busy`. */
   working: { count: number; hints: string[] };
-  waiting: { count: number; hint: string | null };
+  /** The extension publishes no pending questions: `count` is `null`. */
+  waiting: { count: number | null; hint: string | null };
+  /** The extension publishes no finished sessions: `count` is `null`. */
   done: {
-    count: number;
-    unit: string;
+    count: number | null;
+    unit: string | null;
     /** Not reported by the extension; `null` renders "sin datos". */
     withChanges: number | null;
     withoutPush: number | null;
@@ -58,6 +61,10 @@ export interface OverviewData {
   devices: number | null;
 }
 
+/** Why the Esperando tile has no count. */
+export const NO_PENDING_REASON = 'la extensión no expone preguntas pendientes';
+/** Why the Terminadas tile has no count. */
+export const NO_DONE_REASON = 'la extensión no expone sesiones terminadas';
 /** Why the token panel has nothing to draw. */
 export const NO_TOKENS_REASON = 'la extensión no expone uso de tokens';
 /** Why the done tile shows no change counters. */
@@ -111,8 +118,8 @@ export const MEASURED_OVERVIEW: OverviewData = {
  */
 export const NOTHING_MEASURED: OverviewData = {
   working: { count: 0, hints: [] },
-  waiting: { count: 0, hint: null },
-  done: { count: 0, unit: 'esta semana', withChanges: null, withoutPush: null },
+  waiting: { count: null, hint: null },
+  done: { count: null, unit: null, withChanges: null, withoutPush: null },
   tokens: { total: null, sessions: null, today: null, days: null },
   paired: { label: 'Live', host: 'tu-pc' },
   syncedSecondsAgo: null,
@@ -199,7 +206,8 @@ export type TokensPanel =
 export interface OverviewTile {
   id: 'working' | 'waiting' | 'done';
   label: string;
-  count: number;
+  /** `null` when the bridge does not report this metric: renders '—'. */
+  count: number | null;
   unit: string | null;
   hint: string | null;
   wide: boolean;
@@ -214,6 +222,8 @@ export interface OverviewViewModel {
   tiles: OverviewTile[];
   emptyCard: string | null;
   staleChip: string | null;
+  /** Minutes of the last good data (`stale` only), for the connection chip. */
+  staleMinutes: number | null;
   tokens: TokensPanel;
   actions: OverviewAction[];
   syncLine: string;
@@ -231,7 +241,9 @@ function doneHint(done: OverviewData['done']): string | null {
   if (done.withChanges !== null) parts.push(`${done.withChanges} con cambios`);
   if (done.withoutPush !== null) parts.push(`${done.withoutPush} sin push`);
   if (parts.length > 0) return parts.join(' · ');
-  return done.count === 0 ? null : `sin datos de cambios (${NO_CHANGES_REASON})`;
+  return done.count === 0 || done.count === null
+    ? null
+    : `sin datos de cambios (${NO_CHANGES_REASON})`;
 }
 
 function tilesFor(data: OverviewData): OverviewTile[] {
@@ -251,9 +263,9 @@ function tilesFor(data: OverviewData): OverviewTile[] {
       label: 'Esperando',
       count: data.waiting.count,
       unit: null,
-      hint: data.waiting.hint,
+      hint: data.waiting.hint ?? NO_PENDING_REASON,
       wide: false,
-      attention: data.waiting.count > 0,
+      attention: data.waiting.count !== null && data.waiting.count > 0,
       route: '/waiting-inbox',
     },
     {
@@ -261,7 +273,7 @@ function tilesFor(data: OverviewData): OverviewTile[] {
       label: 'Terminadas',
       count: data.done.count,
       unit: data.done.unit,
-      hint: doneHint(data.done),
+      hint: data.done.count === null ? NO_DONE_REASON : doneHint(data.done),
       wide: false,
       attention: false,
       route: '/sessions-list',
@@ -330,6 +342,7 @@ export function buildOverview(state: OverviewStateModel): OverviewViewModel {
         tiles: tilesFor(EMPTY_DATA),
         emptyCard: null,
         staleChip: null,
+        staleMinutes: null,
         tokens: { available: false, reason: 'cargando datos de la PC…', chart: [] },
         actions: actionsFor('success'),
         syncLine: 'Sincronizando…',
@@ -342,6 +355,7 @@ export function buildOverview(state: OverviewStateModel): OverviewViewModel {
         tiles: tilesFor(EMPTY_DATA),
         emptyCard: 'Aún no hay sesiones. Crea la primera.',
         staleChip: null,
+        staleMinutes: null,
         tokens: {
           available: false,
           reason: 'todavía no hay sesiones que medir',
@@ -358,6 +372,7 @@ export function buildOverview(state: OverviewStateModel): OverviewViewModel {
         tiles: tilesFor(state.data),
         emptyCard: null,
         staleChip: null,
+        staleMinutes: null,
         tokens: tokensPanel(state.data, NO_TOKENS_REASON),
         actions: actionsFor('success'),
         syncLine: syncLine(state.data.syncedSecondsAgo, state.data.devices),
@@ -370,6 +385,7 @@ export function buildOverview(state: OverviewStateModel): OverviewViewModel {
         tiles: tilesFor(state.data),
         emptyCard: null,
         staleChip: `Datos de hace ${state.minutes} min`,
+        staleMinutes: state.minutes,
         tokens: tokensPanel(state.data, NO_TOKENS_REASON),
         actions: actionsFor('stale'),
         syncLine: syncLine(state.data.syncedSecondsAgo, state.data.devices),
@@ -382,6 +398,7 @@ export function buildOverview(state: OverviewStateModel): OverviewViewModel {
         tiles: tilesFor(state.data ?? EMPTY_DATA),
         emptyCard: null,
         staleChip: null,
+        staleMinutes: null,
         tokens: state.data === null
           ? { available: false, reason: 'sin conexión con la PC', chart: [] }
           : tokensPanel(state.data, NO_TOKENS_REASON),
@@ -390,4 +407,54 @@ export function buildOverview(state: OverviewStateModel): OverviewViewModel {
         pairDot: 'grey',
       };
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * Connection chip (T17, S11)
+ * ------------------------------------------------------------------ */
+
+/** The Overview chip copy: the state of the tunnel, in the person's words. */
+export interface ConnectionChip {
+  /** `Live · 192.168.0.10` / `Sin conexión · 192.168.0.10` / … */
+  text: string;
+  dot: 'green' | 'grey';
+  accessibilityLabel: string;
+  accessibilityHint: string;
+}
+
+/** What the person can do from the chip (the S11 connection menu). */
+export const CONNECTION_CHIP_HINT = 'Reconectar, cambiar de conexión o agregar otro dispositivo';
+
+/** Host copy when nothing reported one. */
+export const UNKNOWN_HOST_COPY = 'sin datos';
+
+/**
+ * Builds the Overview connection chip — the entry to the connection menu
+ * (S11). The state is the §V5 state, so the chip never claims `Live` while the
+ * screen is offline, and the host is the one `/api/health` reported: when there
+ * is none it says `sin datos` instead of inventing a name.
+ */
+export function connectionChip(vm: OverviewViewModel, host?: string | null): ConnectionChip {
+  const reported = host === undefined ? vm.data?.paired.host ?? '' : host ?? '';
+  const target = reported.trim() === '' ? UNKNOWN_HOST_COPY : reported.trim();
+
+  const text =
+    vm.state === 'loading'
+      ? `Reconectando… · ${target}`
+      : vm.state === 'offline'
+        ? `Sin conexión · ${target}`
+        : vm.state === 'stale' && vm.staleMinutes !== null
+          ? `Live · ${target} · hace ${vm.staleMinutes} min`
+          : `Live · ${target}`;
+
+  const dot: ConnectionChip['dot'] = vm.state === 'success' || vm.state === 'empty' || vm.state === 'stale'
+    ? 'green'
+    : 'grey';
+
+  return {
+    text,
+    dot,
+    accessibilityLabel: `${text} · abrir el menú de conexión`,
+    accessibilityHint: CONNECTION_CHIP_HINT,
+  };
 }
