@@ -5,13 +5,19 @@
  * Imports only the RN-free module `../lib/overview.ts` (Node cannot load .tsx
  * nor react-native). Every rule of the §V5 states table that is expressible at
  * the logic level is pinned here; the screen is only the rendering shell.
+ *
+ * T7q rule: a metric the bridge does not report is `null` and renders
+ * "sin datos" with its reason. It is never 0 and never a fabricated series.
  */
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  DEMO_OVERVIEW,
+  MEASURED_OVERVIEW,
+  NOTHING_MEASURED,
+  NO_CHANGES_REASON,
+  NO_TOKENS_REASON,
   buildOverview,
   chartBars,
   formatTokens,
@@ -24,8 +30,8 @@ test('formatTokens uses es-AR style (comma decimal, k suffix)', () => {
   assert.equal(formatTokens(9400), '9,4k');
 });
 
-test('success view model: artboard demo data, tiles wide-first', () => {
-  const vm = buildOverview({ kind: 'success', data: DEMO_OVERVIEW });
+test('success view model: measured data, tiles wide-first', () => {
+  const vm = buildOverview({ kind: 'success', data: MEASURED_OVERVIEW });
   assert.equal(vm.state, 'success');
   assert.deepEqual(vm.tiles.map((t) => t.id), ['working', 'waiting', 'done']);
   assert.equal(vm.tiles[0].wide, true);
@@ -38,13 +44,14 @@ test('success view model: artboard demo data, tiles wide-first', () => {
 });
 
 test('chart bars: proportional heights, today (last day) flagged accent', () => {
-  const bars = chartBars(DEMO_OVERVIEW.tokens.days);
-  const max = Math.max(...DEMO_OVERVIEW.tokens.days.map((d) => d.value));
+  const days = MEASURED_OVERVIEW.tokens.days;
+  const bars = chartBars(days);
+  const max = Math.max(...days.map((d) => d.value));
   const today = bars[bars.length - 1];
   assert.equal(today.today, true);
   assert.ok(today.height > bars[0].height);
   for (const bar of bars) {
-    const day = DEMO_OVERVIEW.tokens.days[bars.indexOf(bar)];
+    const day = days[bars.indexOf(bar)];
     assert.ok(Math.abs(bar.height - day.value / max) < 1e-9);
   }
 });
@@ -64,6 +71,13 @@ test('sync line: seconds, minutes and singular/plural devices', () => {
   );
 });
 
+test('sync line: an unmeasured part says so, it never becomes 0', () => {
+  assert.equal(syncLine(12, null), 'Sincronizado hace 12 s · dispositivos sin datos');
+  assert.equal(syncLine(null, 1), 'Sincronizado · 1 dispositivo emparejado');
+  assert.equal(syncLine(null, null), 'Sincronizado · dispositivos sin datos');
+  assert.equal(syncLine(12, null).includes('0 dispositivo'), false);
+});
+
 test('empty state: zero tiles and first-session card copy', () => {
   const vm = buildOverview({ kind: 'empty' });
   assert.equal(vm.state, 'empty');
@@ -73,26 +87,72 @@ test('empty state: zero tiles and first-session card copy', () => {
 });
 
 test('stale state: numbers kept, amber chip copy with minutes', () => {
-  const vm = buildOverview({ kind: 'stale', minutes: 3, data: DEMO_OVERVIEW });
+  const vm = buildOverview({ kind: 'stale', minutes: 3, data: MEASURED_OVERVIEW });
   assert.equal(vm.state, 'stale');
   assert.equal(vm.staleChip, 'Datos de hace 3 min');
   assert.equal(vm.tiles[0].count, 2);
 });
 
 test('offline state: reconectando copy, disabled actions, grey dot', () => {
-  const vm = buildOverview({ kind: 'offline', data: DEMO_OVERVIEW });
+  const vm = buildOverview({ kind: 'offline', data: MEASURED_OVERVIEW });
   assert.equal(vm.state, 'offline');
   assert.equal(vm.syncLine, 'Reconectando…');
   assert.equal(vm.actions.every((a) => a.disabled), true);
   assert.equal(vm.pairDot, 'grey');
 });
 
-test('action descriptors: pending routes, honest tap intent', () => {
-  const vm = buildOverview({ kind: 'success', data: DEMO_OVERVIEW });
+test('tokens panel renders the measured series and its formatted totals', () => {
+  const vm = buildOverview({ kind: 'success', data: MEASURED_OVERVIEW });
+  assert.equal(vm.tokens.available, true);
+  assert.equal(vm.tokens.total, '117,7k');
+  assert.equal(vm.tokens.today, '31,2k');
+  assert.equal(vm.tokens.sessions, '4 sesiones');
+  assert.equal(vm.tokens.chart.length, 7);
+});
+
+test('unmeasured metrics are null and render "sin datos" with the reason', () => {
+  const vm = buildOverview({ kind: 'success', data: NOTHING_MEASURED });
+  // Tokens: no usage source on the extension.
+  assert.equal(vm.tokens.available, false);
+  assert.equal(vm.tokens.reason, NO_TOKENS_REASON);
+  assert.deepEqual(vm.tokens.chart, []);
+  // Changes per done session: not reported by /api/sessions. With nothing
+  // done the tile stays silent instead of claiming a measured zero.
+  const done = vm.tiles.find((t) => t.id === 'done');
+  assert.equal(done.count, 0);
+  assert.equal(done.hint, null);
+  // Devices: only when the health payload reports a number.
+  assert.ok(vm.syncLine.includes('dispositivos sin datos'));
+});
+
+test('done tile with real sessions but no counters says "sin datos"', () => {
+  const data = { ...NOTHING_MEASURED, done: { count: 3, unit: 'esta semana', withChanges: null, withoutPush: null } };
+  const vm = buildOverview({ kind: 'success', data });
+  const done = vm.tiles.find((t) => t.id === 'done');
+  assert.equal(done.count, 3);
+  assert.ok(done.hint.includes('sin datos'));
+  assert.ok(done.hint.includes(NO_CHANGES_REASON));
+  assert.equal(done.hint.includes('0 con cambios'), false);
+});
+
+test('loading and offline states never invent a token series', () => {
+  for (const state of [{ kind: 'loading' }, { kind: 'offline', data: null }]) {
+    const vm = buildOverview(state);
+    assert.equal(vm.tokens.available, false);
+    assert.deepEqual(vm.tokens.chart, []);
+    assert.equal(typeof vm.tokens.reason, 'string');
+  }
+});
+
+test('action descriptors point at the screens that exist', () => {
+  const vm = buildOverview({ kind: 'success', data: MEASURED_OVERVIEW });
   const nueva = vm.actions.find((a) => a.id === 'new-session');
   const cambios = vm.actions.find((a) => a.id === 'changes');
+  // /git-changes exists: the action navigates instead of pretending.
+  assert.equal(cambios.route, '/git-changes');
+  assert.equal(cambios.pending, false);
+  // /new-session still has no screen, and says exactly that.
   assert.equal(nueva.route, '/new-session');
   assert.equal(nueva.pending, true);
-  assert.equal(cambios.route, '/changes');
-  assert.equal(cambios.pending, true);
+  assert.ok(nueva.pendingReason.includes('/new-session'));
 });

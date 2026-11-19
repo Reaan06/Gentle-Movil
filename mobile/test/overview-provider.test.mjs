@@ -97,6 +97,48 @@ test('success: real sessions + health flow through the provider', async () => {
   assert.equal(data.paired.host, 'tu-pc');
 });
 
+test('overviewFromSessions: nothing unmeasured is reported as a zero', () => {
+  const data = overviewFromSessions(SESSIONS);
+  // Real: session counts.
+  assert.equal(data.done.count, 1);
+  // Not reported by /api/sessions or /api/health → null, never 0.
+  assert.equal(data.done.withChanges, null);
+  assert.equal(data.done.withoutPush, null);
+  assert.equal(data.tokens.total, null);
+  assert.equal(data.tokens.sessions, null);
+  assert.equal(data.tokens.today, null);
+  assert.equal(data.tokens.days, null);
+  assert.equal(data.devices, null);
+});
+
+test('LastGood.secondsSince is real elapsed time from the injected clock', () => {
+  let now = 1_000_000;
+  const lastGood = new LastGood(() => now);
+  assert.equal(lastGood.secondsSince(), null);
+  lastGood.mark();
+  now += 15_000;
+  assert.equal(lastGood.secondsSince(), 15);
+  assert.equal(lastGood.minutesSince(), 1);
+});
+
+test('success: sync age is measured, devices only when health reports one', async () => {
+  const channels = [okChannel({ sessions: SESSIONS }), okChannel({ proto: 1, bridge: 'tu-pc' })];
+  let index = 0;
+  const provider = bridgeOverviewProvider(() => channels[index++]);
+  const data = await provider();
+  assert.equal(typeof data.syncedSecondsAgo, 'number');
+  assert.ok(data.syncedSecondsAgo >= 0 && data.syncedSecondsAgo < 60);
+  assert.equal(data.devices, null);
+});
+
+test('success: a health payload that reports devices is used as measured', async () => {
+  const channels = [okChannel({ sessions: SESSIONS }), okChannel({ proto: 1, bridge: 'tu-pc', devices: 2 })];
+  let index = 0;
+  const provider = bridgeOverviewProvider(() => channels[index++]);
+  const data = await provider();
+  assert.equal(data.devices, 2);
+});
+
 test('stateFromSignal maps every signal to its §V5 state', () => {
   assert.deepEqual(stateFromSignal(new OfflineSignal({ kind: 'offline' })), { kind: 'offline', data: null });
   assert.deepEqual(stateFromSignal(new EmptySignal({ kind: 'empty' })), { kind: 'empty' });

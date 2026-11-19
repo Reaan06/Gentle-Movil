@@ -30,11 +30,16 @@ export interface ActiveTunnel {
   httpChannel: import('./provision').TunnelChannel;
 }
 
-/** Map a real `/api/sessions` list onto the Overview counts. */
-export function overviewFromSessions(
-  sessions: readonly BridgeSession[],
-  devices = 1,
-): OverviewData {
+/**
+ * Map a real `/api/sessions` list onto the Overview counts.
+ *
+ * Only what the extension reports crosses this boundary: the three status
+ * counts, their hints and (later, from `/api/health`) the host. Token usage,
+ * per-session change counters, the device count and the sync age are `null`
+ * here — the extension exposes no such source, and the view renders "sin
+ * datos" with that reason instead of a zero that looks measured (T7q).
+ */
+export function overviewFromSessions(sessions: readonly BridgeSession[]): OverviewData {
   const working = sessions.filter((s) => s.status === 'working');
   const waiting = sessions.filter((s) => s.status === 'waiting');
   const done = sessions.filter((s) => s.status === 'done');
@@ -50,28 +55,38 @@ export function overviewFromSessions(
     done: {
       count: done.length,
       unit: 'esta semana',
-      withChanges: done.length,
-      withoutPush: 0,
+      withChanges: null,
+      withoutPush: null,
     },
-    tokens: { total: 0, sessions: 0, today: 0, days: [] },
+    tokens: { total: null, sessions: null, today: null, days: null },
     paired: { label: 'Live', host: 'tu-pc' },
-    syncedSecondsAgo: 0,
-    devices,
+    syncedSecondsAgo: null,
+    devices: null,
   };
 }
 
-/** How long since the last good answer, for the stale chip. */
+/** How long since the last good answer, for the stale chip and the sync line. */
 export class LastGood {
   private at = 0;
+  private readonly now: () => number;
+
+  constructor(now: () => number = Date.now) {
+    this.now = now;
+  }
 
   /** Marks "answered now". */
   mark(): void {
-    this.at = Date.now();
+    this.at = this.now();
+  }
+
+  /** Whole seconds since the last good answer, or null when never. */
+  secondsSince(): number | null {
+    return this.at === 0 ? null : Math.max(0, Math.floor((this.now() - this.at) / 1000));
   }
 
   /** Minutes since the last good answer, or null when never. */
   minutesSince(): number | null {
-    return this.at === 0 ? null : Math.max(1, Math.floor((Date.now() - this.at) / 60_000));
+    return this.at === 0 ? null : Math.max(1, Math.floor((this.now() - this.at) / 60_000));
   }
 }
 
@@ -112,11 +127,18 @@ export function bridgeOverviewProvider(
         : await bridgeHealth(healthChannel, { timeoutMs: 4_000 });
     lastGood.mark();
     const data = overviewFromSessions(sessionsResult.body.sessions ?? []);
+    // The sync age is measured from the real last good answer, never a constant.
+    data.syncedSecondsAgo = lastGood.secondsSince();
     if (health.ok) {
       // §9.2 sends `bridge`; older builds sent `name`. Never invent a host.
       const identity = health.body.bridge ?? health.body.name;
       if (identity !== undefined) {
         data.paired = { label: 'Live', host: identity };
+      }
+      // A device count is only shown when the payload actually carries one.
+      const reported = (health.body as { devices?: unknown }).devices;
+      if (typeof reported === 'number') {
+        data.devices = reported;
       }
     }
     if (data.working.count + data.waiting.count + data.done.count === 0) {

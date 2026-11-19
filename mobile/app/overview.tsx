@@ -1,3 +1,4 @@
+import { type Href, useRouter } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
 import { Pressable, RefreshControl, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -8,11 +9,11 @@ import { logger } from '../lib/logger';
 import {
   type ChartBar,
   type LoadOverview,
+  type OverviewAction,
   type OverviewStateModel,
   type OverviewViewModel,
   type OverviewTile,
   buildOverview,
-  formatTokens,
 } from '../lib/overview';
 import {
   bridgeOverviewProvider,
@@ -36,9 +37,12 @@ import { colors, elevation, radius, spacing, typography } from '../lib/theme';
  * Data comes from the PC over the SSH tunnel (`GET /api/sessions` +
  * `/api/health`, see `lib/overview-provider.ts`). There is no demo dataset: with
  * no tunnel the screen says `Reconectando…`, and a PC that times out after a
- * good answer shows `Datos de hace N min` with the cached numbers. Every
- * quick action and dock tab whose screen does not exist yet logs
- * `route pending` instead of navigating or failing silently.
+ * good answer shows `Datos de hace N min` with the cached numbers.
+ *
+ * T7q: every tile, dock tab and quick action navigates to the screen that
+ * really exists. A metric the extension does not report renders "sin datos"
+ * with its reason — never 0, never an invented chart. The only affordance
+ * still without a screen is `+ Nueva sesión` (V8), and it says exactly that.
  */
 
 /** Swappable provider seam (tests inject a fake; the app uses the tunnel). */
@@ -51,35 +55,42 @@ export function setOverviewProvider(next: LoadOverview): LoadOverview {
   return previous;
 }
 
-/** Bottom dock tabs; only Overview exists, the rest log `route pending`. */
+/** Bottom dock tabs — every route below has a real screen. */
 const TABS: readonly { id: string; label: string; glyph: string; route: string }[] = [
   { id: 'overview', label: 'Overview', glyph: '▦', route: '/overview' },
   { id: 'sessions', label: 'Sessions', glyph: '›_', route: '/sessions-list' },
   { id: 'automations', label: 'Automations', glyph: '⟳', route: '/automations' },
-  { id: 'local', label: 'Local', glyph: '▣', route: '/local' },
+  { id: 'local', label: 'Local', glyph: '▣', route: '/local-projects' },
 ];
 
 function PairChip({ vm }: { vm: OverviewViewModel }) {
   const dotColor = vm.pairDot === 'green' ? colors.ok : colors.faint;
+  // The host is the one `/api/health` reported; unknown is said out loud.
+  const host = vm.data?.paired.host ?? 'sin datos';
   return (
     <View style={styles.pair}>
       <View style={[styles.pairDot, { backgroundColor: dotColor }]} />
       <Text style={styles.pairText} accessibilityLabel="túnel SSH">
-        Live · tu-pc
+        Live · {host}
       </Text>
     </View>
   );
 }
 
-function Tile({ tile, greyed }: { tile: OverviewTile; greyed: boolean }) {
+function Tile({
+  tile,
+  greyed,
+  onOpen,
+}: {
+  tile: OverviewTile;
+  greyed: boolean;
+  onOpen: (route: string, id: string) => void;
+}) {
   return (
     <Pressable
       accessibilityRole="button"
       accessibilityLabel={`${tile.label}: ${tile.count}`}
-      onPress={() => {
-        log.info('tile tap', { id: tile.id, route: tile.route });
-        log.warn('route pending', { route: tile.route });
-      }}
+      onPress={() => onOpen(tile.route, tile.id)}
       style={[
         styles.tile,
         tile.wide && styles.tileWide,
@@ -130,6 +141,7 @@ const log = logger.tag('overview');
 
 export default function OverviewScreen() {
   const insets = useSafeAreaInsets();
+  const router = useRouter();
   const [state, setState] = useState<OverviewStateModel>({ kind: 'loading' });
   const [refreshing, setRefreshing] = useState(false);
 
@@ -162,13 +174,29 @@ export default function OverviewScreen() {
     month: 'short',
   });
 
-  const onAction = (id: string, route: string, disabled: boolean) => {
-    if (disabled) {
-      log.warn('action disabled (offline)', { id });
+  const openRoute = useCallback(
+    (route: string, id: string) => {
+      log.info('navigate', { id, route });
+      router.push(route as Href);
+    },
+    [router],
+  );
+
+  const onAction = (action: OverviewAction) => {
+    if (action.disabled) {
+      log.warn('action disabled (offline)', { id: action.id });
       return;
     }
-    log.info('action tap', { id, route });
-    log.warn('route pending', { route });
+    if (action.pending) {
+      // No screen yet: the tap says exactly why instead of navigating nowhere.
+      log.warn('action unavailable', {
+        id: action.id,
+        route: action.route,
+        reason: action.pendingReason,
+      });
+      return;
+    }
+    openRoute(action.route, action.id);
   };
 
   return (
@@ -210,28 +238,32 @@ export default function OverviewScreen() {
         )}
         <View style={styles.bento}>
           {vm.tiles.map((tile) => (
-            <Tile key={tile.id} tile={tile} greyed={greyed} />
+            <Tile key={tile.id} tile={tile} greyed={greyed} onOpen={openRoute} />
           ))}
         </View>
 
         <View style={[styles.panel, greyed && styles.greyed]}>
           <View style={styles.panelHead}>
-            <View>
+            <View style={styles.panelHeadText}>
               <Text style={typography.eyebrow}>Tokens · últimos 7 días</Text>
-              <View style={styles.panelValueRow}>
-                <Text style={styles.panelValue}>
-                  {vm.data ? formatTokens(vm.data.tokens.total) : '—'}
+              {vm.tokens.available ? (
+                <View style={styles.panelValueRow}>
+                  <Text style={styles.panelValue}>{vm.tokens.total}</Text>
+                  <Text style={styles.meta}>en {vm.tokens.sessions}</Text>
+                </View>
+              ) : (
+                <Text style={styles.panelMissing}>
+                  sin datos · {vm.tokens.reason}
                 </Text>
-                <Text style={styles.meta}>
-                  en {vm.data ? vm.data.tokens.sessions : 0} sesiones
-                </Text>
-              </View>
+              )}
             </View>
-            <Text style={styles.panelToday}>
-              hoy · {vm.data ? formatTokens(vm.data.tokens.today) : '—'}
-            </Text>
+            {vm.tokens.available && (
+              <Text style={styles.panelToday}>hoy · {vm.tokens.today}</Text>
+            )}
           </View>
-          <TokenChart bars={vm.chart} greyed={greyed} />
+          {vm.tokens.chart.length > 0 && (
+            <TokenChart bars={vm.tokens.chart} greyed={greyed} />
+          )}
         </View>
 
         <View style={styles.actions}>
@@ -242,7 +274,7 @@ export default function OverviewScreen() {
                 label={action.label}
                 disabled={action.disabled}
                 reportDisabledPress
-                onPress={() => onAction(action.id, action.route, action.disabled)}
+                onPress={() => onAction(action)}
                 style={styles.actionButton}
               />
             ) : (
@@ -250,7 +282,7 @@ export default function OverviewScreen() {
                 key={action.id}
                 label={action.label}
                 disabled={action.disabled}
-                onPress={() => onAction(action.id, action.route, action.disabled)}
+                onPress={() => onAction(action)}
                 style={styles.actionButton}
               />
             ),
@@ -279,7 +311,7 @@ export default function OverviewScreen() {
                   if (current) {
                     return;
                   }
-                  log.warn('route pending', { route: tab.route });
+                  openRoute(tab.route, tab.id);
                 }}
                 style={[styles.tab, current && styles.tabCurrent]}>
                 <Text style={[styles.tabGlyph, current && styles.tabGlyphCurrent]}>
@@ -466,6 +498,14 @@ const styles = StyleSheet.create({
     lineHeight: 22,
     fontWeight: '600',
     color: colors.text,
+  },
+  panelHeadText: {
+    flexShrink: 1,
+  },
+  panelMissing: {
+    ...typography.hint,
+    color: colors.faint,
+    marginTop: 6,
   },
   panelToday: {
     ...typography.hint,
