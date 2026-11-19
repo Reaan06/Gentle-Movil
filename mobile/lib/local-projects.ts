@@ -29,6 +29,10 @@
  */
 
 import { describeError } from './logger.ts';
+import { loadTree } from './local-editor.ts';
+import type { EditorLogger, TreeState } from './local-editor.ts';
+import { localFsEditorSource } from './local-fs.ts';
+import type { LocalFsApi } from './local-fs.ts';
 
 /* ------------------------------------------------------------------ *
  * Copy (es-AR) and keys
@@ -43,7 +47,12 @@ export const LOCAL_PROJECTS_ROUTE = '/local-projects';
 /** The editor V15: not built yet, so opening a project stays pending. */
 export const LOCAL_EDITOR_ROUTE = '/local-editor';
 
-/** Sandbox folder the local-mode slice will materialize (nothing is written). */
+/**
+ * Sandbox folder the projects live in, relative to the app documents dir.
+ *
+ * It stays relative on purpose: the record is portable, and the absolute root is
+ * derived at read time by `projectRootFor` (the core needs the real path).
+ */
 export const PROJECTS_ROOT = 'proyectos';
 
 /** Artboard screen title. */
@@ -92,6 +101,16 @@ export const GIT_FACTS_UNKNOWN_DETAIL =
 export const GIT_FACTS_NOTE =
   'git todavía no corre en el teléfono: cada proyecto muestra sin datos de git hasta que el core Rust exponga gitoxide.';
 
+/** Delete affordance + confirmation copy of the screen (T15). */
+export interface ProjectDeleteCopy {
+  label: string;
+  confirmTitle: string;
+  confirmLabel: string;
+  cancelLabel: string;
+  /** What really happens: the phone's files are not touched. */
+  filesNote: string;
+}
+
 /** Only opened projects show a relative time; the rest say so. */
 export const NEVER_OPENED_LABEL = 'sin abrir';
 
@@ -102,6 +121,60 @@ export const NAME_DUPLICATE_MESSAGE = 'Ya existe un proyecto con ese nombre.';
 /** Note of the pending editor route. */
 export const EDITOR_PENDING_NOTE =
   'El editor todavía no está construido: abrir el proyecto queda pendiente para la próxima rebanada.';
+
+/* ------------------------------------------------------------------ *
+ * Delete (T15) — copy (es-AR)
+ * ------------------------------------------------------------------ */
+
+/** Per-row affordance label. */
+export const DELETE_LABEL = 'Eliminar';
+
+/** Confirmation sheet title: the tap never deletes by itself. */
+export const DELETE_CONFIRM_TITLE = '¿Eliminar el proyecto?';
+
+/** Action of the confirmation sheet. */
+export const DELETE_CONFIRM_LABEL = 'Eliminar de la lista';
+
+/** Cancel of the confirmation sheet. */
+export const DELETE_CANCEL_LABEL = 'Cancelar';
+
+/** What really happens, said plainly: the phone's files are not touched. */
+export const DELETE_FILES_UNTOUCHED_NOTE =
+  'Los archivos del teléfono no se tocan: sólo se borra la ficha del proyecto en la app. Borrar la carpeta del teléfono sería otra acción, explícita, y todavía no está conectada.';
+
+/** Message of a delete intent that was not confirmed yet. */
+export function deleteConfirmMessage(name: string): string {
+  return `Vas a quitar «${name}» de la lista del teléfono. Los archivos del teléfono no se tocan.`;
+}
+
+/** Message of a delete whose id is no longer in the record. */
+export const DELETE_NOT_FOUND_MESSAGE =
+  'El proyecto ya no está en la lista: no hay nada que eliminar.';
+
+/* ------------------------------------------------------------------ *
+ * Device facts (T18) — copy (es-AR)
+ * ------------------------------------------------------------------ */
+
+/** Label every unread/unavailable row shows instead of a made-up count. */
+export const PROJECT_DISK_UNAVAILABLE_LABEL = 'sin datos';
+
+/** A folder the core listed and found empty — a fact, not a failure. */
+export const PROJECT_DISK_EMPTY_LABEL = 'carpeta vacía';
+
+/** Why a row has no device fact yet (it was not read in this pass). */
+export const PROJECT_DISK_UNREAD_REASON =
+  'todavía no leímos la carpeta del proyecto en el teléfono.';
+
+/** Why a project path cannot be turned into a real root. */
+export const PROJECTS_ROOT_MISSING_MESSAGE =
+  'No pudimos resolver la carpeta de la app en el teléfono.';
+
+/** Why a project record has no usable path. */
+export const PROJECT_PATH_MISSING_MESSAGE =
+  'El proyecto no tiene una ruta registrada en el teléfono.';
+
+/** Why a recorded path is not usable as a folder inside the sandbox. */
+export const PROJECT_PATH_ESCAPES_COPY = 'La ruta sale de la carpeta de la app, así que no la abrimos.';
 
 /* ------------------------------------------------------------------ *
  * Model
@@ -173,6 +246,42 @@ export type CreateProjectResult =
   | { ok: true; project: LocalProject }
   | { ok: false; errors: CreateProjectError[] };
 
+/** Result of a delete intent: never a silent removal. */
+export type DeleteProjectResult =
+  | {
+      ok: true;
+      /** The record without the deleted project, ready to be stored as-is. */
+      projects: LocalProject[];
+      removed: LocalProject;
+      /** Project that stays active after the removal (`null` when none is left). */
+      activeId: string | null;
+      /** True when the deleted project was the active/last-opened one. */
+      activeCleared: boolean;
+      /** Honest sentence: the phone's files are not touched. */
+      note: string;
+    }
+  | { ok: false; needsConfirm: true; message: string }
+  | { ok: false; needsConfirm: false; message: string };
+
+/** Options of `deleteProjectIntent` (injected active pointer). */
+export interface DeleteProjectOptions {
+  /** The explicit "yes, delete it" tap. Without it nothing is removed. */
+  confirm?: boolean;
+  /** Active/last-opened project the screen is holding, when it knows it. */
+  activeId?: string | null;
+}
+
+/** One real fact about a project folder on the device (T18). */
+export type ProjectDiskFact =
+  | { kind: 'entries'; count: number; label: string; reason: null }
+  | { kind: 'empty'; count: 0; label: string; reason: null }
+  | { kind: 'unavailable'; count: null; label: string; reason: string };
+
+/** Outcome of turning a recorded path into the real folder the core must read. */
+export type ProjectRootResult =
+  | { ok: true; root: string }
+  | { ok: false; message: string };
+
 /** Meeting point of every route/intent that is not built yet. */
 export interface PendingIntent {
   route: string;
@@ -202,6 +311,8 @@ export interface ProjectRow {
   gitFactsReason: string;
   /** Why they are unknown (gitoxide is not exposed yet). */
   gitFactsDetail: string;
+  /** What the device really has in this project folder (T18). */
+  disk: ProjectDiskFact;
   open: OpenProjectIntent;
 }
 
@@ -245,6 +356,7 @@ export interface ProjectsViewModel {
     note: string;
   };
   gitNote: string;
+  delete: ProjectDeleteCopy;
 }
 
 /* ------------------------------------------------------------------ *
@@ -467,16 +579,203 @@ export function createProjectIntent(
 }
 
 /* ------------------------------------------------------------------ *
+ * Delete intent (T15)
+ * ------------------------------------------------------------------ */
+
+/** Id of the active/last-opened project: the newest `lastOpenedAt`, never a guess. */
+export function activeProjectId(projects: readonly LocalProject[]): string | null {
+  const opened = projects.filter(
+    (project) => project.lastOpenedAt !== null && !Number.isNaN(Date.parse(project.lastOpenedAt)),
+  );
+  if (opened.length === 0) {
+    return null;
+  }
+  const newest = opened.reduce((left, right) =>
+    Date.parse(right.lastOpenedAt as string) > Date.parse(left.lastOpenedAt as string) ? right : left,
+  );
+  return newest.id;
+}
+
+/**
+ * Removes one project record, with a confirmation step and nothing else.
+ *
+ * Rules:
+ * - without `confirm` nothing is removed: the result carries the confirmation
+ *   copy (`needsConfirm`), because a single tap must never delete;
+ * - an id that is not in the record removes nothing and says so;
+ * - only the stored record is affected: the phone's files are **not** touched,
+ *   which the note states plainly (physical deletion is a separate action and
+ *   is not implemented);
+ * - the active/last-opened pointer is reconciled: when the deleted project was
+ *   the active one, the next last-opened project becomes active (or `null`).
+ */
+export function deleteProjectIntent(
+  id: string,
+  projects: readonly LocalProject[],
+  options: DeleteProjectOptions = {},
+): DeleteProjectResult {
+  const target = projects.find((project) => project.id === id);
+  if (target === undefined) {
+    return { ok: false, needsConfirm: false, message: DELETE_NOT_FOUND_MESSAGE };
+  }
+
+  if (options.confirm !== true) {
+    return { ok: false, needsConfirm: true, message: deleteConfirmMessage(target.name) };
+  }
+
+  const remaining = projects.filter((project) => project.id !== id);
+  const activeBefore = options.activeId === undefined ? activeProjectId(projects) : options.activeId;
+  const activeCleared = activeBefore === id;
+
+  return {
+    ok: true,
+    projects: remaining,
+    removed: target,
+    activeId: activeCleared ? activeProjectId(remaining) : activeBefore,
+    activeCleared,
+    note: DELETE_FILES_UNTOUCHED_NOTE,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Device facts and real roots (T18)
+ * ------------------------------------------------------------------ */
+
+/** True when `path` is a relative path that stays inside the app sandbox. */
+function isSafeProjectPath(path: string): boolean {
+  if (path.startsWith('/')) {
+    return false;
+  }
+  const segments = path.split('/').filter((segment) => segment !== '');
+  return segments.length > 0 && segments.every((segment) => segment !== '.' && segment !== '..');
+}
+
+/**
+ * Absolute folder the core must read: the app documents dir plus the recorded
+ * relative path (`proyectos/<slug>`).
+ *
+ * A path that would leave the sandbox is refused instead of being glued on, so
+ * the core is never asked to read something the record should not point at.
+ */
+export function projectRootFor(projectPath: string, documentsDir: string): ProjectRootResult {
+  const base = typeof documentsDir === 'string' ? documentsDir.trim().replace(/\/+$/, '') : '';
+  if (base === '') {
+    return { ok: false, message: PROJECTS_ROOT_MISSING_MESSAGE };
+  }
+  const raw = typeof projectPath === 'string' ? projectPath.trim() : '';
+  if (raw === '') {
+    return { ok: false, message: PROJECT_PATH_MISSING_MESSAGE };
+  }
+  if (!isSafeProjectPath(raw)) {
+    return { ok: false, message: `${PROJECT_PATH_ESCAPES_COPY} (${raw})` };
+  }
+  const relative = raw.split('/').filter((segment) => segment !== '').join('/');
+  return { ok: true, root: `${base}/${relative}` };
+}
+
+/** `2 entradas` / `1 entrada`, with the age suffix of a stale read. */
+function entriesFact(count: number, suffix: string | null): ProjectDiskFact {
+  const noun = count === 1 ? 'entrada' : 'entradas';
+  return {
+    kind: 'entries',
+    count,
+    label: suffix === null ? `${count} ${noun}` : `${count} ${noun} · ${suffix}`,
+    reason: null,
+  };
+}
+
+const unavailableFact = (reason: string): ProjectDiskFact => ({
+  kind: 'unavailable',
+  count: null,
+  label: PROJECT_DISK_UNAVAILABLE_LABEL,
+  reason,
+});
+
+/**
+ * What one real read of the project folder says, in the row's words.
+ *
+ * A capability gap keeps the real message from the editor (`no-fs`/`error`),
+ * so the row never claims `0 entradas` about a folder it could not read.
+ */
+export function diskFactFromTree(state: TreeState): ProjectDiskFact {
+  switch (state.kind) {
+    case 'success':
+      return entriesFact(state.entries.length, null);
+    case 'stale':
+      return entriesFact(state.entries.length, `de hace ${state.minutes} min`);
+    case 'empty':
+      return { kind: 'empty', count: 0, label: PROJECT_DISK_EMPTY_LABEL, reason: null };
+    case 'offline':
+      return unavailableFact(
+        'la lectura del teléfono quedó sin conexión y no hay un listado anterior que mostrar.',
+      );
+    case 'no-fs':
+      return unavailableFact(state.message);
+    case 'error':
+      return unavailableFact(state.message);
+    default:
+      return unavailableFact(PROJECT_DISK_UNREAD_REASON);
+  }
+}
+
+/** Dependencies of `loadProjectDisk` (all injected: no device in the tests). */
+export interface ProjectDiskDeps {
+  /** App documents dir (`expo-file-system` `Paths.document.uri`), `null` when unknown. */
+  documentsDir: string | null;
+  /** Core fs surface; omitted → resolved from the real ABI layer (`lib/local-fs.ts`). */
+  api?: LocalFsApi | null;
+  /** Failure sink of the reads. */
+  logger?: EditorLogger;
+}
+
+/**
+ * Reads what each project folder really has on the device, one honest fact per
+ * project id. A root that cannot be resolved, or a core without the symbols,
+ * is `unavailable` with the real reason — never `0 entradas`.
+ */
+export async function loadProjectDisk(
+  projects: readonly LocalProject[],
+  deps: ProjectDiskDeps,
+): Promise<Record<string, ProjectDiskFact>> {
+  const facts: Record<string, ProjectDiskFact> = {};
+
+  for (const project of projects) {
+    if (deps.documentsDir === null) {
+      facts[project.id] = unavailableFact(PROJECTS_ROOT_MISSING_MESSAGE);
+      continue;
+    }
+    const rooted = projectRootFor(project.path, deps.documentsDir);
+    if (!rooted.ok) {
+      facts[project.id] = unavailableFact(rooted.message);
+      continue;
+    }
+    const source = localFsEditorSource(
+      rooted.root,
+      deps.api === undefined ? { logger: deps.logger } : { api: deps.api, logger: deps.logger },
+    );
+    facts[project.id] = diskFactFromTree(await loadTree(source, { logger: deps.logger }));
+  }
+
+  return facts;
+}
+
+/* ------------------------------------------------------------------ *
  * View model
  * ------------------------------------------------------------------ */
 
 /** Options of `buildProjectsView` (injectable clock for the relative labels). */
 export interface BuildProjectsOptions {
   now?: number;
+  /** Device facts per project id, from `loadProjectDisk`. */
+  disk?: Record<string, ProjectDiskFact>;
 }
 
-/** One row, always with the honest git gap. */
-export function projectRow(project: LocalProject, now: number = Date.now()): ProjectRow {
+/** One row, always with the honest git gap and the device fact of its folder. */
+export function projectRow(
+  project: LocalProject,
+  now: number = Date.now(),
+  disk?: ProjectDiskFact,
+): ProjectRow {
   return {
     id: project.id,
     name: project.name,
@@ -486,6 +785,7 @@ export function projectRow(project: LocalProject, now: number = Date.now()): Pro
     gitFacts: null,
     gitFactsReason: GIT_FACTS_UNKNOWN_REASON,
     gitFactsDetail: GIT_FACTS_UNKNOWN_DETAIL,
+    disk: disk ?? unavailableFact(PROJECT_DISK_UNREAD_REASON),
     open: openProjectIntent(project),
   };
 }
@@ -507,6 +807,13 @@ export function buildProjectsView(
       note: NEW_PROJECT_NOTE,
     },
     gitNote: GIT_FACTS_NOTE,
+    delete: {
+      label: DELETE_LABEL,
+      confirmTitle: DELETE_CONFIRM_TITLE,
+      confirmLabel: DELETE_CONFIRM_LABEL,
+      cancelLabel: DELETE_CANCEL_LABEL,
+      filesNote: DELETE_FILES_UNTOUCHED_NOTE,
+    },
   } as const;
 
   if (state.kind === 'loading') {
@@ -548,7 +855,7 @@ export function buildProjectsView(
   }
 
   const ordered = orderProjects(state.projects);
-  const rows = ordered.map((project) => projectRow(project, now));
+  const rows = ordered.map((project) => projectRow(project, now, options.disk?.[project.id]));
 
   if (rows.length === 0) {
     return {

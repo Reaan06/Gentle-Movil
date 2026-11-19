@@ -12,9 +12,11 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { GhostButton } from '../components/GhostButton';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { rememberPairing } from '../lib/connections';
 import { httpChannelOf, setActiveTunnel } from '../lib/tunnel-store';
 import { PrimaryButton } from '../components/PrimaryButton';
-import type { PairInfo, SshCredential } from '../lib/core';
+import { deviceKeyEnsure, type PairInfo, type SshCredential } from '../lib/core';
 import { logger } from '../lib/logger';
 import {
   PROVISION_ROWS,
@@ -244,8 +246,10 @@ export default function PairingProgressScreen() {
     setSubLine('Abriendo la conexión segura…');
 
     // The flow owns every step, connect included (S4): the core's SSH session,
-    // the QR fingerprint, the extension on loopback, the phone key in
-    // `authorized_keys` and the forward to the extension ports.
+    // the QR fingerprint, the extension on loopback, the phone identity in
+    // `authorized_keys` and the forward to the extension ports. The identity is
+    // the PERSISTED one (`deviceKeyEnsure`, seed sealed in the Keystore): the key
+    // registered on the PC is the same one T17's reconnect authenticates with.
     const result = await provisionFlow(
       pair,
       credential,
@@ -262,10 +266,28 @@ export default function PairingProgressScreen() {
           setFailure({ label: ROW_TEXT[rowForStep(step)].title, reason: error.message || error.kind, kind: error.kind });
         },
       },
-      { logger: log },
+      { logger: log, deviceKeyEnsure },
     );
 
     if (result.ok) {
+      // S11/S12: a finished pairing is what makes the next launch reconnect
+      // instead of asking for the QR again. Only what a key-only reconnect
+      // needs is stored — the password never reaches storage.
+      const remembered = await rememberPairing(
+        AsyncStorage,
+        { host: pair.host, port: pair.port, user: pair.user, fp: pair.fp },
+        // Without this the record cannot tell "this phone no longer holds the key
+        // it paired with" from "same key" — reconnect's guard stays inert.
+        { deviceKeyFingerprint: result.registration?.deviceKeyFingerprint ?? '' },
+      );
+      if (!remembered.ok) {
+        log.failure(
+          'remember-connection',
+          new Error(remembered.reason ?? 'no se pudo recordar la conexión'),
+          { host: pair.host, port: pair.port },
+        );
+      }
+
       // Keep the handles the tunnel step left open: every connected screen
       // (Overview first) speaks HTTP through them. They are native state, so
       // a restart honestly reports "no tunnel" instead of faking one.

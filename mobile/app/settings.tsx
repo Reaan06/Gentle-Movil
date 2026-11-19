@@ -70,9 +70,10 @@ import { bridgeChannel, getActiveTunnel } from '../lib/tunnel-store';
  * - the paired-device row is this phone with the real tunnel host, the real
  *   phone label (`Constants.deviceName` / `Platform.OS`) and a Revoke intent
  *   that is `pending: true` (it edits the PC's `authorized_keys`);
- * - the device-key row calls the real `core.deviceKeyGenerate()`: a fingerprint
- *   only when the core answers, `no disponible` with the real reason when it
- *   rejects — never a fake fingerprint;
+ * - the device-key row calls the real `deviceKeyEnsure()` (the persisted ABI v2
+ *   identity, re-exported by `lib/core.ts`): a fingerprint only when the core
+ *   answers, `no disponible` with the real reason when it rejects — never a
+ *   fake fingerprint and never a fresh keypair;
  * - the two toggles really persist in AsyncStorage (`TOGGLE_STORAGE_KEYS`) and
  *   each row keeps its honest note because the behavior behind it is not
  *   wired yet;
