@@ -1,0 +1,181 @@
+# Rust core CI — lint + tests on the host, and a cross-compile proof that the JNI
+# half still builds for the only ABI the APK ships (arm64-v8a).
+#
+# ── HONEST BASELINE ─────────────────────────────────────────────────────────────
+# Measured on the committed tree *before* this file existed, so the first run of
+# this workflow is expected to be RED on two steps. The flags are deliberately not
+# loosened: the debt is real and belongs in a code change, not in a weaker check.
+#
+#   cargo test                                 → PASS  161 tests
+#                                                78 lib + 27 tests/ffi_surface.rs
+#                                                + 56 tests/provision_tests.rs
+#   cargo check --target aarch64-linux-android
+#     --features jni-shim                      → PASS  (one rustc warning:
+#                                                `unused variable: pointer`,
+#                                                src/jni_shim.rs:306)
+#   cargo fmt --all --check                    → FAIL  72 diff hunks in 10 files
+#                                                src/{cabi,device_key,error,ffi,
+#                                                jni_shim,provision,qr,ssh}.rs and
+#                                                tests/{ffi_surface,provision_tests}.rs
+#   cargo clippy --all-targets -- -D warnings  → FAIL  4 errors, all in
+#                                                src/cabi.rs:
+#                                                clippy::not_unsafe_ptr_arg_deref
+#                                                  at 378:37, 959:40, 964:32
+#                                                clippy::manual_div_ceil at 539:41
+#
+# Not covered here (stated so nobody reads a green run as more than it is):
+#   * the crate's declared MSRV (`rust-version = "1.75"`) is NOT asserted — both
+#     jobs run on current stable;
+#   * `cargo check` does not link `libmobile_core.so`, so the
+#     `Java_com_gentlemovil_core_GcNative_*` symbol export is proven elsewhere, by
+#     `mobile-core/build-android.sh` inside `scripts/build-apk.sh` (it runs
+#     `cargo build --release --features jni-shim --target aarch64-linux-android`
+#     with the same env vars this workflow exports, then fails if the `.so` lacks
+#     a JNI symbol).
+name: CI - Rust core
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'mobile-core/**'
+      - '.github/workflows/ci-rust.yml'
+  pull_request:
+    paths:
+      - 'mobile-core/**'
+      - '.github/workflows/ci-rust.yml'
+  workflow_dispatch:
+
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
+# One run per ref: a new push cancels the previous lint/test round.
+concurrency:
+  group: ci-rust-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: fmt, clippy and tests (linux x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: mobile-core
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4  # v4.x line
+
+      - name: Rust toolchain (stable + rustfmt + clippy)
+        # Moving tag on purpose: this runs the same current stable a developer gets
+        # from `rustup update`. Pinning a rustc version here would let the lint step
+        # drift away from reality.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + git db + target
+        uses: Swatinem/rust-cache@v2  # v2.x line
+        with:
+          workspaces: mobile-core
+          key: host-${{ runner.os }}
+
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (-D warnings)
+        # --all-targets: the crate's tests are the bulk of the surface and live in
+        # `#[cfg(test)]` modules plus tests/*.rs, so checking only the lib target
+        # would skip most of the code.
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --locked
+
+  android-jni:
+    name: JNI shim builds for aarch64-linux-android
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The NDK version pinned by mobile-core/build-android.sh.
+      NDK_VERSION: 28.2.13676358
+      # The API level build-android.sh links against (`--api 26` by default).
+      NDK_API: 26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4  # v4.x line
+
+      - name: Temurin JDK 17 (sdkmanager is a Java tool)
+        uses: actions/setup-java@v4  # v4.x line
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK cmdline-tools + sdkmanager
+        # android-actions/setup-android ships cmdline-tools + sdkmanager and accepts
+        # the SDK licenses, which is what `sdkmanager` needs to install the NDK.
+        uses: android-actions/setup-android@v3  # v3.x line
+
+      - name: sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
+        run: sdkmanager --install "ndk;${NDK_VERSION}"
+
+      - name: Rust toolchain (stable + aarch64-linux-android std)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo registry + git db + target (android)
+        uses: Swatinem/rust-cache@v2  # v2.x line
+        with:
+          workspaces: mobile-core
+          key: android-${{ runner.os }}
+
+      - name: Export the linker env build-android.sh uses
+        # Reuses the exact toolchain layout and variable names from
+        # mobile-core/build-android.sh instead of inventing a second recipe:
+        #   TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+        #   CLANG="$TC/aarch64-linux-android${API}-clang"
+        #   CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CLANG
+        #   CC_aarch64_linux_android=$CLANG
+        #   AR_aarch64_linux_android=$TC/llvm-ar
+        # CC_/AR_ are load-bearing: `ring` assembles its armv8 C/asm through cc-rs and
+        # cc-rs does not autodetect the NDK on its own, so without them the build dies
+        # with `error occurred in cc-rs: failed to find tool
+        # "aarch64-linux-android-clang": No such file or directory` (observed locally
+        # on the committed tree). The linker var is inert for `cargo check` because
+        # nothing is linked; it is exported anyway so this step runs the exact recipe
+        # the APK build uses, and stays correct if the step becomes a real build.
+        run: |
+          set -euo pipefail
+          NDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME}}/ndk/${NDK_VERSION}"
+          TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG="$TOOLCHAIN/aarch64-linux-android${NDK_API}-clang"
+          AR="$TOOLCHAIN/llvm-ar"
+          # Fail fast and by name, like build-android.sh, instead of decoding a
+          # cc-rs error later.
+          for binary in "$CLANG" "$AR"; do
+            if [ ! -x "$binary" ]; then
+              echo "::error::missing $binary — is NDK $NDK_VERSION installed for API $NDK_API?"
+              exit 1
+            fi
+          done
+          {
+            echo "NDK_ROOT=$NDK_ROOT"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CLANG"
+            echo "CC_aarch64_linux_android=$CLANG"
+            echo "AR_aarch64_linux_android=$AR"
+          } >> "$GITHUB_ENV"
+          echo "NDK:   $NDK_ROOT"
+          echo "CLANG: $CLANG"
+          echo "AR:    $AR"
+
+      - name: cargo check --features jni-shim (aarch64-linux-android)
+        # No --offline: nothing is vendored in this repo, so a fresh runner has to
+        # fetch the registry once; rust-cache restores it on later runs. --locked
+        # keeps the committed Cargo.lock (and its MSRV pins) authoritative.
+        working-directory: mobile-core
+        run: cargo check --locked --target aarch64-linux-android --features jni-shim

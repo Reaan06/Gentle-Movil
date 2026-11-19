@@ -1,0 +1,140 @@
+# JavaScript / TypeScript CI — one job per Node package, each independent.
+#
+#   cli (repo root) : `node --test cli/test/`   — no dependencies, by design
+#   mobile          : `npm ci` + `node --test test/` + `tsc --noEmit`
+#   pi-extension    : `node --test test/`       — no dependencies, TS sources
+#
+# Node 24 (LTS line), pinned on purpose:
+#   - `mobile/test/*.mjs` and `pi-extension/test/*.test.ts` import `.ts` sources
+#     directly. Node executes `.ts` by *type stripping* (no build step), which is
+#     enabled by default from Node 23.6 (backported to 22.18) and is NOT enabled
+#     in Node 20, so the root package's own `engines: ">=20"` does not cover what
+#     the suites actually need. Node 24 is the LTS line that has it unflagged.
+#   - 24 also satisfies pi-extension's `engines: ">=22.6.0"`. The major is fixed
+#     so the runner cannot drift to a Node without type stripping; it is not an
+#     exact patch pin because those go stale and stop receiving security fixes.
+#   - Type stripping *strips*, it does not type-check. The only type check in CI
+#     is mobile's `tsc --noEmit`; pi-extension ships a tsconfig but no
+#     `typescript` dependency, so it is not type-checked here (honest gap, not a
+#     silent pass — `node --test` would still fail on a syntax/import error).
+#
+# Dependencies: only `mobile/` has them (14) and a lockfile
+# (`mobile/package-lock.json`, lockfileVersion 3), so it is the only job that
+# runs `npm ci` and the only one with an npm cache. The root package and
+# pi-extension declare zero dependencies and have no lockfile: there is nothing
+# for `npm ci` to install and nothing for a cache to hold, so `cache: npm` is
+# deliberately absent (setup-node fails with "Dependencies lock file is not
+# found" when a package has no lockfile). An empty cache here would be theatre.
+#
+# No `paths:` filters on purpose: a path-filtered required check never reports
+# on a docs-only PR, so it sticks in "Expected — Waiting for status" forever.
+# The three jobs are cheap enough to run on every push.
+#
+# Honest boundary: these jobs prove the logic-level suites pass from a clean
+# checkout on a clean Node, and that the mobile app type-checks. They do not run
+# the app on a device, do not type-check pi-extension, and are unrelated to the
+# Android APK workflow.
+
+name: JS CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: the jobs only read the checkout. The npm cache uses the
+# run-scoped cache service, not the API.
+permissions:
+  contents: read
+
+# A superseded push to the same ref has no value: cancel it instead of paying for
+# two runs of the same suite.
+concurrency:
+  group: ci-js-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: '1'
+
+jobs:
+  cli:
+    name: CLI (root)
+    # The suite starts local loopback servers and is pure Node; a couple of
+    # minutes is generous, 10 catches a real hang.
+    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2 # actions/checkout v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4.4.0 # actions/setup-node v4.4.0
+        with:
+          node-version: '24'
+
+      - name: Unit tests
+        # No install step on purpose: `cli/` must run on Node alone (it renders
+        # its own QR, uses only node: builtins). A dependency added by accident
+        # fails here instead of failing on a user's machine.
+        run: npm test
+
+  mobile:
+    name: Mobile (Expo app)
+    # Cold npm cache + 515 locked packages: `npm ci` dominates the run; the
+    # suite and `tsc` add seconds. 20 leaves room for a slow first run.
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2 # actions/checkout v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4.4.0 # actions/setup-node v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: mobile/package-lock.json
+
+      - name: Install (clean, lockfile-exact)
+        # `npm ci` (not `install`): fails when package.json and the lockfile
+        # diverge, and installs exactly the locked tree.
+        working-directory: mobile
+        run: npm ci
+
+      - name: Unit tests
+        # `npm test` → `node --test test/`; the .mjs tests import the app's
+        # RN-free `.ts` logic modules, which needs type stripping (Node 24).
+        working-directory: mobile
+        run: npm test
+
+      - name: Typecheck
+        # `npm run typecheck` → `tsc --noEmit` with `expo/tsconfig.base`.
+        working-directory: mobile
+        run: npm run typecheck
+
+  pi-extension:
+    name: Pi extension
+    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2 # actions/checkout v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4.4.0 # actions/setup-node v4.4.0
+        with:
+          node-version: '24'
+
+      - name: Unit tests
+        # No install step on purpose: the bridge serves the Pi host over
+        # node:http/node:net only and the tests are `.ts` run by type stripping
+        # (`node --test test/`, which discovers `*.test.ts` when stripping is
+        # enabled). No lockfile exists to install from.
+        working-directory: pi-extension
+        run: npm test
