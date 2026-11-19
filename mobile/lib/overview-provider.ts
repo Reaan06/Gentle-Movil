@@ -40,21 +40,19 @@ export interface ActiveTunnel {
  * datos" with that reason instead of a zero that looks measured (T7q).
  */
 export function overviewFromSessions(sessions: readonly BridgeSession[]): OverviewData {
-  const working = sessions.filter((s) => s.status === 'working');
-  const waiting = sessions.filter((s) => s.status === 'waiting');
-  const done = sessions.filter((s) => s.status === 'done');
+  // §9.3 publishes `busy | idle | unknown`. `busy` is the real working count;
+  // the platform exposes no pending-question and no finished-session notion, so
+  // those two stay `null` and the screen says "sin datos" with the reason.
+  const working = sessions.filter((session) => session.status === 'busy');
   return {
     working: {
       count: working.length,
-      hints: working.slice(0, 2).map((s) => s.hint ?? s.title),
+      hints: working.slice(0, 2).map((session) => session.hint ?? session.title),
     },
-    waiting: {
-      count: waiting.length,
-      hint: waiting.length > 0 ? `${waiting.length} esperándote` : null,
-    },
+    waiting: { count: null, hint: null },
     done: {
-      count: done.length,
-      unit: 'esta semana',
+      count: null,
+      unit: null,
       withChanges: null,
       withoutPush: null,
     },
@@ -120,6 +118,11 @@ export function bridgeOverviewProvider(
       }
       throw new OfflineSignal({ kind: 'offline' });
     }
+    if (sessionsResult.status < 200 || sessionsResult.status >= 300) {
+      // A PC that answers with an error is not a PC without sessions: saying
+      // "crea la primera" with a green dot would be a measurement nobody made.
+      throw new OfflineSignal({ kind: 'offline' });
+    }
     const healthChannel = channel();
     const health =
       healthChannel === null
@@ -141,7 +144,7 @@ export function bridgeOverviewProvider(
         data.devices = reported;
       }
     }
-    if (data.working.count + data.waiting.count + data.done.count === 0) {
+    if ((sessionsResult.body.sessions ?? []).length === 0) {
       throw new EmptySignal({ kind: 'empty' });
     }
     return data;

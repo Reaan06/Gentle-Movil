@@ -61,7 +61,7 @@ export function ConnectionBanner({
 
   return (
     <View
-      accessibilityRole={copy.tone === 'danger' ? 'alert' : 'status'}
+      accessibilityRole={copy.tone === 'danger' ? 'alert' : 'summary'}
       accessibilityLabel={`${copy.title}. ${copy.text}`}
       testID={testID}
       style={[

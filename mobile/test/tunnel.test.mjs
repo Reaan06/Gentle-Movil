@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import { bridgeRequest } from '../lib/bridge.ts';
 import { base64Decode, base64Encode, utf8Decode, utf8Encode } from '../lib/core.ts';
 import {
   CHANNEL_READ_TIMEOUT_MS,
@@ -14,9 +15,11 @@ import {
   closeTunnel,
   httpOverTunnel,
   inspectHttpResponse,
+  openTunnelForwards,
   parseTunnelChannels,
   tunnelChannelFor,
 } from '../lib/provision.ts';
+import { tunnelChannelAdapter } from '../lib/tunnel-bridge.ts';
 
 /**
  * Contract of the tunnel channel I/O (`mobile/lib/core.ts` bindings +
@@ -392,6 +395,188 @@ test('closing the tunnel closes every channel and reports what actually closed',
 /* ------------------------------------------------------------------ *
  * Response framing (pure)
  * ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ *
+ * One channel per request (`lib/tunnel-bridge.ts`)
+ *
+ * The PC closes the connection after every answer (the client asks for
+ * `Connection: close`), so a channel serves exactly ONE response. The app
+ * keeps reusing the handle the `tunnel` step reported, which is how the
+ * tablet ended up reading a consumed channel: `eof`, zero bytes, empty body.
+ * ------------------------------------------------------------------ */
+
+/** HTTP response with a real `Content-Length`, the framing the host serves. */
+function lengthResponse(body) {
+  const payload = JSON.stringify(body);
+  return [
+    'HTTP/1.1 200 OK',
+    'Content-Type: application/json',
+    `Content-Length: ${Buffer.byteLength(payload)}`,
+    '',
+    payload,
+  ].join('\r\n');
+}
+
+/**
+ * The real PC over SSH: every channel opens a fresh TCP connection to the
+ * extension, serves exactly one response and closes it (`Connection: close`).
+ * `gc_provision_step` opens a new channel id on demand, as the core does.
+ */
+function oneShotPeer(options = {}) {
+  const nextIds = [...(options.channelIds ?? [21, 31, 41])];
+  const scripts = new Map(
+    Object.entries(options.responses ?? {}).map(([id, frames]) => [Number(id), [...frames]]),
+  );
+  const calls = [];
+  const writes = [];
+  return {
+    calls,
+    writes,
+    async call(fn, payloadJson) {
+      const payload = JSON.parse(payloadJson);
+      calls.push({ fn, payload });
+      if (fn === GC_FUNCTIONS.provisionStep) {
+        if (options.tunnelError) {
+          return JSON.stringify({ ok: false, error: options.tunnelError, raw: '{}' });
+        }
+        const forwards = (payload.forwards ?? []).map((forward) => ({
+          host: forward.host,
+          port: forward.port,
+          channel_id: nextIds.shift(),
+        }));
+        return JSON.stringify({ ok: true, step: 'tunnel', result: { forwards } });
+      }
+      if (fn === GC_FUNCTIONS.channelWrite) {
+        writes.push([payload.channelId, Buffer.from(payload.bytes, 'base64').toString('utf8')]);
+        return JSON.stringify({
+          ok: true,
+          result: { written: Buffer.from(payload.bytes, 'base64').length },
+        });
+      }
+      if (fn === GC_FUNCTIONS.channelClose) {
+        return JSON.stringify({ ok: true, result: { closed: true } });
+      }
+      if (fn !== GC_FUNCTIONS.channelRead) {
+        throw new Error(`unexpected bridge call ${fn}`);
+      }
+      const queue = scripts.get(payload.channelId);
+      if (queue === undefined || queue.length === 0) {
+        // That channel already served its one response and the peer closed it.
+        return JSON.stringify({ ok: true, result: { bytes: '', eof: true } });
+      }
+      return JSON.stringify({ ok: true, result: { bytes: b64(queue.shift()), eof: false } });
+    },
+  };
+}
+
+const HEALTH_WIRE = lengthResponse({
+  app: 'gentle-shell',
+  bridge: 'gentle-movil',
+  proto: 1,
+  version: '0.1.0',
+});
+
+test('each request opens its own channel: a consumed handle never answers twice', async () => {
+  const peer = oneShotPeer({ responses: { 11: [HEALTH_WIRE], 21: [HEALTH_WIRE] } });
+
+  const first = await bridgeRequest(
+    tunnelChannelAdapter('71', TUNNEL.channels[0], { call: peer.call }),
+    '/api/health',
+  );
+  assert.equal(first.ok, true);
+
+  // `tunnel-store.bridgeChannel()` hands the SAME provision handle again — the
+  // channel that already served its response.
+  const second = await bridgeRequest(
+    tunnelChannelAdapter('71', TUNNEL.channels[0], { call: peer.call }),
+    '/api/health',
+  );
+  assert.equal(second.ok, true, 'the second request must not read the consumed channel');
+  assert.deepEqual(second.body, first.body);
+
+  const closes = peer.calls
+    .filter((entry) => entry.fn === GC_FUNCTIONS.channelClose)
+    .map((entry) => entry.payload.channelId);
+  assert.deepEqual(
+    closes,
+    [11, 21],
+    'every one-shot channel is closed after its exchange so the core frees the id',
+  );
+
+  const reopened = peer.calls.filter((entry) => entry.fn === GC_FUNCTIONS.provisionStep);
+  assert.equal(reopened.length, 1, 'a fresh direct-tcpip channel is opened for the next request');
+  assert.deepEqual(reopened[0].payload, {
+    sessionId: 71,
+    step: 'tunnel',
+    forwards: [{ host: '127.0.0.1', port: EXTENSION_HTTP_PORT }],
+  });
+  assert.deepEqual(
+    peer.writes.map(([channelId]) => channelId),
+    [11, 21],
+    'the second request rides the fresh channel',
+  );
+});
+
+test('a reopen the core refuses is offline with the core reason, never an empty body', async () => {
+  const peer = oneShotPeer({
+    responses: { 11: [HEALTH_WIRE] },
+    tunnelError: { kind: 'ssh', message: 'ssh: unknown session id 72' },
+  });
+
+  const first = await bridgeRequest(
+    tunnelChannelAdapter('72', TUNNEL.channels[0], { call: peer.call }),
+    '/api/health',
+  );
+  assert.equal(first.ok, true);
+
+  const second = await bridgeRequest(
+    tunnelChannelAdapter('72', TUNNEL.channels[0], { call: peer.call }),
+    '/api/health',
+  );
+  assert.equal(second.ok, false);
+  assert.equal(second.failure.kind, 'offline');
+  assert.match(String(second.failure.error), /unknown session id 72/);
+});
+
+test('openTunnelForwards runs the tunnel step again and returns the new handles', async () => {
+  const peer = oneShotPeer({ channelIds: [21] });
+  const opened = await openTunnelForwards(
+    '7',
+    [{ host: '127.0.0.1', port: EXTENSION_HTTP_PORT }],
+    { call: peer.call },
+  );
+
+  assert.equal(opened.ok, true);
+  assert.deepEqual(opened.channels, [
+    { host: '127.0.0.1', port: EXTENSION_HTTP_PORT, channelId: 21 },
+  ]);
+  assert.equal(peer.calls[0].fn, GC_FUNCTIONS.provisionStep);
+  assert.deepEqual(peer.calls[0].payload, {
+    sessionId: 7,
+    step: 'tunnel',
+    forwards: [{ host: '127.0.0.1', port: EXTENSION_HTTP_PORT }],
+  });
+});
+
+test('openTunnelForwards refuses an empty forward list and surfaces the core reason', async () => {
+  const refused = await openTunnelForwards('7', [], {
+    call: async () => {
+      throw new Error('the core must not be called');
+    },
+  });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.error.kind, 'Input');
+
+  const peer = oneShotPeer({ tunnelError: { kind: 'ssh', message: 'ssh: unknown session id 7' } });
+  const failed = await openTunnelForwards(
+    '7',
+    [{ host: '127.0.0.1', port: EXTENSION_HTTP_PORT }],
+    { call: peer.call },
+  );
+  assert.equal(failed.ok, false);
+  assert.deepEqual(failed.error, { kind: 'ssh', message: 'ssh: unknown session id 7' });
+  assert.deepEqual(failed.raw, '{}');
+});
 
 test('inspectHttpResponse tells when a response still needs bytes', () => {
   const text = (value) => utf8Encode(value);

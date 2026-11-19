@@ -7,10 +7,16 @@
  * is the rendering shell and `mobile/test/waiting.test.mjs` pins these rules
  * against a fake channel that speaks the real HTTP/1.1 wire format.
  *
- * What the inbox is: the sessions whose status is `waiting` — the agent stopped
- * because it will not decide for the human. There is no simulated dataset: the
- * cards come from `GET /api/sessions` through the tunnel the pairing flow
- * opened, and every failure maps to a §V9 state instead of a made-up list:
+ * What the inbox is: the sessions the bridge reports with a pending question —
+ * the agent stopped because it will not decide for the human. There is no
+ * simulated dataset: the cards come from `GET /api/sessions` through the tunnel
+ * the pairing flow opened, and every failure maps to a §V9 state instead of a
+ * made-up list.
+ *
+ * §9.3 publishes only `idle | busy | unknown` and carries no question, so no
+ * real payload produces a card today (owner decision 2026-11-18: real states,
+ * nothing invented). The empty state says exactly that (`INBOX_EMPTY_REASON`)
+ * instead of claiming `Todo en marcha` from a measurement nobody made:
  *
  * - no tunnel / channel refused  → `offline` (cached cards stay, `Reconectando…`,
  *   answers disabled with `Requiere conexión`);
@@ -18,8 +24,8 @@
  *   amber `Datos de hace N min` chip;
  * - broken JSON / bad body       → `error` with `failure.message` + the raw
  *   evidence (the screen logs `{step, error, raw}` under `waiting-inbox`);
- * - zero waiting sessions        → `empty` (`Nada esperándote. Todo en marcha.`),
- *   never a success with zeros.
+ * - no pending question reported → `empty` (`Sin datos: …` + the reason), never
+ *   a success with zeros and never a fabricated card.
  *
  * Answers are NOT wired yet: `answerIntent` describes the pending route
  * `/waiting-inbox/<id>/answer` and the UI says so instead of pretending.
@@ -30,9 +36,10 @@ import {
   type TunnelChannel,
   bridgeSessions,
 } from './bridge.ts';
+import { NO_PENDING_REASON } from './overview.ts';
 import { LastGood } from './overview-provider.ts';
 
-/** A `/api/sessions` entry as the inbox reads it (protocol §6 + question). */
+/** A `/api/sessions` entry as the inbox reads it (protocol §9.3 + question). */
 export interface InboxSession extends BridgeSession {
   /**
    * Question the agent is blocked on, when the bridge sends one. Absent or
@@ -78,8 +85,20 @@ export type InboxState =
 /** Artboard intro, minus the "Respondé y sigue solo" promise (answers pending). */
 export const INBOX_INTRO = 'El agente se detuvo para no decidir por vos.';
 
-/** §V9 empty-state copy (views plan). */
-export const INBOX_EMPTY_COPY = 'Nada esperándote. Todo en marcha.';
+/**
+ * Why the inbox can be empty even while the agent is blocked: the extension
+ * exposes no pending question, so the PC cannot report one (§9.3 has no
+ * `waiting` state and no question field). Same wording as the Overview's
+ * Esperando tile, from one source.
+ */
+export const INBOX_EMPTY_REASON = NO_PENDING_REASON;
+
+/**
+ * §V9 empty-state copy. The views-plan line `Nada esperándote. Todo en marcha.`
+ * asserts a measurement the PC never made, so the honest card says there is no
+ * data and why instead of declaring the queue clear (T12 owner decision).
+ */
+export const INBOX_EMPTY_COPY = `Sin datos: ${INBOX_EMPTY_REASON}.`;
 
 /** Why the answer actions are muted while there is no live answer channel. */
 export const INBOX_ANSWER_OFF_NOTE = 'Requiere conexión';
@@ -161,30 +180,27 @@ function timestampOf(at: string): number {
 }
 
 /**
- * Cards for the sessions that are `waiting`, newest first (the artboard's
- * order). Working, done and archived sessions never enter the inbox.
+ * Status the protocol reserves for "the agent is blocked on a human answer"
+ * (§V9's source). §9.3 does not publish it yet: a real payload only carries
+ * `idle | busy | unknown`, so nothing matches and no card is invented. A
+ * `busy` or `unknown` session is never promoted into a question.
+ */
+const PENDING_STATUS: string = 'waiting';
+
+/**
+ * Cards for the sessions that report a pending question, newest first (the
+ * artboard's order). Empty for every §9.3 payload until the extension exposes
+ * questions — the inbox then says "sin datos" with `INBOX_EMPTY_REASON`
+ * instead of claiming nobody is waiting.
  */
 export function inboxItemsFromSessions(
   sessions: readonly InboxSession[],
   now: number = Date.now(),
 ): InboxItem[] {
   return sessions
-    .filter((session) => session.status === 'waiting')
+    .filter((session) => String(session.status) === PENDING_STATUS)
     .map((session) => inboxItemFromSession(session, now))
     .sort((a, b) => timestampOf(b.updatedAt) - timestampOf(a.updatedAt));
-}
-
-/** Raw body prefix for the `{step, error, raw}` log. */
-function rawPrefix(body: unknown): string | null {
-  try {
-    if (typeof body === 'string') {
-      return body.slice(0, 120);
-    }
-    const json = JSON.stringify(body);
-    return typeof json === 'string' ? json.slice(0, 120) : null;
-  } catch {
-    return null;
-  }
 }
 
 /** Options of one inbox refresh. */
@@ -246,17 +262,10 @@ export async function loadInbox(
       items: cached,
     };
   }
-  const body = result.body as { sessions?: unknown } | null;
-  const sessions = body === null || typeof body !== 'object' ? undefined : body.sessions;
-  if (!Array.isArray(sessions)) {
-    return {
-      kind: 'error',
-      message: 'La PC devolvió datos incompletos.',
-      raw: rawPrefix(result.body),
-      items: cached,
-    };
-  }
-  const items = inboxItemsFromSessions(sessions as InboxSession[], options.now);
+  // `bridgeSessions` already normalized the payload: a body that is not a
+  // session list arrived as a typed failure above, so this list is the real one
+  // and there is exactly one place that owns the parse message.
+  const items = inboxItemsFromSessions(result.body.sessions, options.now);
   // A good answer (even an empty one) moves the stale chip's baseline.
   lastGood.mark();
   return items.length === 0 ? { kind: 'empty', items: [] } : { kind: 'success', items };

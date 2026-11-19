@@ -17,8 +17,11 @@ import {
   MEASURED_OVERVIEW,
   NOTHING_MEASURED,
   NO_CHANGES_REASON,
+  NO_DONE_REASON,
+  NO_PENDING_REASON,
   NO_TOKENS_REASON,
   buildOverview,
+  connectionChip,
   chartBars,
   formatTokens,
   syncLine,
@@ -116,13 +119,22 @@ test('unmeasured metrics are null and render "sin datos" with the reason', () =>
   assert.equal(vm.tokens.available, false);
   assert.equal(vm.tokens.reason, NO_TOKENS_REASON);
   assert.deepEqual(vm.tokens.chart, []);
-  // Changes per done session: not reported by /api/sessions. With nothing
-  // done the tile stays silent instead of claiming a measured zero.
+  // Esperando: §9.3 publishes no pending question, so the tile is null with
+  // its reason — never 0 and never the idle/unknown count.
+  const waiting = vm.tiles.find((t) => t.id === 'waiting');
+  assert.equal(waiting.count, null);
+  assert.equal(waiting.attention, false);
+  assert.equal(waiting.hint, NO_PENDING_REASON);
+  // Terminadas: no finished-session source, so the tile is null with its
+  // reason instead of a measured zero.
   const done = vm.tiles.find((t) => t.id === 'done');
-  assert.equal(done.count, 0);
-  assert.equal(done.hint, null);
+  assert.equal(done.count, null);
+  assert.equal(done.hint, NO_DONE_REASON);
   // Devices: only when the health payload reports a number.
   assert.ok(vm.syncLine.includes('dispositivos sin datos'));
+  // The real measured count still renders: Trabajando is 0 because the PC said
+  // so, not because the metric is missing.
+  assert.equal(vm.tiles.find((t) => t.id === 'working').count, 0);
 });
 
 test('done tile with real sessions but no counters says "sin datos"', () => {
@@ -155,4 +167,40 @@ test('action descriptors point at the screens that exist', () => {
   assert.equal(nueva.route, '/new-session');
   assert.equal(nueva.pending, true);
   assert.ok(nueva.pendingReason.includes('/new-session'));
+});
+
+/**
+ * The connection chip (T17, S11): Overview's chip is the door to the connection
+ * menu, so it has to say the real state of the tunnel and the real host — and
+ * never invent a host it does not know.
+ */
+test('connection chip: real state, real host, and it opens the connection menu', () => {
+  const success = buildOverview({ kind: 'success', data: MEASURED_OVERVIEW });
+
+  const live = connectionChip(success, '192.168.0.10');
+  assert.equal(live.text, 'Live · 192.168.0.10');
+  assert.equal(live.dot, 'green');
+  assert.match(live.accessibilityLabel, /menú de conexión/i);
+  assert.equal(live.accessibilityHint, 'Reconectar, cambiar de conexión o agregar otro dispositivo');
+
+  const stale = connectionChip(buildOverview({ kind: 'stale', minutes: 7, data: MEASURED_OVERVIEW }), '192.168.0.10');
+  assert.equal(stale.text, 'Live · 192.168.0.10 · hace 7 min');
+  assert.equal(stale.dot, 'green');
+
+  const offline = connectionChip(buildOverview({ kind: 'offline', data: null }), '192.168.0.10');
+  assert.equal(offline.text, 'Sin conexión · 192.168.0.10');
+  assert.equal(offline.dot, 'grey');
+
+  const loading = connectionChip(buildOverview({ kind: 'loading' }), '192.168.0.10');
+  assert.equal(loading.text, 'Reconectando… · 192.168.0.10');
+  assert.equal(loading.dot, 'grey');
+
+  // The host the data reported is used when the caller has none; an unknown
+  // host is said out loud instead of printing a made-up name.
+  assert.equal(connectionChip(success).text, 'Live · tu-pc');
+  assert.equal(connectionChip(success, null).text, 'Live · sin datos');
+  assert.equal(
+    connectionChip(buildOverview({ kind: 'offline', data: null }), '   ').text,
+    'Sin conexión · sin datos',
+  );
 });

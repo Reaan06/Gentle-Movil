@@ -381,7 +381,7 @@ export default function AutomationEditorScreen() {
           </View>
 
           {saveNote !== null && (
-            <View style={styles.noteCard} accessibilityRole="status">
+            <View style={styles.noteCard} accessibilityRole="summary">
               <Text style={styles.noteTitle}>Guardar todavía no está conectado</Text>
               <Text style={styles.noteText}>{saveNote}</Text>
             </View>

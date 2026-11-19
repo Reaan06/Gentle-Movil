@@ -31,16 +31,17 @@ import {
  * §V9).
  *
  * One aggregated queue of everything blocked on the human: the sessions the PC
- * reports as `waiting`, with the question they stopped on and how long they have
- * been waiting. Rendering shell only — the §V9 state machine, the card view
- * model and every es-AR copy live in `mobile/lib/waiting.ts`, pinned by
+ * reports with a pending question and how long they have been waiting.
+ * Rendering shell only — the §V9 state machine, the card view model and every
+ * es-AR copy live in `mobile/lib/waiting.ts`, pinned by
  * `mobile/test/waiting.test.mjs`.
  *
  * Data is real: `GET /api/sessions` through the SSH tunnel the pairing flow
  * opened (`lib/waiting.ts` → `lib/bridge.ts`). No tunnel is `Reconectando…`
  * with the cached cards kept and answers muted; a broken answer is an inline
- * error card with `failure.message` plus the raw evidence in the log; zero
- * waiting sessions is `Nada esperándote. Todo en marcha.`, never zeros-as-data.
+ * error card with `failure.message` plus the raw evidence in the log. §9.3
+ * publishes no pending question yet, so the honest empty card is `Sin datos:
+ * <reason>` — never zeros-as-data and never a claim that nobody is waiting.
  *
  * Answers are NOT wired yet: the answer action logs `route pending`
  * (`/waiting-inbox/<id>/answer`) and the footer note says so. The screen never

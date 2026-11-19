@@ -17,15 +17,16 @@ import {
 } from '../lib/overview-provider.ts';
 // .mjs es JS puro: los `type` imports no existen aquí (Node 26 no strippea .mjs)
 
+/** The real §9.3 payload: a bare array with the three published statuses. */
 const SESSIONS = [
-  { id: '1', title: 'feat/auth', status: 'working', hint: 'gentle-movil', updatedAt: '2026-11-18T15:00:00Z' },
-  { id: '2', title: 'fix/daemon', status: 'working', hint: 'gentle-shell', updatedAt: '2026-11-18T14:00:00Z' },
-  { id: '3', title: 'pregunta del review', status: 'waiting', hint: null, updatedAt: '2026-11-18T13:00:00Z' },
-  { id: '4', title: 'chore/deps', status: 'done', hint: 'engram', updatedAt: '2026-11-18T12:00:00Z' },
+  { id: '1', title: 'feat/auth', status: 'busy', hint: 'gentle-movil', updatedAt: '2026-11-18T15:00:00Z' },
+  { id: '2', title: 'fix/daemon', status: 'busy', hint: 'gentle-shell', updatedAt: '2026-11-18T14:00:00Z' },
+  { id: '3', title: 'pregunta del review', status: 'idle', hint: null, updatedAt: '2026-11-18T13:00:00Z' },
+  { id: '4', title: 'chore/deps', status: 'unknown', hint: 'engram', updatedAt: '2026-11-18T12:00:00Z' },
 ];
 
-function okChannel(body) {
-  const wire = `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(body)}`;
+function okChannel(body, status = 200) {
+  const wire = `HTTP/1.1 ${status} OK\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(body)}`;
   return {
     async write() { return 1; },
     async read() { return { bytes: new TextEncoder().encode(wire), eof: true }; },
@@ -35,15 +36,24 @@ function okChannel(body) {
 
 test('overviewFromSessions maps real statuses onto counts and hints', () => {
   const data = overviewFromSessions(SESSIONS);
+  // Trabajando is the real `busy` count.
   assert.equal(data.working.count, 2);
   assert.deepEqual(data.working.hints, ['gentle-movil', 'gentle-shell']);
-  assert.equal(data.waiting.count, 1);
-  assert.equal(data.done.count, 1);
+  // §9.3 publishes no pending question and no finished session, so those two
+  // tiles are unmeasured: null, never a zero and never the idle/unknown count.
+  assert.equal(data.waiting.count, null);
+  assert.equal(data.done.count, null);
 });
 
 test('empty PC (zero sessions) maps to the empty state, not zeros-as-success', () => {
-  const provider = bridgeOverviewProvider(() => okChannel({ sessions: [] }));
+  const provider = bridgeOverviewProvider(() => okChannel([]));
   assert.rejects(provider(), EmptySignal);
+});
+
+test('a 5xx from /api/sessions is offline, never an empty-with-green-dot', async () => {
+  // A broken PC must not read as "Aún no hay sesiones. Crea la primera.".
+  const provider = bridgeOverviewProvider(() => okChannel({ error: 'boom' }, 500));
+  await assert.rejects(provider(), OfflineSignal);
 });
 
 test('tunnel never opened → offline signal, no fetch attempted', async () => {
@@ -89,7 +99,7 @@ test('timeout after a good answer → stale with minutes since it', async () => 
 });
 
 test('success: real sessions + health flow through the provider', async () => {
-  const channels = [okChannel({ sessions: SESSIONS }), okChannel({ proto: 1, name: 'tu-pc' })];
+  const channels = [okChannel(SESSIONS), okChannel({ proto: 1, bridge: 'tu-pc' })];
   let index = 0;
   const provider = bridgeOverviewProvider(() => channels[index++]);
   const data = await provider();
@@ -99,9 +109,10 @@ test('success: real sessions + health flow through the provider', async () => {
 
 test('overviewFromSessions: nothing unmeasured is reported as a zero', () => {
   const data = overviewFromSessions(SESSIONS);
-  // Real: session counts.
-  assert.equal(data.done.count, 1);
-  // Not reported by /api/sessions or /api/health → null, never 0.
+  // Not reported by §9.3 → null, never 0 and never a count borrowed from the
+  // states the payload does publish.
+  assert.equal(data.waiting.count, null);
+  assert.equal(data.done.count, null);
   assert.equal(data.done.withChanges, null);
   assert.equal(data.done.withoutPush, null);
   assert.equal(data.tokens.total, null);
@@ -122,7 +133,7 @@ test('LastGood.secondsSince is real elapsed time from the injected clock', () =>
 });
 
 test('success: sync age is measured, devices only when health reports one', async () => {
-  const channels = [okChannel({ sessions: SESSIONS }), okChannel({ proto: 1, bridge: 'tu-pc' })];
+  const channels = [okChannel(SESSIONS), okChannel({ proto: 1, bridge: 'tu-pc' })];
   let index = 0;
   const provider = bridgeOverviewProvider(() => channels[index++]);
   const data = await provider();
@@ -132,7 +143,7 @@ test('success: sync age is measured, devices only when health reports one', asyn
 });
 
 test('success: a health payload that reports devices is used as measured', async () => {
-  const channels = [okChannel({ sessions: SESSIONS }), okChannel({ proto: 1, bridge: 'tu-pc', devices: 2 })];
+  const channels = [okChannel(SESSIONS), okChannel({ proto: 1, bridge: 'tu-pc', devices: 2 })];
   let index = 0;
   const provider = bridgeOverviewProvider(() => channels[index++]);
   const data = await provider();

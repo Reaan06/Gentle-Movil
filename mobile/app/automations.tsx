@@ -323,7 +323,7 @@ export default function AutomationsScreen() {
             {meta}
           </Text>
         </View>
-        <View style={styles.pair} accessibilityRole="status">
+        <View style={styles.pair} accessibilityRole="summary">
           <View
             style={[
               styles.pairDot,
@@ -354,7 +354,7 @@ export default function AutomationsScreen() {
         )}
 
         {banner === null && vm.banner !== null && (
-          <View style={styles.offlineStrip} accessibilityRole="status">
+          <View style={styles.offlineStrip} accessibilityRole="summary">
             <ActivityIndicator size="small" color={colors.warning} />
             <View style={styles.offlineText}>
               <Text style={styles.offlineTitle}>{vm.banner}</Text>
@@ -379,7 +379,7 @@ export default function AutomationsScreen() {
         )}
 
         {toggleNote !== null && (
-          <View style={styles.noteCard} accessibilityRole="status">
+          <View style={styles.noteCard} accessibilityRole="summary">
             <Text style={styles.noteText}>{toggleNote}</Text>
           </View>
         )}

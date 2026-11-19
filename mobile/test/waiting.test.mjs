@@ -3,9 +3,12 @@
  * tunnel, so every case here speaks the real wire format through a fake channel
  * (same helpers as `mobile/test/bridge.test.mjs`) and pins that:
  *
- * - only `waiting` sessions become cards (working/done/archived excluded);
- * - the relative waiting copy is honest, singular and plural;
- * - zero waiting sessions is the `empty` state, never success-with-zeros;
+ * - the PC publishes `busy | idle | unknown` and no question (§9.3), so no real
+ *   session becomes a card and no `waiting` status is ever invented;
+ * - the card mapping and the relative waiting copy are honest, singular and
+ *   plural (pure functions, fed directly);
+ * - no pending question is the `empty` state with its reason, never a success
+ *   with zeros and never `Todo en marcha`;
  * - a missing tunnel is `offline`, a broken body is `error` with the failure
  *   message and the raw evidence, a timeout after a good answer is `stale`;
  * - the answer action is still a pending route (nothing is sent).
@@ -18,6 +21,7 @@ import { utf8Encode } from '../lib/core.ts';
 import { LastGood } from '../lib/overview-provider.ts';
 import {
   INBOX_EMPTY_COPY,
+  INBOX_EMPTY_REASON,
   answerIntent,
   buildInbox,
   inboxItemFromSession,
@@ -71,67 +75,95 @@ function silentChannel() {
   };
 }
 
-/** The real `/api/sessions` shape, with one of each status. */
+/** The real `/api/sessions` payload: a bare array with the three §9.3 states. */
 function sessions() {
   return [
     {
       id: 's1',
       title: 'feat/auth-login',
-      status: 'waiting',
+      status: 'busy',
       hint: 'gentle-movil',
       updatedAt: '2026-11-18T15:16:00Z',
-      question: '¿Uso bcrypt o argon2 para los hashes?',
     },
     {
       id: 's2',
       title: 'fix/daemon-retry',
-      status: 'working',
+      status: 'busy',
       hint: 'gentle-shell',
       updatedAt: '2026-11-18T15:18:00Z',
     },
     {
       id: 's3',
       title: 'chore/deps',
-      status: 'done',
+      status: 'idle',
       hint: 'engram',
       updatedAt: '2026-11-18T15:19:00Z',
     },
     {
       id: 's4',
       title: 'pregunta sin texto',
-      status: 'waiting',
+      status: 'unknown',
       hint: null,
       updatedAt: '2026-11-18T15:12:00Z',
-    },
-    {
-      id: 's5',
-      title: 'archivada',
-      status: 'archived',
-      hint: 'gentle-movil',
-      updatedAt: '2026-11-18T15:10:00Z',
     },
   ];
 }
 
-test('(a) only waiting sessions become inbox items, newest first', () => {
-  const items = inboxItemsFromSessions(sessions(), NOW);
-  assert.deepEqual(
-    items.map((item) => item.id),
-    ['s1', 's4'],
-  );
-  assert.equal(items[0].title, 'feat/auth-login');
-  assert.equal(items[0].projectHint, 'gentle-movil');
-  assert.equal(items[0].sessionLabel, 'gentle-movil');
-  assert.equal(items[0].question, '¿Uso bcrypt o argon2 para los hashes?');
-  assert.equal(items[1].projectHint, null);
-  assert.equal(items[1].sessionLabel, 'pregunta sin texto');
-  assert.equal(items[1].question, null);
+/**
+ * The cards a bridge that exposes pending questions would produce. Built with
+ * `inboxItemFromSession` directly: §9.3 has no question source yet, so this is
+ * render-model fixture data, never a fabricated wire payload.
+ */
+function cachedCards() {
+  return [
+    inboxItemFromSession(
+      {
+        id: 's1',
+        title: 'feat/auth-login',
+        status: 'busy',
+        hint: 'gentle-movil',
+        updatedAt: '2026-11-18T15:16:00Z',
+        question: '¿Uso bcrypt o argon2 para los hashes?',
+      },
+      NOW,
+    ),
+    inboxItemFromSession(
+      {
+        id: 's4',
+        title: 'pregunta sin texto',
+        status: 'unknown',
+        hint: null,
+        updatedAt: '2026-11-18T15:12:00Z',
+      },
+      NOW,
+    ),
+  ];
+}
+
+test('(a) a §9.3 session list produces no card: the PC publishes no question', () => {
+  // No published state (`busy` / `idle` / `unknown`) is promoted into an inbox
+  // item, and no `waiting` state is invented to fill the screen.
+  assert.deepEqual(inboxItemsFromSessions(sessions(), NOW), []);
+});
+
+test('(a) one session maps onto its card: title, hint, label, question', () => {
+  const [withQuestion, withoutQuestion] = cachedCards();
+  assert.equal(withQuestion.id, 's1');
+  assert.equal(withQuestion.title, 'feat/auth-login');
+  assert.equal(withQuestion.projectHint, 'gentle-movil');
+  assert.equal(withQuestion.sessionLabel, 'gentle-movil');
+  assert.equal(withQuestion.question, '¿Uso bcrypt o argon2 para los hashes?');
+  assert.equal(withQuestion.waitingMinutes, 4);
+  assert.equal(withQuestion.waitingFor, 'esperando hace 4 min');
+  assert.equal(withoutQuestion.projectHint, null);
+  assert.equal(withoutQuestion.sessionLabel, 'pregunta sin texto');
+  assert.equal(withoutQuestion.question, null);
 });
 
 test('(a) a blank or non-string question is no question block, not empty text', () => {
   const base = {
     title: 't',
-    status: 'waiting',
+    status: 'busy',
     hint: null,
     updatedAt: '2026-11-18T15:16:00Z',
   };
@@ -162,7 +194,7 @@ test('(b) waiting minutes come from updatedAt with an injectable clock', () => {
   assert.equal(waitingMinutes('2026-11-18T15:40:00Z', NOW), 0);
   assert.equal(waitingMinutes('no-es-una-fecha', NOW), null);
 
-  const base = { title: 't', status: 'waiting', hint: null };
+  const base = { title: 't', status: 'busy', hint: null };
   const four = inboxItemFromSession(
     { ...base, id: 's1', updatedAt: '2026-11-18T15:16:00Z' },
     NOW,
@@ -175,39 +207,48 @@ test('(b) waiting minutes come from updatedAt with an injectable clock', () => {
   assert.equal(unknown.waitingFor, 'esperando');
 });
 
-test('(c) no waiting session → empty state, never success with zeros', async () => {
-  const channel = scriptedChannel([
-    OK_WIRE({ sessions: sessions().filter((session) => session.status !== 'waiting') }),
-  ]);
+test('(c) no pending question → empty with the reason, never success with zeros', async () => {
+  // The exact payload the extension serves today: real sessions, no question.
+  const channel = scriptedChannel([OK_WIRE(sessions())]);
   const state = await loadInbox(channel, { now: NOW });
   assert.equal(state.kind, 'empty');
   assert.deepEqual(state.items, []);
 
   const vm = buildInbox(state);
-  assert.equal(INBOX_EMPTY_COPY, 'Nada esperándote. Todo en marcha.');
-  assert.equal(vm.emptyCard, 'Nada esperándote. Todo en marcha.');
+  assert.equal(vm.emptyCard, INBOX_EMPTY_COPY);
+  assert.equal(INBOX_EMPTY_COPY, `Sin datos: ${INBOX_EMPTY_REASON}.`);
+  assert.equal(vm.emptyCard.includes(INBOX_EMPTY_REASON), true);
+  // The old artboard copy claimed a measurement the PC never made.
+  assert.equal(vm.emptyCard.includes('Todo en marcha'), false);
   assert.equal(vm.countLine, 'Nada esperándote');
   assert.equal(vm.errorCard, null);
 });
 
-test('success: real waiting sessions become cards with plural header copy', async () => {
-  const channel = scriptedChannel([OK_WIRE({ sessions: sessions() })]);
-  const state = await loadInbox(channel, { now: NOW });
-  assert.equal(state.kind, 'success');
-  assert.equal(state.items.length, 2);
+test('success: plural header copy counts questions and pending cards', () => {
+  const [withQuestion, withoutQuestion] = cachedCards();
+  const items = [withQuestion, { ...withoutQuestion, question: '¿Sigo con el refactor?' }];
+  const vm = buildInbox({ kind: 'success', items });
+  assert.equal(vm.state, 'success');
+  assert.equal(vm.items.length, 2);
+  assert.equal(vm.countLine, '2 preguntas abiertas');
+  assert.equal(vm.pendingChip, '2 pendientes');
+  assert.equal(vm.answerEnabled, true);
+  assert.equal(vm.emptyCard, null);
+});
 
-  const vm = buildInbox(state);
+test('success: singular header copy for one question and one pending card', () => {
+  const vm = buildInbox({ kind: 'success', items: [cachedCards()[0]] });
   // Only `s1` carries a question, so the header counts one open question...
   assert.equal(vm.countLine, '1 pregunta abierta');
-  // ...while the pending chip counts every session waiting on the human.
-  assert.equal(vm.pendingChip, '2 pendientes');
+  // ...while the pending chip counts every card waiting on the human.
+  assert.equal(vm.pendingChip, '1 pendiente');
   assert.equal(vm.answerEnabled, true);
   assert.equal(vm.emptyCard, null);
   assert.equal(vm.staleChip, null);
 });
 
 test('(d) offline: no tunnel → offline state with cached cards and answers disabled', async () => {
-  const cached = inboxItemsFromSessions(sessions(), NOW);
+  const cached = cachedCards();
   const state = await loadInbox(null, { cached, now: NOW });
   assert.equal(state.kind, 'offline');
   assert.equal(state.items.length, 2);
@@ -247,14 +288,19 @@ test('(e) a body without a sessions array is an error, never an empty inbox', as
   const channel = scriptedChannel([OK_WIRE({ nope: true })]);
   const state = await loadInbox(channel, { now: NOW });
   assert.equal(state.kind, 'error');
-  assert.equal(state.message, 'La PC devolvió datos incompletos.');
+  // One parse owner: `bridgeSessions` reports the invalid list, the inbox does
+  // not re-implement the check (and never turns it into an empty success).
+  assert.equal(state.message, 'La PC devolvió una lista de sesiones inválida.');
   assert.match(state.raw, /nope/);
+  const vm = buildInbox(state);
+  assert.equal(vm.emptyCard, null);
+  assert.equal(vm.answerEnabled, false);
 });
 
 test('timeout after a good answer → stale chip with the cards kept', async () => {
   const lastGood = new LastGood();
   lastGood.mark();
-  const cached = inboxItemsFromSessions(sessions(), NOW);
+  const cached = cachedCards();
   const state = await loadInbox(silentChannel(), {
     cached,
     lastGood,

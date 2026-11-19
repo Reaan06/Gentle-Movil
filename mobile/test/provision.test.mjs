@@ -10,6 +10,8 @@ import {
   EXTENSION_HTTP_PORT,
   EXTENSION_LOOPBACK_PORTS,
   EXTENSION_WS_PORT,
+  FINGERPRINT_COPY,
+  GC_FUNCTIONS,
   PROVISION_ROWS,
   PROVISION_STEPS,
   PROVISION_TIMEOUTS,
@@ -51,8 +53,47 @@ const PAIR = {
 
 const CREDENTIAL = { kind: 'password', value: 'correcta' };
 
-/** Device key the fake core hands out (32-byte ed25519 public key, hex). */
+/** Device key the persisted identity answers with (32-byte ed25519 public key, hex). */
 const DEVICE_PUBKEY_HEX = 'ab'.repeat(32);
+
+/** Fingerprint of that persisted identity (`deviceKeyEnsure` answers both). */
+const DEVICE_KEY_FP = 'SHA256:9E42C71B053A88F0D6224BA9517EC310';
+
+/** What the frozen ABI v2 `deviceKeyEnsure()` resolves with — and nothing else. */
+const DEVICE_IDENTITY = { publicHex: DEVICE_PUBKEY_HEX, fingerprint: DEVICE_KEY_FP };
+
+/**
+ * Recording identity source: the persisted phone identity the register step must
+ * install. `answer` is the identity, a function returning it, or an error to throw.
+ */
+function fakeIdentity(answer = DEVICE_IDENTITY) {
+  const calls = [];
+  return {
+    calls,
+    async ensure() {
+      calls.push('deviceKeyEnsure');
+      if (answer instanceof Error) {
+        throw answer;
+      }
+      if (typeof answer === 'function') {
+        return answer();
+      }
+      return answer;
+    },
+  };
+}
+
+/** Identity source that rejects with a typed failure (a core that cannot answer). */
+function rejectingIdentity(failure) {
+  const calls = [];
+  return {
+    calls,
+    async ensure() {
+      calls.push('deviceKeyEnsure');
+      throw failure;
+    },
+  };
+}
 
 /**
  * Channels the fake core reports after `tunnel` (`TunnelResult.forwards`), one per
@@ -81,15 +122,6 @@ function fakeBridge(script = {}) {
         }
         const fingerprint = script.fingerprint ?? PAIR.fp;
         return JSON.stringify({ ok: true, result: { sessionId: 7, fingerprint } });
-      }
-      if (fn === 'gc_device_key_generate') {
-        const key = script.deviceKey ?? 'ok';
-        if (key !== 'ok') {
-          return JSON.stringify({ ok: false, error: { kind: key, message: `falló ${key}` }, raw: null });
-        }
-        // The real core answers {"ok":true,"key":{...}} with the key at the TOP level
-        // (cabi gc_device_key_generate); the fake mirrors that placement.
-        return JSON.stringify({ ok: true, key: { public_hex: DEVICE_PUBKEY_HEX, secret: {} } });
       }
       const behaviour = script[payload.step] ?? script[fn] ?? 'ok';
       if (behaviour === 'hang') {
@@ -146,8 +178,13 @@ test('the happy path runs the five steps in order and reports each one', async (
   const bridge = fakeBridge();
   const logger = fakeLogger();
   const cb = recordedCallbacks();
+  const identity = fakeIdentity();
 
-  const result = await provisionFlow(PAIR, CREDENTIAL, cb, { call: bridge.call, logger });
+  const result = await provisionFlow(PAIR, CREDENTIAL, cb, {
+    call: bridge.call,
+    logger,
+    deviceKeyEnsure: identity.ensure,
+  });
 
   assert.equal(result.ok, true);
   assert.equal(result.sessionId, '7');
@@ -162,14 +199,17 @@ test('the happy path runs the five steps in order and reports each one', async (
   });
   assert.deepEqual(
     bridge.calls.map((entry) => entry.payload.step ?? entry.fn),
-    ['gc_ssh_connect', 'detect', 'gc_device_key_generate', 'register', 'tunnel'],
+    ['gc_ssh_connect', 'detect', 'register', 'tunnel'],
   );
+  // The identity is the persisted one, asked for exactly once: no key is minted.
+  assert.deepEqual(identity.calls, ['deviceKeyEnsure']);
   // detect and register carry the shell command composed in TS (no new ABI).
   const detect = bridge.calls.find((entry) => entry.payload.step === 'detect');
   assert.match(detect.payload.command, /43721/);
   assert.match(detect.payload.command, /43722/);
   const register = bridge.calls.find((entry) => entry.payload.step === 'register');
-  assert.equal(register.payload.devicePubkeyHex, DEVICE_PUBKEY_HEX);
+  assert.equal(register.payload.devicePubkeyHex, DEVICE_IDENTITY.publicHex);
+  assert.equal(register.payload.authorizedKey, sshEd25519AuthorizedKey(DEVICE_IDENTITY.publicHex));
   assert.match(register.payload.authorizedKey, /^ssh-ed25519 AAAA/);
   assert.match(register.payload.command, /authorized_keys/);
   const tunnel = bridge.calls.find((entry) => entry.payload.step === 'tunnel');
@@ -186,7 +226,7 @@ test('the happy path runs the five steps in order and reports each one', async (
     ]),
   );
   assert.equal(logger.failures.length, 0);
-  assert.equal(result.registration.authorizedKey, sshEd25519AuthorizedKey(DEVICE_PUBKEY_HEX));
+  assert.equal(result.registration.authorizedKey, sshEd25519AuthorizedKey(DEVICE_IDENTITY.publicHex));
   // The tunnel handles are kept, not discarded: they are how the app speaks HTTP/WS.
   assert.deepEqual(result.tunnel, {
     sessionId: '7',
@@ -195,6 +235,120 @@ test('the happy path runs the five steps in order and reports each one', async (
       { host: '127.0.0.1', port: EXTENSION_WS_PORT, channelId: 12 },
     ],
   });
+});
+
+/* ------------------------------------------------------------------ *
+ * The register step installs the PERSISTED identity (T16 follow-up)
+ * ------------------------------------------------------------------ */
+
+test('register installs the persisted identity and never mints a throwaway key', async () => {
+  const identity = fakeIdentity();
+  const bridge = fakeBridge();
+
+  const result = await provisionFlow(PAIR, CREDENTIAL, recordedCallbacks(), {
+    call: bridge.call,
+    logger: fakeLogger(),
+    deviceKeyEnsure: identity.ensure,
+  });
+
+  assert.equal(result.ok, true);
+  const register = bridge.calls.find((entry) => entry.payload.step === 'register');
+  // The very key `deviceKeyEnsure()` answered with is the one the host accepts.
+  assert.equal(register.payload.devicePubkeyHex, DEVICE_IDENTITY.publicHex);
+  assert.equal(
+    result.registration.authorizedKey,
+    sshEd25519AuthorizedKey(DEVICE_IDENTITY.publicHex),
+  );
+  // No fresh keypair call is left in the flow: the ABI name is gone and never called.
+  assert.equal(
+    Object.values(GC_FUNCTIONS).includes('gc_device_key_generate'),
+    false,
+    'GC_FUNCTIONS still exposes gc_device_key_generate',
+  );
+  assert.equal(
+    bridge.calls.some((entry) => entry.fn === 'gc_device_key_generate'),
+    false,
+    'the flow called gc_device_key_generate',
+  );
+  const source = readFileSync(new URL('../lib/provision.ts', import.meta.url), 'utf8');
+  assert.equal(source.includes('gc_device_key_generate'), false, 'provision.ts still names the old symbol');
+});
+
+test('two pairings of the same persisted identity install the same authorized key', async () => {
+  const identity = fakeIdentity();
+  const first = await provisionFlow(PAIR, CREDENTIAL, recordedCallbacks(), {
+    call: fakeBridge().call,
+    logger: fakeLogger(),
+    deviceKeyEnsure: identity.ensure,
+  });
+  const second = await provisionFlow(PAIR, CREDENTIAL, recordedCallbacks(), {
+    call: fakeBridge().call,
+    logger: fakeLogger(),
+    deviceKeyEnsure: identity.ensure,
+  });
+
+  assert.equal(first.ok, true);
+  assert.equal(second.ok, true);
+  // A reconnect compares against the persisted key: the line cannot drift per pairing.
+  assert.equal(first.registration.authorizedKey, second.registration.authorizedKey);
+  assert.deepEqual(identity.calls, ['deviceKeyEnsure', 'deviceKeyEnsure']);
+});
+
+test('an injected known public key is used and the identity source is never asked', async () => {
+  const identity = fakeIdentity(new Error('no debe llamarse'));
+  const bridge = fakeBridge();
+
+  const result = await provisionFlow(PAIR, CREDENTIAL, recordedCallbacks(), {
+    call: bridge.call,
+    logger: fakeLogger(),
+    devicePubkeyHex: DEVICE_PUBKEY_HEX,
+    deviceKeyEnsure: identity.ensure,
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(identity.calls, []);
+  const register = bridge.calls.find((entry) => entry.payload.step === 'register');
+  assert.equal(register.payload.devicePubkeyHex, DEVICE_PUBKEY_HEX);
+});
+
+test('no identity source stops register honestly instead of minting a throwaway key', async () => {
+  const bridge = fakeBridge();
+  const logger = fakeLogger();
+  const cb = recordedCallbacks();
+
+  const result = await provisionFlow(PAIR, CREDENTIAL, cb, { call: bridge.call, logger });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failedStep, 'register');
+  assert.equal(result.error.kind, 'DeviceKey');
+  assert.match(result.error.message, /deviceKeyEnsure/, 'the failure names what is missing');
+  assert.deepEqual(stepsOf(bridge), ['detect'], 'register is never sent without an identity');
+  assert.deepEqual(logger.failures, [
+    {
+      step: 'register',
+      error: { kind: 'DeviceKey', message: result.error.message },
+      raw: { source: 'deviceKeyEnsure' },
+    },
+  ]);
+  assert.deepEqual(cb.events.at(-1), ['error', 'register', 'DeviceKey', { source: 'deviceKeyEnsure' }]);
+});
+
+test('an identity answer without a public key fails register instead of installing junk', async () => {
+  const identity = fakeIdentity({ publicHex: '', fingerprint: DEVICE_KEY_FP });
+  const bridge = fakeBridge();
+  const logger = fakeLogger();
+
+  const result = await provisionFlow(PAIR, CREDENTIAL, recordedCallbacks(), {
+    call: bridge.call,
+    logger,
+    deviceKeyEnsure: identity.ensure,
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failedStep, 'register');
+  assert.equal(result.error.kind, 'DeviceKey');
+  assert.deepEqual(stepsOf(bridge), ['detect']);
+  assert.equal(logger.failures.length, 1);
 });
 
 test('no upload, verify or start step survives the pivot (S5)', () => {
@@ -237,7 +391,11 @@ test('a tunnel failure stops at tunnel after every earlier step succeeded', asyn
   const logger = fakeLogger();
   const cb = recordedCallbacks();
 
-  const result = await provisionFlow(PAIR, CREDENTIAL, cb, { call: bridge.call, logger });
+  const result = await provisionFlow(PAIR, CREDENTIAL, cb, {
+    call: bridge.call,
+    logger,
+    deviceKeyEnsure: fakeIdentity().ensure,
+  });
 
   assert.equal(result.ok, false);
   assert.equal(result.failedStep, 'tunnel');
@@ -264,13 +422,11 @@ test('a tunnel without channel handles fails the step instead of reporting a tun
 
   const result = await provisionFlow(PAIR, CREDENTIAL, cb, {
     logger,
+    deviceKeyEnsure: fakeIdentity().ensure,
     call: async (fn, payloadJson) => {
       const payload = JSON.parse(payloadJson);
       if (fn === 'gc_ssh_connect') {
         return JSON.stringify({ ok: true, result: { sessionId: 7, fingerprint: PAIR.fp } });
-      }
-      if (fn === 'gc_device_key_generate') {
-        return JSON.stringify({ ok: true, key: { public_hex: DEVICE_PUBKEY_HEX, secret: {} } });
       }
       // The core answered ok but reported no opened channel.
       return JSON.stringify({ ok: true, result: payload.step === 'tunnel' ? { forwards: [] } : { step: payload.step } });
@@ -300,8 +456,18 @@ test('a register failure stops at register and logs the verbatim reason', async 
   const bridge = fakeBridge({ register: 'Ssh' });
   const logger = fakeLogger();
   const cb = recordedCallbacks();
+  // An answer that carries extra material must never reach a log line.
+  const identity = fakeIdentity({
+    publicHex: DEVICE_PUBKEY_HEX,
+    fingerprint: DEVICE_KEY_FP,
+    secret: 'SEED-QUE-NUNCA-SE-LOGUEA',
+  });
 
-  const result = await provisionFlow(PAIR, CREDENTIAL, cb, { call: bridge.call, logger });
+  const result = await provisionFlow(PAIR, CREDENTIAL, cb, {
+    call: bridge.call,
+    logger,
+    deviceKeyEnsure: identity.ensure,
+  });
 
   assert.equal(result.ok, false);
   assert.equal(result.failedStep, 'register');
@@ -310,19 +476,39 @@ test('a register failure stops at register and logs the verbatim reason', async 
     { step: 'register', error: { kind: 'Ssh', message: 'falló Ssh' }, raw: '{"exit":1}' },
   ]);
   assert.deepEqual(cb.events.at(-1), ['error', 'register', 'Ssh', '{"exit":1}']);
+  assert.equal(
+    JSON.stringify(logger.failures).includes('SEED-QUE-NUNCA-SE-LOGUEA'),
+    false,
+    'a secret reached the log',
+  );
 });
 
-test('a device key the core cannot produce fails register instead of installing nothing', async () => {
-  const bridge = fakeBridge({ deviceKey: 'Crypto' });
+test('an identity source that rejects fails register with its verbatim reason', async () => {
+  const identity = rejectingIdentity({
+    kind: 'CoreUnavailable',
+    message: 'libmobile_core.so no está en la build',
+  });
+  const bridge = fakeBridge();
   const logger = fakeLogger();
 
-  const result = await provisionFlow(PAIR, CREDENTIAL, recordedCallbacks(), { call: bridge.call, logger });
+  const result = await provisionFlow(PAIR, CREDENTIAL, recordedCallbacks(), {
+    call: bridge.call,
+    logger,
+    deviceKeyEnsure: identity.ensure,
+  });
 
   assert.equal(result.ok, false);
   assert.equal(result.failedStep, 'register');
-  assert.equal(result.error.kind, 'Crypto');
+  assert.equal(result.error.kind, 'CoreUnavailable');
+  assert.equal(result.error.message, 'libmobile_core.so no está en la build');
   assert.deepEqual(stepsOf(bridge), ['detect'], 'register is never sent without a key');
-  assert.equal(logger.failures.length, 1);
+  assert.deepEqual(logger.failures, [
+    {
+      step: 'register',
+      error: { kind: 'CoreUnavailable', message: 'libmobile_core.so no está en la build' },
+      raw: null,
+    },
+  ]);
 });
 
 /* ------------------------------------------------------------------ *
@@ -351,14 +537,40 @@ test('a host key that does not match the QR stops at fingerprint', async () => {
 });
 
 test('a session that reports no fingerprint stops honestly instead of assuming it matches', async () => {
+  // SEC-013: the connect record promises the host key the handshake verified. A session
+  // that reports none is not a success: the connect step itself refuses it, so there is no
+  // "ok" the fingerprint step could be skipped for.
   const bridge = fakeBridge({ fingerprint: '' });
   const logger = fakeLogger();
 
   const result = await provisionFlow(PAIR, CREDENTIAL, recordedCallbacks(), { call: bridge.call, logger });
 
   assert.equal(result.ok, false);
-  assert.equal(result.failedStep, 'fingerprint');
+  assert.equal(result.failedStep, 'connect');
   assert.equal(result.error.kind, 'Fingerprint');
+  assert.equal(result.error.message, FINGERPRINT_COPY.unreported);
+  assert.deepEqual(stepsOf(bridge), [], 'no remote step runs on an unverified session');
+  assert.deepEqual(logger.failures, [
+    {
+      step: 'connect',
+      error: { kind: 'Fingerprint', message: FINGERPRINT_COPY.unreported },
+      raw: { sessionId: 7, fingerprint: '' },
+    },
+  ]);
+});
+
+test('a connect answer that names an unusable host fingerprint is refused, naming what came', async () => {
+  const bridge = fakeBridge({ fingerprint: 'SHA256:abc' });
+  const logger = fakeLogger();
+
+  const result = await provisionFlow(PAIR, CREDENTIAL, recordedCallbacks(), { call: bridge.call, logger });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failedStep, 'connect');
+  assert.equal(result.error.kind, 'Fingerprint');
+  // The refusal keeps both facts: what was promised and what actually arrived.
+  assert.ok(result.error.message.includes(FINGERPRINT_COPY.unreported));
+  assert.match(result.error.message, /SHA256:abc/);
   assert.deepEqual(stepsOf(bridge), []);
 });
 
@@ -400,11 +612,13 @@ test('overall progress is step based over the five rows', () => {
   assert.equal(overallPercent(-1), 0, 'never below 0');
 });
 
-test('connectPair returns the session id or the honest failure', async () => {
+test('connectPair returns the session id and the verified host key, or the honest failure', async () => {
   const ok = await connectPair(PAIR, CREDENTIAL, {
-    call: async () => JSON.stringify({ ok: true, result: { sessionId: 'sess-1', fingerprint: 'SHA256:abc' } }),
+    call: async () =>
+      JSON.stringify({ ok: true, result: { sessionId: 'sess-1', fingerprint: FP.match(/.{2}/g).join(':') } }),
   });
-  assert.deepEqual(ok, { ok: true, sessionId: 'sess-1', fingerprint: 'SHA256:abc' });
+  // The verified host key is part of the success, normalized to compact hex.
+  assert.deepEqual(ok, { ok: true, sessionId: 'sess-1', fingerprint: FP });
 
   const failed = await connectPair(PAIR, CREDENTIAL, {
     call: async () => JSON.stringify({ ok: false, error: { kind: 'AuthFailed', message: 'Credenciales rechazadas.' }, raw: null }),
@@ -417,6 +631,43 @@ test('connectPair returns the session id or the honest failure', async () => {
   });
   assert.equal(noSession.ok, false);
   assert.equal(noSession.error.kind, 'BadResponse');
+});
+
+test('connectPair requires the host fingerprint: a missing or unusable one is a typed failure', async () => {
+  // Nothing here may read "there is a session id" as "the session is pinned".
+  for (const [fingerprint, reason] of [
+    [undefined, FINGERPRINT_COPY.unreported],
+    ['', FINGERPRINT_COPY.unreported],
+    ['   ', FINGERPRINT_COPY.unreported],
+  ]) {
+    const result = await connectPair(PAIR, CREDENTIAL, {
+      call: async () =>
+        JSON.stringify({ ok: true, result: { sessionId: 'sess-1', ...(fingerprint === undefined ? {} : { fingerprint }) } }),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.error.kind, 'Fingerprint');
+    assert.equal(result.error.message, reason);
+  }
+
+  const unusable = await connectPair(PAIR, CREDENTIAL, {
+    call: async () => JSON.stringify({ ok: true, result: { sessionId: 'sess-1', fingerprint: 'SHA256:abc' } }),
+  });
+  assert.equal(unusable.ok, false);
+  assert.equal(unusable.error.kind, 'Fingerprint');
+  assert.ok(unusable.error.message.includes(FINGERPRINT_COPY.unreported));
+  assert.match(unusable.error.message, /SHA256:abc/);
+});
+
+test('connectPair keeps the real host key mismatch for the fingerprint step', async () => {
+  // PRESERVE: a usable-but-different host key is still the fingerprint step’s own verdict.
+  const result = await connectPair(PAIR, CREDENTIAL, {
+    call: async () => JSON.stringify({ ok: true, result: { sessionId: 'sess-1', fingerprint: 'ff'.repeat(32) } }),
+  });
+  assert.deepEqual(result, { ok: true, sessionId: 'sess-1', fingerprint: 'ff'.repeat(32) });
+  assert.deepEqual(verifyHostFingerprint(PAIR.fp, result.fingerprint), {
+    ok: false,
+    error: { kind: 'FingerprintMismatch', message: FINGERPRINT_COPY.mismatch },
+  });
 });
 
 test('a step that hangs times out with the pinned copy and stops the flow', async () => {
@@ -515,4 +766,30 @@ test('register appends the key once, however many times it runs', (t) => {
   const other = sshEd25519AuthorizedKey('cd'.repeat(32));
   execFileSync('sh', ['-c', authorizedKeysScript(other)], { env: { ...process.env, HOME: home } });
   assert.deepEqual(readFileSync(keys, 'utf8').split('\n').filter(Boolean), [line, other]);
+});
+
+test('the password path pins the host key the QR already carries (SEC-008)', async () => {
+  const bridge = fakeBridge();
+  await connectPair(PAIR, CREDENTIAL, { call: bridge.call });
+  const connect = bridge.calls.find((entry) => entry.fn === 'gc_ssh_connect');
+  assert.equal(connect.payload.expectedFp, PAIR.fp);
+});
+
+test('a pairing keeps the phone-key fingerprint so reconnect can detect a swap', async () => {
+  const identity = fakeIdentity();
+  const bridge = fakeBridge();
+  const result = await provisionFlow(PAIR, CREDENTIAL, recordedCallbacks(), {
+    call: bridge.call,
+    deviceKeyEnsure: identity.ensure,
+    logger: fakeLogger(),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.registration.deviceKeyFingerprint, DEVICE_KEY_FP);
+  // A caller that injects a bare public key cannot claim a fingerprint it never saw.
+  const injected = await provisionFlow(PAIR, CREDENTIAL, recordedCallbacks(), {
+    call: fakeBridge().call,
+    devicePubkeyHex: DEVICE_PUBKEY_HEX,
+    logger: fakeLogger(),
+  });
+  assert.equal(injected.registration.deviceKeyFingerprint, undefined);
 });

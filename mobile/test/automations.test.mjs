@@ -634,3 +634,43 @@ test('loadAutomation maps 404, no tunnel and a broken body honestly', async () =
   assert.equal(broken.message, 'La PC devolvió automatizaciones incompletas.');
   assert.match(broken.raw, /"name"/);
 });
+
+/* ------------------------------------------------------------------ *
+ * The real wire the PC serves (hardware: empty bodies)
+ *
+ * `/api/automations` answers the 18-byte `{"automations":[]}` with
+ * `Connection: keep-alive`: the response ends at its `Content-Length`.
+ * ------------------------------------------------------------------ */
+
+/** Keep-alive peer: one framed answer, then the connection stays open. */
+function keepAliveChannel(wire) {
+  let answered = false;
+  return {
+    async write() {
+      return 1;
+    },
+    async read() {
+      if (!answered) {
+        answered = true;
+        return { bytes: utf8Encode(wire), eof: false };
+      }
+      return { bytes: new Uint8Array(), eof: false };
+    },
+    async close() {},
+  };
+}
+
+test('keep-alive: the real 18-byte automations answer is an empty list, not a failure', async () => {
+  const body = JSON.stringify({ automations: [] });
+  assert.equal(Buffer.byteLength(body), 18, 'the host really serves these 18 bytes');
+  const wire =
+    'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n' +
+    `Content-Length: ${Buffer.byteLength(body)}\r\nConnection: keep-alive\r\n\r\n${body}`;
+
+  const state = await loadAutomations(keepAliveChannel(wire), {
+    timeoutMs: 300,
+    logger: collectingLogger(),
+  });
+
+  assert.equal(state.kind, 'empty');
+});
