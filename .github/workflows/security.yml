@@ -151,7 +151,7 @@ jobs:
           persist-credentials: false
 
       - name: Review dependency changes
-        uses: actions/dependency-review-action@v4 # v4.7.3
+        uses: actions/dependency-review-action@v5 # v4.7.3
         with:
           # Same severity bar as the Trivy gate.
           fail-on-severity: high
